@@ -1,0 +1,30 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local env / caches (巨大化の原因)
+.cache/
+.config/
+.local/
+.npm/
+.vscode/
+.codeoss/
+.docker/
+.rustup/
+.gemini/
+
+# Zip残骸
+upload*.zip
+
+# Secrets（絶対にGitHubへ入れない）
+credentials.json
+*.pem
+*.key
