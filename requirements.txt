@@ -11,3 +11,5 @@ joblib==1.4.2
 
 google-auth==2.36.0
 google-api-python-client==2.154.0
+gunicorn
+
