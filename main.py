@@ -11,7 +11,8 @@ import google.auth
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from datetime import datetime, timedelta, timezone
-from flask import Flask
+from flask import Flask, request
+
 
 # ★追加：設定は config.py から読む（値は同じ）
 from config import (
@@ -1333,6 +1334,12 @@ def home():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
+    
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    print(f"[HEALTH] {request.method} {request.path}")
+    return "ok", 200
+
 
 @app.route("/preflight", methods=["GET"])
 def preflight():
@@ -1397,4 +1404,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
