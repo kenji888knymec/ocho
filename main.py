@@ -16,7 +16,6 @@ from flask import Flask
 # ★追加：設定は config.py から読む（値は同じ）
 from config import (
     VERSION,
-    discord_webhook_url,  # 直接は使わなくてもOKだが、デバッグ用に残しても害なし
     SPREADSHEET_ID, MAIN_SHEET_NAME, LEARN_SHEET_NAME,
     CAND_SIGMA, ALERT_SIGMA, AI_TH, DEFAULT_LEV,
     ENABLE_JUDGE, AUTO_JUDGE_AFTER_RUN, MIN_BARS,
@@ -29,7 +28,9 @@ from config import (
     RUN_MUTEX_ENABLED, RUN_MUTEX_SHEET, RUN_MUTEX_CELL, RUN_MUTEX_TTL_SEC,
     EXPECTED_HEADERS_LEARN, TABLE_FIELDS, FIELD_ALIASES, TABLE_REQUIRED_FIELDS,
     JST,
+    RUN_MUTEX,
 )
+
 
 # ★追加：Discord送信は discord_util.py に分離（中身は同じ）
 from discord_util import send_discord_message
@@ -54,10 +55,11 @@ _dedup_cache: Dict[str, Dict[str, Any]] = {}
 _row_count_cache: Dict[str, Dict[str, Any]] = {}
 ROWCOUNT_TTL_SEC = 180
 
-_run_lock = threading.Lock()
 
 _exchange_cache: Dict[str, Any] = {"ex": None, "ts": 0.0}
 _symbol_resolve_cache: Dict[str, str] = {}
+
+_run_lock = RUN_MUTEX
 
 _INSTANCE_ID = "|".join(
     [
@@ -1395,3 +1397,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
