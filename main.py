@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import random
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -131,6 +132,47 @@ def _invalidate_sheet_caches(sheet_name: str):
     _sheet_header_cache.pop(sheet_name, None)
 
 # ==========================================
+# Sheets execute wrapper（429/5xx対策）
+# ==========================================
+SHEETS_RETRY_MAX = 6
+SHEETS_RETRY_BASE_SEC = 1.0
+SHEETS_RETRY_MAX_SLEEP_SEC = 20.0
+
+def _http_status(err: Exception) -> int:
+    try:
+        resp = getattr(err, "resp", None)
+        st = getattr(resp, "status", 0)
+        return int(st) if st is not None else 0
+    except Exception:
+        return 0
+
+def sheets_execute(req, desc: str = ""):
+    last = None
+    for attempt in range(SHEETS_RETRY_MAX + 1):
+        try:
+            return req.execute()
+        except HttpError as e:
+            last = e
+            st = _http_status(e)
+            retryable = st in (429, 500, 503)
+            if retryable and attempt < SHEETS_RETRY_MAX:
+                sleep = min(SHEETS_RETRY_BASE_SEC * (2 ** attempt), SHEETS_RETRY_MAX_SLEEP_SEC)
+                sleep += random.random()
+                print(f"[WARN] Sheets retry {attempt+1}/{SHEETS_RETRY_MAX} sleep={sleep:.1f}s status={st} {desc}")
+                time.sleep(sleep)
+                continue
+            raise
+        except Exception as e:
+            last = e
+            if attempt < SHEETS_RETRY_MAX:
+                sleep = min(SHEETS_RETRY_BASE_SEC * (2 ** attempt), SHEETS_RETRY_MAX_SLEEP_SEC)
+                sleep += random.random()
+                print(f"[WARN] Sheets retry {attempt+1}/{SHEETS_RETRY_MAX} sleep={sleep:.1f}s {desc} err={e}")
+                time.sleep(sleep)
+                continue
+            raise last
+
+# ==========================================
 # Sheets: service
 # ==========================================
 def get_sheet_service():
@@ -177,10 +219,13 @@ def _expected_header_len(sheet_name: str) -> int:
 # ==========================================
 def _get_sheets_meta() -> Dict[str, Any]:
     service = get_sheet_service()
-    return service.spreadsheets().get(
-        spreadsheetId=SPREADSHEET_ID,
-        fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
-    ).execute()
+    return sheets_execute(
+        service.spreadsheets().get(
+            spreadsheetId=SPREADSHEET_ID,
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+        ),
+        desc="_get_sheets_meta",
+    )
 
 def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 26) -> bool:
     if not AUTO_CREATE_SHEETS:
@@ -206,7 +251,10 @@ def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 2
                 }
             ]
         }
-        service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req).execute()
+        sheets_execute(
+            service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req),
+            desc=f"ensure_sheet_exists addSheet={sheet_name}",
+        )
         print(f"[CFG] created sheet: {sheet_name}")
         return True
     except Exception as e:
@@ -240,24 +288,40 @@ def read_header_row(sheet_name: str) -> List[str]:
     try:
         service = get_sheet_service()
         rng = f"{sheet_name}!A1:{HEADER_COL_END}1"
-        res = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng).execute()
+        res = sheets_execute(
+            service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng),
+            desc=f"read_header_row sheet={sheet_name}",
+        )
         raw = (res.get("values", [[]]) or [[]])[0]
-        return _normalize_headers(raw)
+        hs = _normalize_headers(raw)
+        if hs:
+            return hs
+
+        # ここ重要：一時的に空が返ってもキャッシュを使って壊しにくくする
+        c = _sheet_header_cache.get(sheet_name)
+        prev = (c or {}).get("headers", [])
+        return prev if prev else []
+
     except Exception as e:
         print(f"[WARN] read_header_row failed: sheet={sheet_name} err={e}")
-        return []
+        c = _sheet_header_cache.get(sheet_name)
+        prev = (c or {}).get("headers", [])
+        return prev if prev else []
 
 def write_header_row(sheet_name: str, headers: List[str]) -> bool:
     try:
         service = get_sheet_service()
         end_col = col_to_a1(max(len(headers) - 1, 0))
         rng = f"{sheet_name}!A1:{end_col}1"
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=rng,
-            valueInputOption="RAW",
-            body={"values": [headers]},
-        ).execute()
+        sheets_execute(
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=rng,
+                valueInputOption="RAW",
+                body={"values": [headers]},
+            ),
+            desc=f"write_header_row sheet={sheet_name}",
+        )
         _invalidate_sheet_caches(sheet_name)
         return True
     except Exception as e:
@@ -269,12 +333,15 @@ def update_single_cell(sheet_name: str, col0: int, row1: int, value: str) -> boo
         service = get_sheet_service()
         a1 = col_to_a1(col0)
         rng = f"{sheet_name}!{a1}{row1}"
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=rng,
-            valueInputOption="RAW",
-            body={"values": [[value]]},
-        ).execute()
+        sheets_execute(
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=rng,
+                valueInputOption="RAW",
+                body={"values": [[value]]},
+            ),
+            desc=f"update_single_cell sheet={sheet_name} cell={rng}",
+        )
         _invalidate_sheet_caches(sheet_name)
         return True
     except Exception as e:
@@ -374,7 +441,13 @@ def get_headers_and_len(sheet_name: str) -> Tuple[List[str], Optional[int], bool
             hm = _build_headers_map(headers)
             ok = all(_resolve_col_idx(hm, f) != -1 for f in TABLE_REQUIRED_FIELDS)
 
-    _sheet_header_cache[sheet_name] = {"headers": headers, "ts": now, "ok": ok}
+    # ここ重要：headersが空の時にキャッシュを空で上書きしない（壊れにくくする）
+    if headers:
+        _sheet_header_cache[sheet_name] = {"headers": headers, "ts": now, "ok": ok}
+    else:
+        if sheet_name not in _sheet_header_cache:
+            _sheet_header_cache[sheet_name] = {"headers": [], "ts": now, "ok": ok}
+
     return headers, colcount, ok
 
 # ==========================================
@@ -444,13 +517,16 @@ def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: 
             adjusted_rows.append(_make_aligned_row(headers, out_len, fields, r))
 
         service = get_sheet_service()
-        service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{sheet_name}!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": adjusted_rows},
-        ).execute()
+        sheets_execute(
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{sheet_name}!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": adjusted_rows},
+            ),
+            desc=f"append_rows_to_sheet sheet={sheet_name} rows={len(adjusted_rows)}",
+        )
 
         _invalidate_sheet_caches(sheet_name)
 
@@ -603,10 +679,13 @@ def _get_row_count_cached(sheet_name: str) -> int:
         col_letter = "A" if col_time < 0 else col_to_a1(col_time)
 
         service = get_sheet_service()
-        res = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{sheet_name}!{col_letter}:{col_letter}",
-        ).execute()
+        res = sheets_execute(
+            service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{sheet_name}!{col_letter}:{col_letter}",
+            ),
+            desc=f"row_count sheet={sheet_name} col={col_letter}",
+        )
         vals = res.get("values", [])
         n = len(vals)
         _row_count_cache[sheet_name] = {"ts": now, "n": n}
@@ -647,10 +726,13 @@ def _get_recent_dedup_keys(sheet_name: str) -> Set[str]:
         a2 = col_to_a1(c2)
 
         service = get_sheet_service()
-        res = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{sheet_name}!{a1}{start}:{a2}{last_row}",
-        ).execute()
+        res = sheets_execute(
+            service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{sheet_name}!{a1}{start}:{a2}{last_row}",
+            ),
+            desc=f"dedup_scan sheet={sheet_name} range={a1}{start}:{a2}{last_row}",
+        )
 
         rows = res.get("values", []) or []
         for r in rows:
@@ -677,7 +759,10 @@ def _mutex_read() -> str:
     _ensure_mutex_sheet()
     service = get_sheet_service()
     rng = f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}"
-    res = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng).execute()
+    res = sheets_execute(
+        service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng),
+        desc=f"mutex_read {rng}",
+    )
     v = (res.get("values", [[]]) or [[]])[0]
     return "" if not v else str(v[0]).strip()
 
@@ -685,12 +770,15 @@ def _mutex_write(value: str):
     _ensure_mutex_sheet()
     service = get_sheet_service()
     rng = f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}"
-    service.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [[value]]},
-    ).execute()
+    sheets_execute(
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=rng,
+            valueInputOption="RAW",
+            body={"values": [[value]]},
+        ),
+        desc=f"mutex_write {rng}",
+    )
 
 def acquire_run_mutex() -> Tuple[bool, str]:
     if not RUN_MUTEX_ENABLED:
@@ -1090,10 +1178,13 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
 
     start_row = max(2, last_row - lookback_rows + 1)
 
-    res = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}",
-    ).execute()
+    res = sheets_execute(
+        service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}",
+        ),
+        desc=f"judge_read sheet={sheet_name} A{start_row}:{HEADER_COL_END}{last_row}",
+    )
 
     rows = res.get("values", []) or []
     if not rows:
@@ -1287,10 +1378,13 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
         time.sleep(0.12)
 
     if updates:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={"valueInputOption": "USER_ENTERED", "data": updates},
-        ).execute()
+        sheets_execute(
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": updates},
+            ),
+            desc=f"judge_batchUpdate sheet={sheet_name} updates={len(updates)}",
+        )
         _invalidate_sheet_caches(sheet_name)
 
     return judged
@@ -1334,12 +1428,11 @@ def home():
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return "ok", 200
-    
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     print(f"[HEALTH] {request.method} {request.path}")
     return "ok", 200
-
 
 @app.route("/preflight", methods=["GET"])
 def preflight():
@@ -1404,5 +1497,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
