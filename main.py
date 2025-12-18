@@ -825,7 +825,7 @@ def release_run_mutex(token: str):
 if os.path.exists("trade_ai_model.pkl"):
     try:
         ai_model = joblib.load("trade_ai_model.pkl")
-        print("[AI] Model Loaded Successfully")
+        print(f"[AI] Model Loaded Successfully path={os.environ.get('MODEL_LOCAL_PATH','')} ver={os.environ.get('MODEL_VERSION','')}")
     except Exception as e:
         print(f"[AI] Load Failed: {e}")
         ai_model = None
@@ -1497,3 +1497,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
