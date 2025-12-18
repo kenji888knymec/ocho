@@ -576,17 +576,30 @@ def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_v
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
     headers, colcount, ok = get_headers_and_len(sheet_name)
 
+    # ★重要：learn_log は「一時的にヘッダーが空」でも自己回復して記録を落とさない
     if not headers:
-        msg = f"[WARN] Headers empty. Skip append to prevent corruption. sheet={sheet_name}"
-        print(msg)
-        send_discord_message(msg)
-        return
+        if sheet_name == LEARN_SHEET_NAME:
+            try:
+                ensure_learn_headers()  # ヘッダー自己修復（AUTO_FIX_HEADERS が有効なら書き直す）
+            except Exception:
+                pass
+            headers = list(EXPECTED_HEADERS_LEARN)  # 空のまま落とさず、このヘッダーで整列して追記する
+            colcount = get_sheet_colcount(sheet_name)
+            ok = True
+            print(f"[WARN] Headers empty but recovered for learn_log. sheet={sheet_name}")
+        else:
+            msg = f"[WARN] Headers empty. Skip append to prevent corruption. sheet={sheet_name}"
+            print(msg)
+            send_discord_message(msg)
+            return
 
     if STRICT_HEADER_CHECK and not ok:
+        # learn_log は上で ok=True にしているので通常ここで止まらない
         msg = f"[WARN] Header check failed. Skip append to prevent corruption. sheet={sheet_name}"
         print(msg)
         send_discord_message(msg)
         return
+
 
     if colcount is None:
         out_len = len(headers)
@@ -1757,6 +1770,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
