@@ -1084,10 +1084,17 @@ def logic_main():
             if not (is_buy or is_sell):
                 continue
 
-            ai_score = None
-            ai_pass = True if ai_model is None else False
 
-            if ai_model is not None:
+            # ===== AI判定（E値も算出）=====
+            ai_score = None
+            E = None  # 期待値（%）
+
+            if ai_model is None:
+                # モデルが無い時は従来通り「バイパス」
+                ai_pass = True
+            else:
+                ai_pass = False  # 成功したらTrueにする
+
                 feats = pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
@@ -1099,12 +1106,33 @@ def logic_main():
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
+
                 try:
-                    ai_score = float(ai_model.predict_proba(feats)[0][1])
-                    ai_pass = (ai_score >= AI_TH)
+                    ai_score = float(ai_model.predict_proba(feats)[0][1])  # P(win)っぽいもの
+
+                    # TP/SL幅（%）を簡易計算（列ズレ回避のため配列には触らない）
+                    tp_mult = 3.8
+                    sl_mult = 1.5
+                    sig = float(row["Dynamic_Sigma"])
+
+                    tp_pct = abs(sig * tp_mult) * 100.0
+                    sl_pct = abs(sig * sl_mult) * 100.0
+
+                    p_tp = ai_score
+                    p_sl = 1.0 - ai_score
+
+                    # 期待値（%ベース）
+                    E = (p_tp * tp_pct) - (p_sl * sl_pct)
+
+                    # 通す条件：従来の閾値 + 期待値がプラス
+                    ai_pass = (ai_score >= AI_TH) and (E > 0)
+
                 except Exception as e:
                     print(f"[AI] predict_proba failed for {symbol}: {e}")
+                    ai_score = None
+                    E = None
                     ai_pass = False
+
 
             item = {
                 "symbol": symbol.replace("/USDT", ""),
@@ -1119,6 +1147,7 @@ def logic_main():
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
                 "ai_score": ai_score,
                 "ai_pass": bool(ai_pass),
+                "E": E,
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
             }
@@ -1626,4 +1655,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
