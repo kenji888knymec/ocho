@@ -254,6 +254,65 @@ def _get_sheets_meta() -> Dict[str, Any]:
         desc="_get_sheets_meta",
     )
 
+def _resize_sheet_if_needed(sheet_name: str, min_rows: int, min_cols: int) -> bool:
+    """
+    既存シートの gridProperties(rowCount/columnCount) が不足していれば拡張する。
+    Output length invalid（列数不足）を根本から潰すための処理。
+    """
+    try:
+        meta = _get_sheets_meta()
+        target_sheet_id = None
+        cur_rows = None
+        cur_cols = None
+
+        for sh in meta.get("sheets", []) or []:
+            p = (sh or {}).get("properties", {}) or {}
+            if p.get("title") == sheet_name:
+                target_sheet_id = p.get("sheetId")
+                gp = (p.get("gridProperties") or {})
+                cur_rows = int(gp.get("rowCount") or 0)
+                cur_cols = int(gp.get("columnCount") or 0)
+                break
+
+        if target_sheet_id is None:
+            return False
+
+        need_rows = max(int(min_rows), int(cur_rows or 0))
+        need_cols = max(int(min_cols), int(cur_cols or 0))
+
+        if (cur_rows or 0) >= need_rows and (cur_cols or 0) >= need_cols:
+            return True  # 既に十分
+
+        service = get_sheet_service()
+        req = {
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": int(target_sheet_id),
+                            "gridProperties": {
+                                "rowCount": int(need_rows),
+                                "columnCount": int(need_cols),
+                            },
+                        },
+                        "fields": "gridProperties(rowCount,columnCount)",
+                    }
+                }
+            ]
+        }
+        sheets_execute(
+            service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req),
+            desc=f"_resize_sheet_if_needed sheet={sheet_name} rows={need_rows} cols={need_cols}",
+        )
+        _invalidate_sheet_caches(sheet_name)
+        print(f"[CFG] resized sheet: {sheet_name} rows={need_rows} cols={need_cols}")
+        return True
+
+    except Exception as e:
+        print(f"[WARN] _resize_sheet_if_needed failed: sheet={sheet_name} err={e}")
+        return False
+
+
 def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 26) -> bool:
     if not AUTO_CREATE_SHEETS:
         return True
@@ -263,8 +322,11 @@ def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 2
         for sh in meta.get("sheets", []) or []:
             p = (sh or {}).get("properties", {}) or {}
             if p.get("title") == sheet_name:
+                # ★既存シートは「作る」だけだと列数不足が残るので、ここで必ず拡張チェックする
+                _resize_sheet_if_needed(sheet_name, min_rows=int(min_rows), min_cols=int(min_cols))
                 return True
 
+        # 無ければ作成
         service = get_sheet_service()
         req = {
             "requests": [
@@ -283,10 +345,15 @@ def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 2
             desc=f"ensure_sheet_exists addSheet={sheet_name}",
         )
         print(f"[CFG] created sheet: {sheet_name}")
+
+        # 作成直後も念のため拡張チェック（将来の min_cols 変更にも強くする）
+        _resize_sheet_if_needed(sheet_name, min_rows=int(min_rows), min_cols=int(min_cols))
         return True
+
     except Exception as e:
         print(f"[WARN] ensure_sheet_exists failed: sheet={sheet_name} err={e}")
         return False
+
 
 def get_sheet_colcount(sheet_name: str) -> Optional[int]:
     now = time.time()
@@ -1217,7 +1284,25 @@ def logic_main():
         )
 
         # ★重要：この配列の要素数は絶対に増減しない（列ズレ防止）
-        candidate_rows.append([
+        # ===== learn_log へ書く1行を作る（列数を強制一致させて Skip append を防ぐ）=====
+
+        ai_disp = "N/A" if item.get("ai_score") is None else f"{float(item['ai_score']):.1%}"
+        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
+
+        # AIがあるのに通らなかったものは AI_REJECT にして後で抽出しやすくする
+        status = "AI_REJECT" if (ai_model is not None and (not bool(item.get("ai_pass", False)))) else "CANDIDATE"
+
+        # Reserved1/2 は列追加せずに情報を残す用途（既存運用があるなら上書きになる点だけ注意）
+        reserved1 = "" if item.get("ai_score") is None else float(item["ai_score"])
+        reserved2 = "" if item.get("E") is None else float(item["E"])
+
+        note_str = (
+            f"AI:{ai_disp} E:{e_disp} Pass:{bool(item.get('ai_pass', False))} "
+            f"AI_TH:{AI_TH} Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
+            f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
+        )
+
+        row_out = [
             dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
             float(item["close"]), float(item["score"]), float(item["sigma"]), status,
             float(tp), float(sl), float(tp_pct), float(sl_pct),
@@ -1226,7 +1311,19 @@ def logic_main():
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
             "", "", "", "", "", "", ""
-        ])
+        ]
+
+        # ★ここが肝：EXPECTED_HEADERS_LEARN と列数を必ず一致させる（多い→切る、少ない→空で埋める）
+        expected_n = len(EXPECTED_HEADERS_LEARN)
+        if len(row_out) != expected_n:
+            print(f"[WARN] learn_log row length mismatch: out={len(row_out)} expected={expected_n} sym={sym} dt={dt_str}")
+            if len(row_out) < expected_n:
+                row_out = row_out + ([""] * (expected_n - len(row_out)))
+            else:
+                row_out = row_out[:expected_n]
+
+        candidate_rows.append(row_out)
+
 
         learn_keys.add(k)
 
@@ -1660,6 +1757,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
