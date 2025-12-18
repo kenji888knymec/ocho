@@ -1172,6 +1172,9 @@ def logic_main():
     learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
     table_keys = _get_recent_dedup_keys(MAIN_SHEET_NAME)
 
+    # =========================
+    # learn_log 追記（候補行）
+    # =========================
     candidate_rows: List[List[Any]] = []
     for item in pending_candidates:
         sym = item["symbol"]
@@ -1194,21 +1197,26 @@ def logic_main():
         tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
 
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
+        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
+
+        # ★ learn_log の Status を分ける（後で抽出しやすくする）
+        # - AIモデルがあるのに ai_pass=False → AI_REJECT
+        # - それ以外 → CANDIDATE
+        status = "AI_REJECT" if (ai_model is not None and (not bool(item["ai_pass"]))) else "CANDIDATE"
+
+        # ★ Reserved1/Reserved2 を活用（列追加しない）
+        # Reserved1 = ai_score（確率）
+        # Reserved2 = E（期待値 %）
+        reserved1 = "" if item["ai_score"] is None else float(item["ai_score"])
+        reserved2 = "" if item.get("E") is None else float(item["E"])
+
         note_str = (
-            f"AI:{ai_disp} Pass:{item['ai_pass']} "
-            f"Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
+            f"AI:{ai_disp} E:{e_disp} Pass:{bool(item['ai_pass'])} "
+            f"AI_TH:{AI_TH} Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
-        # ★追加：learn_logのStatusを分ける（後で抽出しやすくする）
-        # - AIモデルがあるのに ai_pass=False → AI_REJECT
-        # - それ以外 → CANDIDATE
-        status = "AI_REJECT" if (ai_model is not None and (not item["ai_pass"])) else "CANDIDATE"
-
-        # ★追加：Reserved1/Reserved2に数値を入れておく（列追加不要）
-        reserved1 = "" if item["ai_score"] is None else float(item["ai_score"])
-        reserved2 = float(AI_TH)
-
+        # ★重要：この配列の要素数は絶対に増減しない（列ズレ防止）
         candidate_rows.append([
             dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
             float(item["close"]), float(item["score"]), float(item["sigma"]), status,
@@ -1220,12 +1228,14 @@ def logic_main():
             "", "", "", "", "", "", ""
         ])
 
-
         learn_keys.add(k)
 
     if candidate_rows:
         append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, EXPECTED_HEADERS_LEARN)
 
+    # =========================
+    # table / Discord（通知）
+    # =========================
     filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)[:3]
     count = 0
     alert_rows: List[List[Any]] = []
@@ -1260,17 +1270,19 @@ def logic_main():
             d_str = "売り(SHORT)"
 
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
+        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
 
         msg = (
             f"{icon} **{d_str}** {icon}\n"
             f"{VERSION}\n"
             f"💎 {sym} ({item['type']})\n"
-            f"📈 Score:{item['score']:.2f}σ  AI:{ai_disp}\n"
+            f"📈 Score:{item['score']:.2f}σ  AI:{ai_disp}  E:{e_disp}\n"
             f"🟦 BTC:{btc_mode} 1h:{btc_1h_change:.2%}  Calm:{BTC_CALM}  BTC_OK:{btc_ok}\n"
             f"💰 {cp:.4f}\n"
             f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%)\n"
             f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%)"
         )
+
         send_discord_message(msg)
         count += 1
 
@@ -1648,6 +1660,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
