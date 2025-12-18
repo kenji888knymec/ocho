@@ -1031,6 +1031,20 @@ def logic_main():
 
     pending_candidates: List[Dict[str, Any]] = []
     pending_alerts: List[Dict[str, Any]] = []
+    def calc_tp_sl(item):
+        tp_mult = 3.8
+        sl_mult = 1.5
+        cp = float(item["close"])
+        sig = float(item["sigma"])
+        if item["is_buy"]:
+            tp = cp * (1 + sig * tp_mult)
+            sl = cp * (1 - sig * sl_mult)
+        else:
+            tp = cp * (1 - sig * tp_mult)
+            sl = cp * (1 + sig * sl_mult)
+        tp_pct = abs((tp - cp) / cp) * 100.0
+        sl_pct = abs((sl - cp) / cp) * 100.0
+        return tp, sl, tp_pct, sl_pct
 
     for symbol in symbols:
         try:
@@ -1084,17 +1098,9 @@ def logic_main():
             if not (is_buy or is_sell):
                 continue
 
-
-            # ===== AI判定（E値も算出）=====
+            # ===== AI確率（ここでは確率だけ計算）=====
             ai_score = None
-            E = None  # 期待値（%）
-
-            if ai_model is None:
-                # モデルが無い時は従来通り「バイパス」
-                ai_pass = True
-            else:
-                ai_pass = False  # 成功したらTrueにする
-
+            if ai_model is not None:
                 feats = pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
@@ -1106,34 +1112,13 @@ def logic_main():
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
-
                 try:
-                    ai_score = float(ai_model.predict_proba(feats)[0][1])  # P(win)っぽいもの
-
-                    # TP/SL幅（%）を簡易計算（列ズレ回避のため配列には触らない）
-                    tp_mult = 3.8
-                    sl_mult = 1.5
-                    sig = float(row["Dynamic_Sigma"])
-
-                    tp_pct = abs(sig * tp_mult) * 100.0
-                    sl_pct = abs(sig * sl_mult) * 100.0
-
-                    p_tp = ai_score
-                    p_sl = 1.0 - ai_score
-
-                    # 期待値（%ベース）
-                    E = (p_tp * tp_pct) - (p_sl * sl_pct)
-
-                    # 通す条件：従来の閾値 + 期待値がプラス
-                    ai_pass = (ai_score >= AI_TH) and (E > 0)
-
+                    ai_score = float(ai_model.predict_proba(feats)[0][1])
                 except Exception as e:
                     print(f"[AI] predict_proba failed for {symbol}: {e}")
                     ai_score = None
-                    E = None
-                    ai_pass = False
 
-
+            # ===== item（辞書なのでSheets列ズレと無関係）=====
             item = {
                 "symbol": symbol.replace("/USDT", ""),
                 "time": int(row["Time"]),
@@ -1146,35 +1131,43 @@ def logic_main():
                 "type": signal_type,
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
                 "ai_score": ai_score,
-                "ai_pass": bool(ai_pass),
-                "E": E,
+                "ai_pass": True,  # 仮（この後にEで確定する）
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
             }
 
+            # ===== 期待値E（calc_tp_sl(item) を使う）=====
+            E = None
+            try:
+                tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
+
+                p_tp = 0.0 if ai_score is None else float(ai_score)
+                p_sl = 1.0 - p_tp
+
+                E = (p_tp * float(tp_pct)) - (p_sl * float(sl_pct))
+            except Exception as e:
+                print(f"[AI] calc_tp_sl failed for {symbol}: {e}")
+                E = None
+
+            item["E"] = E
+
+            # ===== 最終判定（E > 0 を採用）=====
+            if ai_model is None:
+                item["ai_pass"] = True
+            else:
+                item["ai_pass"] = (E is not None) and (E > 0)
+
             pending_candidates.append(item)
 
-            if ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
+            # 通知候補（ai_passはE込み判定）
+            if item["ai_pass"] and BTC_CALM and item["score"] >= ALERT_SIGMA:
                 pending_alerts.append(item)
+
 
         except Exception as e:
             print(f"[ERR] {symbol} fetch/compute: {e}")
             continue
 
-    def calc_tp_sl(item):
-        tp_mult = 3.8
-        sl_mult = 1.5
-        cp = float(item["close"])
-        sig = float(item["sigma"])
-        if item["is_buy"]:
-            tp = cp * (1 + sig * tp_mult)
-            sl = cp * (1 - sig * sl_mult)
-        else:
-            tp = cp * (1 - sig * tp_mult)
-            sl = cp * (1 + sig * sl_mult)
-        tp_pct = abs((tp - cp) / cp) * 100.0
-        sl_pct = abs((sl - cp) / cp) * 100.0
-        return tp, sl, tp_pct, sl_pct
 
     learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
     table_keys = _get_recent_dedup_keys(MAIN_SHEET_NAME)
@@ -1655,5 +1648,6 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
