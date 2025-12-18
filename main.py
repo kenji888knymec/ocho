@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import storage
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 
 # ★追加：設定は config.py から読む（値は同じ）
@@ -44,13 +44,30 @@ from discord_util import send_discord_message
 app = Flask(__name__)
 AI_MODEL = None
 
+_AI_LOADED_AT = ""
+_AI_LAST_ERROR = ""
+
+
 @app.get("/ai_health")
 def ai_health():
-    global AI_MODEL
+    global AI_MODEL, ai_model
     if AI_MODEL is None:
-        AI_MODEL = load_ai_model()
+        AI_MODEL = ai_model
     ok = AI_MODEL is not None
-    return ("ok" if ok else "ng"), (200 if ok else 500)
+
+    payload = {
+        "ok": bool(ok),
+        "service": os.environ.get("K_SERVICE", ""),
+        "revision": os.environ.get("K_REVISION", ""),
+        "model_version": os.environ.get("MODEL_VERSION", "").strip(),
+        "model_uri": os.environ.get("MODEL_GCS_URI", "").strip(),
+        "model_local_path": os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip(),
+        "loaded_at": _AI_LOADED_AT,
+        "last_error": _AI_LAST_ERROR,
+    }
+    status = 200 if ok else 503
+    return jsonify(payload), status
+
 
 
 # ==========================================
@@ -833,12 +850,56 @@ def release_run_mutex(token: str):
 # ==========================================
 # モデル読み込み
 # ==========================================
+def _boot_notify_model_status_once(bucket, gcs_uri: str, local_path: str, ver: str, ok: bool, err: str):
+    key = os.environ.get("K_REVISION", "").strip() or ver or "unknown"
+    marker_name = f"markers/crypto-alert/boot/{key}.json"
+    blob = bucket.blob(marker_name)
+
+    body = {
+        "ok": bool(ok),
+        "service": os.environ.get("K_SERVICE", ""),
+        "revision": os.environ.get("K_REVISION", ""),
+        "model_version": ver,
+        "model_uri": gcs_uri,
+        "model_local_path": local_path,
+        "loaded_at": _AI_LOADED_AT,
+        "last_error": ("" if ok else (err or ""))[:500],
+    }
+
+    try:
+        blob.upload_from_string(
+            data=str(body),
+            content_type="application/json",
+            if_generation_match=0,
+        )
+    except Exception as e:
+        s = str(e)
+        if "412" in s or "Precondition" in s:
+            print(f"[AI] boot notify skipped (marker exists): {marker_name}")
+            return
+        print(f"[WARN] boot marker create failed: {e}")
+        return
+
+    msg = (
+        f"[AI] Boot Model Status\n"
+        f"ok={ok}\n"
+        f"ver={ver}\n"
+        f"uri={gcs_uri}\n"
+        f"path={local_path}\n"
+        f"rev={os.environ.get('K_REVISION','')}\n"
+        f"err={(err or '')[:180]}"
+    )
+    send_discord_message(msg)
+
+
 def load_ai_model():
     """
     優先順位:
     1) MODEL_GCS_URI が gs://... の場合 -> GCS から MODEL_LOCAL_PATH にダウンロードして joblib.load
     2) それ以外 -> ローカルの trade_ai_model.pkl を joblib.load
     """
+    global _AI_LOADED_AT, _AI_LAST_ERROR
+
     gcs_uri = os.environ.get("MODEL_GCS_URI", "").strip()
     local_path = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
     ver = os.environ.get("MODEL_VERSION", "").strip()
@@ -856,20 +917,39 @@ def load_ai_model():
             blob.download_to_filename(local_path)
 
             m = joblib.load(local_path)
+            _AI_LOADED_AT = datetime.now(JST).isoformat()
+            _AI_LAST_ERROR = ""
             print(f"[AI] Model Loaded Successfully uri={gcs_uri} path={local_path} ver={ver}")
+            _boot_notify_model_status_once(bucket, gcs_uri, local_path, ver, True, "")
             return m
 
         if os.path.exists("trade_ai_model.pkl"):
             m = joblib.load("trade_ai_model.pkl")
+            _AI_LOADED_AT = datetime.now(JST).isoformat()
+            _AI_LAST_ERROR = ""
             print(f"[AI] Model Loaded Successfully uri=LOCAL path=trade_ai_model.pkl ver={ver}")
             return m
 
         print("[AI] trade_ai_model.pkl not found -> AI gate is bypassed (ai_pass=True).")
+        _AI_LOADED_AT = ""
+        _AI_LAST_ERROR = "model file not found (AI bypassed)"
         return None
 
     except Exception as e:
+        _AI_LOADED_AT = ""
+        _AI_LAST_ERROR = str(e)
         print(f"[AI] Load Failed: {e}")
+        try:
+            if gcs_uri.startswith("gs://"):
+                client = storage.Client()
+                tmp = gcs_uri[5:]
+                bucket_name, _ = tmp.split("/", 1)
+                bucket = client.bucket(bucket_name)
+                _boot_notify_model_status_once(bucket, gcs_uri, local_path, ver, False, str(e))
+        except Exception:
+            pass
         return None
+
 
 ai_model = load_ai_model()
 
@@ -1537,3 +1617,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
