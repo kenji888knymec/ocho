@@ -1178,16 +1178,26 @@ def logic_main():
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
+        # ★追加：learn_logのStatusを分ける（後で抽出しやすくする）
+        # - AIモデルがあるのに ai_pass=False → AI_REJECT
+        # - それ以外 → CANDIDATE
+        status = "AI_REJECT" if (ai_model is not None and (not item["ai_pass"])) else "CANDIDATE"
+
+        # ★追加：Reserved1/Reserved2に数値を入れておく（列追加不要）
+        reserved1 = "" if item["ai_score"] is None else float(item["ai_score"])
+        reserved2 = float(AI_TH)
+
         candidate_rows.append([
             dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
-            float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
+            float(item["close"]), float(item["score"]), float(item["sigma"]), status,
             float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, 0, 0, bool(item["ai_pass"]), bool(BTC_CALM),
+            DEFAULT_LEV, reserved1, reserved2, bool(item["ai_pass"]), bool(BTC_CALM),
             VERSION, item["type"], 0, 0,
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
             "", "", "", "", "", "", ""
         ])
+
 
         learn_keys.add(k)
 
@@ -1616,3 +1626,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
