@@ -11,6 +11,7 @@ import ccxt
 import google.auth
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request
 
@@ -41,6 +42,16 @@ from discord_util import send_discord_message
 # Flask設定（Buildpacks標準：main.py の app を起動）
 # ==========================================
 app = Flask(__name__)
+AI_MODEL = None
+
+@app.get("/ai_health")
+def ai_health():
+    global AI_MODEL
+    if AI_MODEL is None:
+        AI_MODEL = load_ai_model()
+    ok = AI_MODEL is not None
+    return ("ok" if ok else "ng"), (200 if ok else 500)
+
 
 # ==========================================
 # グローバル
@@ -822,16 +833,45 @@ def release_run_mutex(token: str):
 # ==========================================
 # モデル読み込み
 # ==========================================
-if os.path.exists("trade_ai_model.pkl"):
+def load_ai_model():
+    """
+    優先順位:
+    1) MODEL_GCS_URI が gs://... の場合 -> GCS から MODEL_LOCAL_PATH にダウンロードして joblib.load
+    2) それ以外 -> ローカルの trade_ai_model.pkl を joblib.load
+    """
+    gcs_uri = os.environ.get("MODEL_GCS_URI", "").strip()
+    local_path = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
+    ver = os.environ.get("MODEL_VERSION", "").strip()
+
     try:
-        ai_model = joblib.load("trade_ai_model.pkl")
-        print(f"[AI] Model Loaded Successfully path={os.environ.get('MODEL_LOCAL_PATH','')} ver={os.environ.get('MODEL_VERSION','')}")
+        if gcs_uri.startswith("gs://"):
+            tmp = gcs_uri[5:]
+            bucket_name, blob_name = tmp.split("/", 1)
+
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            blob.download_to_filename(local_path)
+
+            m = joblib.load(local_path)
+            print(f"[AI] Model Loaded Successfully uri={gcs_uri} path={local_path} ver={ver}")
+            return m
+
+        if os.path.exists("trade_ai_model.pkl"):
+            m = joblib.load("trade_ai_model.pkl")
+            print(f"[AI] Model Loaded Successfully uri=LOCAL path=trade_ai_model.pkl ver={ver}")
+            return m
+
+        print("[AI] trade_ai_model.pkl not found -> AI gate is bypassed (ai_pass=True).")
+        return None
+
     except Exception as e:
         print(f"[AI] Load Failed: {e}")
-        ai_model = None
-else:
-    print("[AI] trade_ai_model.pkl not found -> AI gate is bypassed (ai_pass=True).")
-    ai_model = None
+        return None
+
+ai_model = load_ai_model()
 
 # ==========================================
 # ★起動時に「必要シート/ヘッダー」を自己修復
@@ -1497,4 +1537,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
