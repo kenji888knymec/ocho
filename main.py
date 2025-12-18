@@ -1155,7 +1155,7 @@ def logic_main():
             if ai_model is None:
                 item["ai_pass"] = True
             else:
-                item["ai_pass"] = (E is not None) and (E > 0)
+                item["ai_pass"] = (E is not None) and (E > float(os.environ.get("E_TH", "0")))
 
             pending_candidates.append(item)
 
@@ -1660,6 +1660,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
