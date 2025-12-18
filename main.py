@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import random
+import json
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -50,10 +51,8 @@ _AI_LAST_ERROR = ""
 
 @app.get("/ai_health")
 def ai_health():
-    global AI_MODEL, ai_model
-    if AI_MODEL is None:
-        AI_MODEL = ai_model
-    ok = AI_MODEL is not None
+    global ai_model
+    ok = ai_model is not None
 
     payload = {
         "ok": bool(ok),
@@ -868,7 +867,7 @@ def _boot_notify_model_status_once(bucket, gcs_uri: str, local_path: str, ver: s
 
     try:
         blob.upload_from_string(
-            data=str(body),
+            data=json.dumps(body, ensure_ascii=False),
             content_type="application/json",
             if_generation_match=0,
         )
@@ -1617,4 +1616,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
