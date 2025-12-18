@@ -35,6 +35,175 @@ from config import (
     RUN_MUTEX,
 )
 
+# ==========================================================
+# 改善①：AIモデル運用の堅牢化（MODEL_VERSION / GCS配布 / 起動時ロード結果の可視化）
+# - Reserved1/2、E計算、Discord本文表示、append配列の列数は変更しない
+# ==========================================================
+MODEL_VERSION = os.environ.get("MODEL_VERSION", "").strip() or VERSION
+MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()  # 例: gs://your-bucket/models/trade_ai_model.pkl
+MODEL_LOCAL_FALLBACK = os.environ.get("MODEL_LOCAL_FALLBACK", "trade_ai_model.pkl").strip()
+
+_model_lock = threading.Lock()
+_model_obj = None
+_model_info = {
+    "enabled": bool(ENABLE_JUDGE),
+    "loaded": False,
+    "model_version": MODEL_VERSION,
+    "source": "",
+    "local_path": "",
+    "sha256": "",
+    "loaded_at": "",
+    "error": "",
+}
+_startup_model_notify_done = False
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
+    if not gs_uri.startswith("gs://"):
+        raise ValueError(f"MODEL_GCS_URI must start with gs://  got={gs_uri}")
+    no_scheme = gs_uri[len("gs://"):]
+    parts = no_scheme.split("/", 1)
+    bucket = parts[0]
+    blob = parts[1] if len(parts) > 1 else ""
+    if not bucket or not blob:
+        raise ValueError(f"Invalid gs uri: {gs_uri}")
+    return bucket, blob
+
+
+def _download_model_from_gcs(gs_uri: str, dst_path: str) -> None:
+    bucket_name, blob_name = _parse_gs_uri(gs_uri)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    blob.download_to_filename(dst_path)
+
+
+def _resolve_model_path() -> Tuple[str, str]:
+    """
+    Returns (path, source)
+    source: "gcs" | "local"
+    """
+    if MODEL_GCS_URI:
+        dst_dir = f"/tmp/models/{MODEL_VERSION}"
+        dst_path = os.path.join(dst_dir, "trade_ai_model.pkl")
+        return dst_path, "gcs"
+    return MODEL_LOCAL_FALLBACK, "local"
+
+
+def load_ai_model_if_needed(force: bool = False) -> bool:
+    """
+    AIモデルのロードを1箇所に集約（運用の見える化）
+    """
+    global _model_obj
+    with _model_lock:
+        if not ENABLE_JUDGE:
+            _model_info["enabled"] = False
+            _model_info["loaded"] = False
+            _model_info["source"] = ""
+            _model_info["local_path"] = ""
+            _model_info["sha256"] = ""
+            _model_info["loaded_at"] = ""
+            _model_info["error"] = "ENABLE_JUDGE is False"
+            _model_obj = None
+            return False
+
+        if _model_obj is not None and _model_info.get("loaded") and not force:
+            return True
+
+        path, source = _resolve_model_path()
+        try:
+            if source == "gcs":
+                _download_model_from_gcs(MODEL_GCS_URI, path)
+
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"model file not found: {path}")
+
+            obj = joblib.load(path)
+            sha = _sha256_file(path)
+
+            _model_obj = obj
+            _model_info["enabled"] = True
+            _model_info["loaded"] = True
+            _model_info["model_version"] = MODEL_VERSION
+            _model_info["source"] = source
+            _model_info["local_path"] = path
+            _model_info["sha256"] = sha
+            _model_info["loaded_at"] = datetime.now(timezone.utc).isoformat()
+            _model_info["error"] = ""
+            return True
+
+        except Exception as e:
+            _model_obj = None
+            _model_info["enabled"] = True
+            _model_info["loaded"] = False
+            _model_info["model_version"] = MODEL_VERSION
+            _model_info["source"] = source
+            _model_info["local_path"] = path
+            _model_info["sha256"] = ""
+            _model_info["loaded_at"] = datetime.now(timezone.utc).isoformat()
+            _model_info["error"] = f"{type(e).__name__}: {e}"
+            return False
+
+
+def get_ai_model() -> Optional[object]:
+    return _model_obj
+
+
+def _startup_notify_model_status_once() -> None:
+    """
+    起動時ロード結果を Discord に 1 回だけ通知したいが、
+    send_discord_message が未定義のタイミングもあるので安全に遅延させる。
+    """
+    global _startup_model_notify_done
+    if _startup_model_notify_done:
+        return
+
+    ok = load_ai_model_if_needed(force=False)
+
+    # send_discord_message がまだ無いなら、通知は“次回以降”に回す（ロードだけは済ませる）
+    if "send_discord_message" not in globals():
+        return
+
+    try:
+        if ok:
+            msg = (
+                f"[BOOT] AI model loaded: OK\n"
+                f"- model_version: {MODEL_VERSION}\n"
+                f"- source: {_model_info.get('source')}\n"
+                f"- path: {_model_info.get('local_path')}\n"
+                f"- sha256: {_model_info.get('sha256')[:12]}..."
+            )
+        else:
+            msg = (
+                f"[BOOT] AI model loaded: FAIL\n"
+                f"- model_version: {MODEL_VERSION}\n"
+                f"- source: {_model_info.get('source')}\n"
+                f"- path: {_model_info.get('local_path')}\n"
+                f"- error: {_model_info.get('error')}"
+            )
+        send_discord_message(msg)
+        _startup_model_notify_done = True
+    except Exception:
+        pass
+
+
+# ★起動時に “ロードだけ” 先に済ませる（通知は send_discord_message が使える時点で1回）
+try:
+    load_ai_model_if_needed(force=False)
+except Exception:
+    pass
+
+
 
 # ★追加：Discord送信は discord_util.py に分離（中身は同じ）
 from discord_util import send_discord_message
@@ -1704,6 +1873,7 @@ def healthz():
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
+    _startup_notify_model_status_once()
     print(f"[HEALTH] {request.method} {request.path}")
     return "ok", 200
 
@@ -1770,6 +1940,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
