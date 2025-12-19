@@ -1242,6 +1242,13 @@ def logic_main():
     btc_vol = 0.0
     btc_ok = False
 
+    # ===== BTC地合い（安全なデフォルトを先に用意）=====
+    btc_ok = False
+    btc_mode = "Range"
+    median_sigma = 0.01
+    btc_1h_change = 0.0
+    btc_vol = 0.0
+
     try:
         btc_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=60)
         if not btc_ohlcv or len(btc_ohlcv) < MIN_BARS:
@@ -1262,14 +1269,17 @@ def logic_main():
             btc_mode = "Up"
         elif btc_1h_change < -0.001:
             btc_mode = "Down"
+        else:
+            btc_mode = "Range"
 
         btc_ok = True
     except Exception as e:
         print(f"[WARN] BTC fetch failed: {e}")
 
-    BTC_CALM = btc_ok and (median_sigma < 0.005)
+    BTC_CALM = bool(btc_ok and (median_sigma < 0.005))
     ALLOW_LONG = (btc_mode != "Down")
     ALLOW_SHORT = (btc_mode != "Up")
+
 
     symbols = [
         "BTC/USDT", "DOT/USDT", "BONK/USDT", "DOGE/USDT", "LINK/USDT", "ETH/USDT", "SUI/USDT", "BNB/USDT", "UNI/USDT",
@@ -1400,17 +1410,77 @@ def logic_main():
 
             item["E"] = E
 
-            # ===== 最終判定（E > 0 を採用）=====
-            if ai_model is None:
+            # ===== 最終判定（改善③：地合いで閾値を動かす）=====
+            if ai_model is None or ai_score is None:
                 item["ai_pass"] = True
             else:
-                item["ai_pass"] = (E is not None) and (E > float(os.environ.get("E_TH", "0")))
+                # ベース閾値（既存の設定を尊重）
+                base_ai_th = float(AI_TH)
+                base_e_th = float(os.environ.get("E_TH", "0"))
+
+                # 地合いで調整：Calmは緩める / Stormは厳しくする
+                ai_th = base_ai_th
+                e_th = base_e_th
+
+                # median_sigma（BTCの代表ボラ）で大きく分岐
+                # 目安：CALM < 0.005 は既存定義通り
+                if BTC_CALM:
+                    # Calm：取り逃しを減らす（少し緩める）
+                    ai_th -= 0.03
+                    # Eは「0付近に大量に潰れる」ので、Calm時だけ僅かに負を許容すると機会損失が減る
+                    e_th -= 0.02
+                else:
+                    # Storm：ノイズを減らす（厳しく）
+                    ai_th += 0.07
+                    e_th += 0.03
+
+                # 方向性（btc_mode）で微調整：逆方向はより厳しく
+                # ※ALLOW_LONG/SHORT は既に使っている想定なので、ここは“判定強度”だけ調整
+                if item.get("is_buy", False) and btc_mode == "Down":
+                    ai_th += 0.05
+                    e_th += 0.02
+                if item.get("is_sell", False) and btc_mode == "Up":
+                    ai_th += 0.05
+                    e_th += 0.02
+
+                # 安全な上下限（暴れ防止）
+                if ai_th < 0.05:
+                    ai_th = 0.05
+                if ai_th > 0.95:
+                    ai_th = 0.95
+
+                # 採用：AI確率とEの両方で判定（改善③の“地合い適応”の最短で強い形）
+                item["ai_pass"] = (E is not None) and (float(ai_score) >= ai_th) and (float(E) > e_th)
 
             pending_candidates.append(item)
 
-            # 通知候補（ai_passはE込み判定）
-            if item["ai_pass"] and BTC_CALM and item["score"] >= ALERT_SIGMA:
+
+            # 通知候補（改善③：地合いで通知条件を動かす）
+            # ポイント：
+            # - Calmは従来通り出しやすく
+            # - Stormでも「完全停止」せず、条件を厳しくして通す（HIGHが取り逃されない）
+            score_th = float(ALERT_SIGMA)
+
+            # 地合いで通知閾値を調整
+            # Calm：少し緩める / Storm：少し厳しく
+            if BTC_CALM:
+                score_th -= 0.10
+            else:
+                score_th += 0.20
+
+            # 方向性がBTCと逆なら、さらに厳しく（無駄な逆張りを減らす）
+            if item.get("is_buy", False) and btc_mode == "Down":
+                score_th += 0.10
+            if item.get("is_sell", False) and btc_mode == "Up":
+                score_th += 0.10
+
+            # 安全な下限（緩めすぎ防止）
+            if score_th < 0.5:
+                score_th = 0.5
+
+            if item["ai_pass"] and item["score"] >= score_th:
                 pending_alerts.append(item)
+
 
 
         except Exception as e:
@@ -2184,6 +2254,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
