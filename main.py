@@ -2006,13 +2006,29 @@ def _e_report(days: int = 30) -> str:
     q33 = q(0.33)
     q67 = q(0.67)
 
+    # 分位が潰れる（q33==q67）場合のフォールバック：
+    # 直近データで E=0 が多数派のとき、分位3分割が成立しないため
+    # 「負 / 0 / 正」で必ず3群に分ける
+    if q33 == q67:
+        q_mode = "SIGN_FALLBACK"
+    else:
+        q_mode = "TERTILE"
 
-    def bucket(e):
+    def bucket(e: float) -> str:
+        if q_mode == "SIGN_FALLBACK":
+            if e < 0:
+                return "LOW"
+            if e == 0:
+                return "MID"
+            return "HIGH"
+
+        # 通常：分位3分割
         if e <= q33:
             return "LOW"
         if e <= q67:
             return "MID"
         return "HIGH"
+
 
     # 集計
     stats = {
@@ -2056,15 +2072,20 @@ def _e_report(days: int = 30) -> str:
         wr = s["win"] / n if n else 0.0
         avg = s["pnl_sum"] / n if n else 0.0
         sym_lines.append(f"{sym}: n={n} win_rate={wr:.2f} avg_pnl={avg:.2f}%")
+        
+    zeros = sum(1 for _, e, _, _ in data if e == 0)
+    negs = sum(1 for _, e, _, _ in data if e < 0)
+    poss = sum(1 for _, e, _, _ in data if e > 0)
 
     msg = (
-        f"[E_REPORT] last {days} days (DONE only)\n"
+        f"[E_REPORT] last {days} days (DONE only)  E_counts: neg={negs} zero={zeros} pos={poss}\n"
         f"E tertiles: q33={q33:.2f}  q67={q67:.2f}\n"
         f"{line('LOW')}\n"
         f"{line('MID')}\n"
         f"{line('HIGH')}\n"
         f"Top symbols:\n" + "\n".join(sym_lines)
     )
+
     return msg
 
 
@@ -2163,6 +2184,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
