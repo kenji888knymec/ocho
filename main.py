@@ -1482,39 +1482,12 @@ def logic_main():
 
             pending_candidates.append(item)
 
-
             # 通知候補（改善③：地合いで通知条件を動かす）
-            # ポイント：
-            # - Calmは従来通り出しやすく
-            # - Stormでも「完全停止」せず、条件を厳しくして通す（HIGHが取り逃されない）
-            score_th = float(ALERT_SIGMA)
+            # - score は地合いで動く alert_sigma_eff を採用
+            # - ai_pass は上で確定済み（AI_TH/E_th 地合い補正込み）
+            if item["ai_pass"] and (item["score"] >= float(alert_sigma_eff)):
+                pending_alerts.append(item)
 
-            # 地合いで通知閾値を調整
-            # Calm：少し緩める / Storm：少し厳しく
-            if BTC_CALM:
-                score_th -= 0.10
-            else:
-                score_th += 0.20
-
-            # 方向性がBTCと逆なら、さらに厳しく（無駄な逆張りを減らす）
-            if item.get("is_buy", False) and btc_mode == "Down":
-                score_th += 0.10
-            if item.get("is_sell", False) and btc_mode == "Up":
-                score_th += 0.10
-
-            # 安全な下限（緩めすぎ防止）
-            if score_th < 0.5:
-                score_th = 0.5
-
-        if item["ai_pass"] and (item["score"] >= alert_sigma_eff):
-            pending_alerts.append(item)
-
-
-
-
-        except Exception as e:
-            print(f"[ERR] {symbol} fetch/compute: {e}")
-            continue
 
 
     learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
@@ -2283,6 +2256,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
