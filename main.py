@@ -1988,14 +1988,24 @@ def _e_report(days: int = 30) -> str:
     if not data:
         return f"[E_REPORT] No DONE rows with E/PnL found in last {days} days."
 
-    # E を 3段階に分ける（最短・頑健：分位）
+    # E を 3段階に分ける（頑健：分位点は切り捨てで安定化）
     es = sorted([x[1] for x in data])
-    def q(p):
-        k = int(round((len(es) - 1) * p))
-        return es[max(0, min(len(es) - 1, k))]
+
+    def q(p: float) -> float:
+        n = len(es)
+        if n <= 0:
+            return 0.0
+        # round ではなく floor（切り捨て）で分位を安定化
+        k = int((n - 1) * p)
+        if k < 0:
+            k = 0
+        if k > n - 1:
+            k = n - 1
+        return float(es[k])
 
     q33 = q(0.33)
     q67 = q(0.67)
+
 
     def bucket(e):
         if e <= q33:
@@ -2153,6 +2163,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
