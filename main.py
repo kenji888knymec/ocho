@@ -1871,11 +1871,224 @@ def home():
 def healthz():
     return "ok", 200
 
+
+def _get_sheets_service_for_report():
+    """
+    既存コードに Sheets service 生成関数があっても壊さないため、
+    レポート専用にローカルで作る（必要十分・最短）。
+    """
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds, _ = google.auth.default(scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def _read_sheet_all_values(spreadsheet_id: str, sheet_name: str) -> List[List[Any]]:
+    svc = _get_sheets_service_for_report()
+    rng = f"{sheet_name}!A:ZZ"
+    resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    return resp.get("values", [])
+
+
+def _index_map(header_row: List[str]) -> Dict[str, int]:
+    m = {}
+    for i, name in enumerate(header_row):
+        m[str(name).strip()] = i
+    return m
+
+
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _e_report(days: int = 30) -> str:
+    """
+    learn_log を読み、E(Reserved2)のレンジ別に成績を集計して返す。
+    前提：
+      - Reserved2 に E（期待値%）が入っている
+      - PnL_Pct / ExitReason / EvalStatus が入っている（あなたの添付と同じ系）
+    """
+    rows = _read_sheet_all_values(SPREADSHEET_ID, LEARN_SHEET_NAME)
+    if not rows or len(rows) < 2:
+        return "[E_REPORT] learn_log is empty."
+
+    header = rows[0]
+    idx = _index_map(header)
+
+    # 必須列
+    need_cols = ["Reserved2", "PnL_Pct", "EvalStatus", "ExitReason", "Symbol"]
+    missing = [c for c in need_cols if c not in idx]
+    if missing:
+        return f"[E_REPORT] missing columns in learn_log: {missing}"
+
+    i_e = idx["Reserved2"]
+    i_pnl = idx["PnL_Pct"]
+    i_status = idx["EvalStatus"]
+    i_exit = idx["ExitReason"]
+    i_sym = idx["Symbol"]
+
+    # 任意列（あれば便利）
+    i_exit_time = idx.get("ExitTime", None)
+    i_dt = idx.get("Datetime(SymbolTime_JST)", idx.get("Datetime", None))
+
+    # “最近days日” に絞る（ExitTimeがあればExitTime、なければDatetimeで）
+    # パースできない行は対象に残す（最短で壊さない）
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def parse_dt(val: Any) -> Optional[datetime]:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s == "":
+            return None
+        # いくつかの形式を雑に吸収
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        return None
+
+    data = []
+    for r in rows[1:]:
+        if len(r) <= max(i_e, i_pnl, i_status, i_exit, i_sym):
+            continue
+
+        status = str(r[i_status]).strip().upper()
+        if status != "DONE":
+            continue
+
+        e = _to_float(r[i_e])
+        pnl = _to_float(r[i_pnl])
+        sym = str(r[i_sym]).strip()
+        exr = str(r[i_exit]).strip().upper()
+
+        if e is None or pnl is None or sym == "":
+            continue
+
+        dt_val = None
+        if i_exit_time is not None and i_exit_time < len(r):
+            dt_val = parse_dt(r[i_exit_time])
+        if dt_val is None and i_dt is not None and i_dt < len(r):
+            dt_val = parse_dt(r[i_dt])
+
+        if dt_val is not None and dt_val < cutoff:
+            continue
+
+        data.append((sym, e, pnl, exr))
+
+    if not data:
+        return f"[E_REPORT] No DONE rows with E/PnL found in last {days} days."
+
+    # E を 3段階に分ける（最短・頑健：分位）
+    es = sorted([x[1] for x in data])
+    def q(p):
+        k = int(round((len(es) - 1) * p))
+        return es[max(0, min(len(es) - 1, k))]
+
+    q33 = q(0.33)
+    q67 = q(0.67)
+
+    def bucket(e):
+        if e <= q33:
+            return "LOW"
+        if e <= q67:
+            return "MID"
+        return "HIGH"
+
+    # 集計
+    stats = {
+        "LOW": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
+        "MID": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
+        "HIGH": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
+    }
+
+    by_sym = {}  # sym -> same dict
+    for sym, e, pnl, exr in data:
+        b = bucket(e)
+        s = stats[b]
+        s["n"] += 1
+        s["win"] += 1 if pnl > 0 else 0
+        s["pnl_sum"] += pnl
+        s["sl"] += 1 if exr == "SL" else 0
+        s["tp"] += 1 if exr == "TP" else 0
+
+        if sym not in by_sym:
+            by_sym[sym] = {"n": 0, "win": 0, "pnl_sum": 0.0}
+        by_sym[sym]["n"] += 1
+        by_sym[sym]["win"] += 1 if pnl > 0 else 0
+        by_sym[sym]["pnl_sum"] += pnl
+
+    def line(b):
+        s = stats[b]
+        n = s["n"]
+        if n <= 0:
+            return f"{b}: n=0"
+        wr = s["win"] / n
+        avg = s["pnl_sum"] / n
+        slr = s["sl"] / n
+        tpr = s["tp"] / n
+        return f"{b}: n={n} win_rate={wr:.2f} avg_pnl={avg:.2f}% SL={slr:.2f} TP={tpr:.2f}"
+
+    # 銘柄別 上位（件数順）
+    top_syms = sorted(by_sym.items(), key=lambda kv: kv[1]["n"], reverse=True)[:10]
+    sym_lines = []
+    for sym, s in top_syms:
+        n = s["n"]
+        wr = s["win"] / n if n else 0.0
+        avg = s["pnl_sum"] / n if n else 0.0
+        sym_lines.append(f"{sym}: n={n} win_rate={wr:.2f} avg_pnl={avg:.2f}%")
+
+    msg = (
+        f"[E_REPORT] last {days} days (DONE only)\n"
+        f"E tertiles: q33={q33:.2f}  q67={q67:.2f}\n"
+        f"{line('LOW')}\n"
+        f"{line('MID')}\n"
+        f"{line('HIGH')}\n"
+        f"Top symbols:\n" + "\n".join(sym_lines)
+    )
+    return msg
+
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     _startup_notify_model_status_once()
     print(f"[HEALTH] {request.method} {request.path}")
     return "ok", 200
+
+
+@app.route("/e_report", methods=["GET"])
+def e_report():
+    """
+    手動確認用：
+      /e_report?days=30
+    Discordにも同じ内容を流す（確認しやすい）
+    """
+    days = request.args.get("days", "30")
+    try:
+        days_i = int(days)
+        if days_i < 1:
+            days_i = 1
+        if days_i > 365:
+            days_i = 365
+    except Exception:
+        days_i = 30
+
+    msg = _e_report(days=days_i)
+    try:
+        send_discord_message(msg)
+    except Exception:
+        pass
+    return msg, 200
+
 
 @app.route("/preflight", methods=["GET"])
 def preflight():
@@ -1940,6 +2153,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
