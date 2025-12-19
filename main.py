@@ -1229,9 +1229,12 @@ def logic_main():
         send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
         return f"SelfHealFailed: {msg}"
 
-    if (now_jst.minute % 15) >= 10:
+    force = (request.args.get("force", "0") == "1")
+
+    if (not force) and ((now_jst.minute % 15) >= 10):
         print(f"[RUN] skip (waiting window) minute={now_jst.minute}")
-        return "Waiting..."
+        return "Waiting...", 200
+
 
     exchange = build_exchange()
 
@@ -1279,6 +1282,31 @@ def logic_main():
     BTC_CALM = bool(btc_ok and (median_sigma < 0.005))
     ALLOW_LONG = (btc_mode != "Down")
     ALLOW_SHORT = (btc_mode != "Up")
+
+    # ==========================================
+    # 改善③：地合い別の “可変しきい値”
+    #  - alert_sigma_eff：通知のσしきい値（厳しさ）
+    #  - e_th_eff       ：期待値Eのしきい値（厳しさ）
+    # ==========================================
+    alert_sigma_eff = float(ALERT_SIGMA)
+    e_th_eff = float(os.environ.get("E_TH", "0"))
+
+    if BTC_CALM:
+        alert_sigma_eff -= 0.20  # calmは少し出しやすく
+    else:
+        alert_sigma_eff += 0.40  # 非calmは絞る
+        e_th_eff += 0.05         # 非calmは期待値も厳しく
+
+    if btc_mode == "Down":
+        alert_sigma_eff += 0.10
+        e_th_eff += 0.02
+    elif btc_mode == "Up":
+        alert_sigma_eff += 0.05
+
+    # 安全下限（極端に出しすぎない）
+    if alert_sigma_eff < 1.0:
+        alert_sigma_eff = 1.0
+
 
 
     symbols = [
@@ -1478,8 +1506,9 @@ def logic_main():
             if score_th < 0.5:
                 score_th = 0.5
 
-            if item["ai_pass"] and item["score"] >= score_th:
-                pending_alerts.append(item)
+        if item["ai_pass"] and (item["score"] >= alert_sigma_eff):
+            pending_alerts.append(item)
+
 
 
 
@@ -2254,6 +2283,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
