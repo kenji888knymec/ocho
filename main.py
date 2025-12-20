@@ -16,8 +16,7 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
-
-# ★追加：設定は config.py から読む（値は同じ）
+# ★設定は config.py から読む
 from config import (
     VERSION,
     SPREADSHEET_ID, MAIN_SHEET_NAME, LEARN_SHEET_NAME,
@@ -36,14 +35,12 @@ from config import (
 )
 
 # ==========================================================
-# 改善①：AIモデル運用の堅牢化（MODEL_VERSION / GCS配布 / 起動時ロード結果の可視化）
-# - Reserved1/2、E計算、Discord本文表示、append配列の列数は変更しない
+# AIモデル運用の堅牢化
 # ==========================================================
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "").strip() or VERSION
-MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()  # 例: gs://your-bucket/models/trade_ai_model.pkl
+MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()
 MODEL_LOCAL_FALLBACK = os.environ.get("MODEL_LOCAL_FALLBACK", "trade_ai_model.pkl").strip()
 MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
-
 
 _model_lock = threading.Lock()
 _model_obj = None
@@ -71,7 +68,7 @@ def _sha256_file(path: str) -> str:
 
 def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     if not gs_uri.startswith("gs://"):
-        raise ValueError(f"MODEL_GCS_URI must start with gs://  got={gs_uri}")
+        raise ValueError(f"MODEL_GCS_URI must start with gs:// got={gs_uri}")
     no_scheme = gs_uri[len("gs://"):]
     parts = no_scheme.split("/", 1)
     bucket = parts[0]
@@ -91,10 +88,6 @@ def _download_model_from_gcs(gs_uri: str, dst_path: str) -> None:
 
 
 def _resolve_model_path() -> Tuple[str, str]:
-    """
-    Returns (path, source)
-    source: "gcs" | "local"
-    """
     if MODEL_GCS_URI:
         dst_dir = f"/tmp/models/{MODEL_VERSION}"
         dst_path = os.path.join(dst_dir, "trade_ai_model.pkl")
@@ -103,18 +96,11 @@ def _resolve_model_path() -> Tuple[str, str]:
 
 
 def load_ai_model_if_needed(force: bool = False) -> bool:
-    """
-    AIモデルのロードを1箇所に集約（運用の見える化）
-    """
     global _model_obj
     with _model_lock:
         if not ENABLE_JUDGE:
             _model_info["enabled"] = False
             _model_info["loaded"] = False
-            _model_info["source"] = ""
-            _model_info["local_path"] = ""
-            _model_info["sha256"] = ""
-            _model_info["loaded_at"] = ""
             _model_info["error"] = "ENABLE_JUDGE is False"
             _model_obj = None
             return False
@@ -134,26 +120,19 @@ def load_ai_model_if_needed(force: bool = False) -> bool:
             sha = _sha256_file(path)
 
             _model_obj = obj
-            _model_info["enabled"] = True
-            _model_info["loaded"] = True
-            _model_info["model_version"] = MODEL_VERSION
-            _model_info["source"] = source
-            _model_info["local_path"] = path
-            _model_info["sha256"] = sha
-            _model_info["loaded_at"] = datetime.now(timezone.utc).isoformat()
-            _model_info["error"] = ""
+            _model_info.update({
+                "enabled": True, "loaded": True, "source": source,
+                "local_path": path, "sha256": sha,
+                "loaded_at": datetime.now(timezone.utc).isoformat(), "error": ""
+            })
             return True
-
         except Exception as e:
             _model_obj = None
-            _model_info["enabled"] = True
-            _model_info["loaded"] = False
-            _model_info["model_version"] = MODEL_VERSION
-            _model_info["source"] = source
-            _model_info["local_path"] = path
-            _model_info["sha256"] = ""
-            _model_info["loaded_at"] = datetime.now(timezone.utc).isoformat()
-            _model_info["error"] = f"{type(e).__name__}: {e}"
+            _model_info.update({
+                "loaded": False, "source": source, "local_path": path,
+                "loaded_at": datetime.now(timezone.utc).isoformat(),
+                "error": f"{type(e).__name__}: {e}"
+            })
             return False
 
 
@@ -161,166 +140,139 @@ def get_ai_model() -> Optional[object]:
     return _model_obj
 
 
+def _boot_marker_once_if_possible(ok: bool, err: str) -> None:
+    try:
+        if not MODEL_GCS_URI:
+            return
+        bucket_name, _ = _parse_gs_uri(MODEL_GCS_URI)
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        key = os.environ.get("K_REVISION", "").strip() or MODEL_VERSION or "unknown"
+        marker_name = f"markers/crypto-alert/boot/{key}.json"
+        blob = bucket.blob(marker_name)
+        body = {
+            "ok": bool(ok),
+            "service": os.environ.get("K_SERVICE", ""),
+            "revision": os.environ.get("K_REVISION", ""),
+            "model_version": _model_info.get("model_version", ""),
+            "model_uri": MODEL_GCS_URI,
+            "model_local_path": _model_info.get("local_path", ""),
+            "loaded_at": _model_info.get("loaded_at", ""),
+            "last_error": ("" if ok else (err or ""))[:500],
+        }
+        blob.upload_from_string(
+            data=json.dumps(body, ensure_ascii=False),
+            content_type="application/json",
+            if_generation_match=0
+        )
+    except Exception as e:
+        print(f"[WARN] boot marker skipped/failed: {e}")
+
+
 def _startup_notify_model_status_once() -> None:
-    """
-    起動時ロード結果を Discord に 1 回だけ通知したいが、
-    send_discord_message が未定義のタイミングもあるので安全に遅延させる。
-    """
     global _startup_model_notify_done
     if _startup_model_notify_done:
         return
-
     ok = load_ai_model_if_needed(force=False)
-
-    # send_discord_message がまだ無いなら、通知は“次回以降”に回す（ロードだけは済ませる）
     if "send_discord_message" not in globals():
         return
-
     try:
         if ok:
             msg = (
                 f"[BOOT] AI model loaded: OK\n"
                 f"- model_version: {MODEL_VERSION}\n"
                 f"- source: {_model_info.get('source')}\n"
-                f"- path: {_model_info.get('local_path')}\n"
                 f"- sha256: {_model_info.get('sha256')[:12]}..."
             )
         else:
             msg = (
                 f"[BOOT] AI model loaded: FAIL\n"
                 f"- model_version: {MODEL_VERSION}\n"
-                f"- source: {_model_info.get('source')}\n"
-                f"- path: {_model_info.get('local_path')}\n"
                 f"- error: {_model_info.get('error')}"
             )
         send_discord_message(msg)
+        _boot_marker_once_if_possible(ok=ok, err=_model_info.get("error", ""))
         _startup_model_notify_done = True
     except Exception:
         pass
 
 
-# （削除）起動時の先行ロードは行わない：load_ai_model() 側で一元化する（GCS配布＆通知も一本化）
-
-
-
-
-# ★追加：Discord送信は discord_util.py に分離（中身は同じ）
 from discord_util import send_discord_message
 
 # ==========================================
-# Flask設定（Buildpacks標準：main.py の app を起動）
+# Flask設定
 # ==========================================
 app = Flask(__name__)
-
-# 起動時に1回だけモデルロードし、Discordに結果を通知（成功/失敗）
-# ※ ここで load_ai_model_if_needed() が動くので「AIをONにしたのにOFF扱い」を潰せます
 _startup_notify_model_status_once()
-
-# 互換：既存コードが AI_MODEL 変数を参照している場合に備えてセットしておく
-AI_MODEL = get_ai_model()
-
-# デバッグ表示用（/health 等で返したい場合に使える）
-_AI_LOADED_AT = _model_info.get("loaded_at", "")
-_AI_LAST_ERROR = _model_info.get("error", "")
-
-
-
-@app.get("/ai_health")
-def ai_health():
-    global ai_model
-    ok = ai_model is not None
-
-    payload = {
-        "ok": bool(ok),
-        "service": os.environ.get("K_SERVICE", ""),
-        "revision": os.environ.get("K_REVISION", ""),
-        "model_version": os.environ.get("MODEL_VERSION", "").strip(),
-        "model_uri": os.environ.get("MODEL_GCS_URI", "").strip(),
-        "model_local_path": MODEL_LOCAL_PATH,
-        "loaded_at": _AI_LOADED_AT,
-        "last_error": _AI_LAST_ERROR,
-    }
-    status = 200 if ok else 503
-    return jsonify(payload), status
-
-
+ai_model = get_ai_model()
 
 # ==========================================
-# グローバル
+# グローバル & ヘルパー
 # ==========================================
-ai_model = None
-
-last_alert_records: Dict[str, int] = {}
-last_candidate_records: Dict[str, int] = {}
-
-_sheet_header_cache: Dict[str, Dict[str, Any]] = {}
-_sheet_service_cache: Dict[str, Any] = {"svc": None, "ts": 0.0}
-_sheet_colcount_cache: Dict[str, Dict[str, Any]] = {}
-_dedup_cache: Dict[str, Dict[str, Any]] = {}
-_row_count_cache: Dict[str, Dict[str, Any]] = {}
+last_alert_records, last_candidate_records = {}, {}
+_sheet_header_cache = {}
+_sheet_service_cache = {"svc": None, "ts": 0.0}
+_sheet_colcount_cache = {}
+_dedup_cache = {}
+_row_count_cache = {}
 ROWCOUNT_TTL_SEC = 180
 
-
-_exchange_cache: Dict[str, Any] = {"ex": None, "ts": 0.0}
-_symbol_resolve_cache: Dict[str, str] = {}
-
+_exchange_cache, _symbol_resolve_cache = {"ex": None, "ts": 0.0}, {}
 _run_lock = RUN_MUTEX
+_INSTANCE_ID = "|".join([
+    os.environ.get("K_SERVICE", "svc"),
+    os.environ.get("K_REVISION", "rev"),
+    os.environ.get("HOSTNAME", "host"),
+    str(os.getpid())
+])
 
-_INSTANCE_ID = "|".join(
-    [
-        os.environ.get("K_SERVICE", "svc"),
-        os.environ.get("K_REVISION", "rev"),
-        os.environ.get("HOSTNAME", "host"),
-        str(os.getpid()),
-    ]
-)
+_DT_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"]
 
-# ==========================================
-# 日時の正規化
-# ==========================================
-_DT_FORMATS = [
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d %H:%M",
-    "%Y/%m/%d %H:%M:%S",
-    "%Y/%m/%d %H:%M",
-]
 
 def parse_dt_any(s: str) -> Optional[datetime]:
-    s = ("" if s is None else str(s)).strip()
+    s = str(s or "").strip()
     if not s:
         return None
     if s.startswith("'"):
         s = s[1:].strip()
     s = s.replace("JST", "").strip()
 
+    dt = None
     for fmt in _DT_FORMATS:
         try:
-            return datetime.strptime(s, fmt)
+            dt = datetime.strptime(s, fmt)
+            break
         except Exception:
             pass
 
-    try:
-        ts = pd.to_datetime(s, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts.to_pydatetime()
-    except Exception:
+    if dt is None:
+        try:
+            ts = pd.to_datetime(s, errors="coerce")
+            dt = None if pd.isna(ts) else ts.to_pydatetime()
+        except Exception:
+            dt = None
+
+    if dt is None:
         return None
+
+    # Time列はJST文字列で保存している前提：
+    # - naive は JST を付与
+    # - tz付きは JST に寄せて統一（Z/UTC混在でも dedup がズレない）
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JST)
+    else:
+        dt = dt.astimezone(JST)
+
+    return dt
+
 
 def normalize_dt_str(s: str) -> str:
     dt = parse_dt_any(s)
-    if dt is None:
-        return ("" if s is None else str(s)).strip()
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else str(s or "").strip()
 
-# ===========================
-# A1列変換（0-based）
-# ===========================
+
 def col_to_a1(idx0: int) -> str:
-    idx = int(idx0)
-    if idx < 0:
-        return "A"
-    s = ""
+    idx, s = int(idx0), ""
     while True:
         idx, r = divmod(idx, 26)
         s = chr(65 + r) + s
@@ -329,2020 +281,874 @@ def col_to_a1(idx0: int) -> str:
         idx -= 1
     return s
 
+
 def _invalidate_sheet_caches(sheet_name: str):
-    _row_count_cache.pop(sheet_name, None)
-    _dedup_cache.pop(sheet_name, None)
-    _sheet_header_cache.pop(sheet_name, None)
+    for cache in [_row_count_cache, _dedup_cache, _sheet_header_cache]:
+        cache.pop(sheet_name, None)
+
 
 # ==========================================
-# Sheets execute wrapper（429/5xx対策）
+# Sheets API 実行
 # ==========================================
-SHEETS_RETRY_MAX = 6
-SHEETS_RETRY_BASE_SEC = 1.0
-SHEETS_RETRY_MAX_SLEEP_SEC = 20.0
-
-def _http_status(err: Exception) -> int:
-    try:
-        resp = getattr(err, "resp", None)
-        st = getattr(resp, "status", 0)
-        return int(st) if st is not None else 0
-    except Exception:
-        return 0
-
 def sheets_execute(req, desc: str = ""):
-    last = None
-    for attempt in range(SHEETS_RETRY_MAX + 1):
+    for attempt in range(7):
         try:
             return req.execute()
         except HttpError as e:
-            last = e
-            st = _http_status(e)
-            retryable = st in (429, 500, 503)
-            if retryable and attempt < SHEETS_RETRY_MAX:
-                sleep = min(SHEETS_RETRY_BASE_SEC * (2 ** attempt), SHEETS_RETRY_MAX_SLEEP_SEC)
-                sleep += random.random()
-                print(f"[WARN] Sheets retry {attempt+1}/{SHEETS_RETRY_MAX} sleep={sleep:.1f}s status={st} {desc}")
-                time.sleep(sleep)
+            st = int(getattr(e.resp, "status", 0) or 0)
+            if st in (429, 500, 503) and attempt < 6:
+                time.sleep(min(1.0 * (2 ** attempt), 20.0) + random.random())
                 continue
             raise
-        except Exception as e:
-            last = e
-            if attempt < SHEETS_RETRY_MAX:
-                sleep = min(SHEETS_RETRY_BASE_SEC * (2 ** attempt), SHEETS_RETRY_MAX_SLEEP_SEC)
-                sleep += random.random()
-                print(f"[WARN] Sheets retry {attempt+1}/{SHEETS_RETRY_MAX} sleep={sleep:.1f}s {desc} err={e}")
-                time.sleep(sleep)
+        except Exception:
+            if attempt < 6:
+                time.sleep(min(1.0 * (2 ** attempt), 20.0) + random.random())
                 continue
-            raise last
+            raise
 
-# ==========================================
-# Sheets: service
-# ==========================================
+
 def get_sheet_service():
     now = time.time()
-    svc = _sheet_service_cache.get("svc")
-    ts = float(_sheet_service_cache.get("ts", 0))
-    if svc is not None and (now - ts) <= SVC_TTL_SEC:
-        return svc
+    if _sheet_service_cache["svc"] and (now - _sheet_service_cache["ts"]) <= SVC_TTL_SEC:
+        return _sheet_service_cache["svc"]
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    _sheet_service_cache["svc"] = svc
-    _sheet_service_cache["ts"] = now
+    _sheet_service_cache.update({"svc": svc, "ts": now})
     return svc
 
-def _normalize_headers(headers: List[Any]) -> List[str]:
-    hs = [("" if h is None else str(h)).strip() for h in headers]
-    while hs and hs[-1] == "":
-        hs.pop()
-    return hs
-
-def _build_headers_map(headers: List[str]) -> Dict[str, int]:
-    m: Dict[str, int] = {}
-    for i, h in enumerate(headers):
-        key = ("" if h is None else str(h)).strip()
-        if key != "":
-            m[key] = i
-    return m
-
-def _resolve_col_idx(headers_map: Dict[str, int], field: str) -> int:
-    for cand in FIELD_ALIASES.get(field, [field]):
-        if cand in headers_map:
-            return int(headers_map[cand])
-    return -1
-
-def _expected_header_len(sheet_name: str) -> int:
-    if sheet_name == MAIN_SHEET_NAME:
-        return HEADER_LEN_TABLE
-    if sheet_name == LEARN_SHEET_NAME:
-        return HEADER_LEN_LEARN
-    return 0
 
 # ==========================================
-# シート存在確認・作成（_lock等）
+# シート/ヘッダー管理
 # ==========================================
-def _get_sheets_meta() -> Dict[str, Any]:
-    service = get_sheet_service()
+def _get_sheets_meta():
     return sheets_execute(
-        service.spreadsheets().get(
+        get_sheet_service().spreadsheets().get(
             spreadsheetId=SPREADSHEET_ID,
-            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
-        ),
-        desc="_get_sheets_meta",
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))"
+        )
     )
 
-def _resize_sheet_if_needed(sheet_name: str, min_rows: int, min_cols: int) -> bool:
-    """
-    既存シートの gridProperties(rowCount/columnCount) が不足していれば拡張する。
-    Output length invalid（列数不足）を根本から潰すための処理。
-    """
+
+def _resize_sheet_if_needed(sheet_name: str, min_rows: int, min_cols: int):
     try:
         meta = _get_sheets_meta()
-        target_sheet_id = None
-        cur_rows = None
-        cur_cols = None
-
-        for sh in meta.get("sheets", []) or []:
-            p = (sh or {}).get("properties", {}) or {}
-            if p.get("title") == sheet_name:
-                target_sheet_id = p.get("sheetId")
-                gp = (p.get("gridProperties") or {})
-                cur_rows = int(gp.get("rowCount") or 0)
-                cur_cols = int(gp.get("columnCount") or 0)
-                break
-
-        if target_sheet_id is None:
+        target = next((s["properties"] for s in meta.get("sheets", []) if s["properties"]["title"] == sheet_name), None)
+        if not target:
             return False
-
-        need_rows = max(int(min_rows), int(cur_rows or 0))
-        need_cols = max(int(min_cols), int(cur_cols or 0))
-
-        if (cur_rows or 0) >= need_rows and (cur_cols or 0) >= need_cols:
-            return True  # 既に十分
-
-        service = get_sheet_service()
+        cur_r = int(target["gridProperties"]["rowCount"])
+        cur_c = int(target["gridProperties"]["columnCount"])
+        if cur_r >= min_rows and cur_c >= min_cols:
+            return True
         req = {
             "requests": [
                 {
                     "updateSheetProperties": {
                         "properties": {
-                            "sheetId": int(target_sheet_id),
+                            "sheetId": target["sheetId"],
                             "gridProperties": {
-                                "rowCount": int(need_rows),
-                                "columnCount": int(need_cols),
-                            },
+                                "rowCount": max(min_rows, cur_r),
+                                "columnCount": max(min_cols, cur_c)
+                            }
                         },
-                        "fields": "gridProperties(rowCount,columnCount)",
+                        "fields": "gridProperties(rowCount,columnCount)"
                     }
                 }
             ]
         }
-        sheets_execute(
-            service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req),
-            desc=f"_resize_sheet_if_needed sheet={sheet_name} rows={need_rows} cols={need_cols}",
-        )
+        sheets_execute(get_sheet_service().spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req))
         _invalidate_sheet_caches(sheet_name)
-        print(f"[CFG] resized sheet: {sheet_name} rows={need_rows} cols={need_cols}")
         return True
-
-    except Exception as e:
-        print(f"[WARN] _resize_sheet_if_needed failed: sheet={sheet_name} err={e}")
+    except Exception:
         return False
 
 
-def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 26) -> bool:
+def ensure_sheet_exists(sheet_name: str, min_rows: int = 1000, min_cols: int = 26):
     if not AUTO_CREATE_SHEETS:
         return True
-
     try:
         meta = _get_sheets_meta()
-        for sh in meta.get("sheets", []) or []:
-            p = (sh or {}).get("properties", {}) or {}
-            if p.get("title") == sheet_name:
-                # ★既存シートは「作る」だけだと列数不足が残るので、ここで必ず拡張チェックする
-                _resize_sheet_if_needed(sheet_name, min_rows=int(min_rows), min_cols=int(min_cols))
-                return True
-
-        # 無ければ作成
-        service = get_sheet_service()
-        req = {
-            "requests": [
-                {
-                    "addSheet": {
-                        "properties": {
-                            "title": sheet_name,
-                            "gridProperties": {"rowCount": int(min_rows), "columnCount": int(min_cols)},
-                        }
-                    }
-                }
-            ]
-        }
-        sheets_execute(
-            service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req),
-            desc=f"ensure_sheet_exists addSheet={sheet_name}",
-        )
-        print(f"[CFG] created sheet: {sheet_name}")
-
-        # 作成直後も念のため拡張チェック（将来の min_cols 変更にも強くする）
-        _resize_sheet_if_needed(sheet_name, min_rows=int(min_rows), min_cols=int(min_cols))
-        return True
-
-    except Exception as e:
-        print(f"[WARN] ensure_sheet_exists failed: sheet={sheet_name} err={e}")
+        if any(s["properties"]["title"] == sheet_name for s in meta.get("sheets", [])):
+            return _resize_sheet_if_needed(sheet_name, min_rows, min_cols)
+        req = {"requests": [{"addSheet": {"properties": {"title": sheet_name, "gridProperties": {"rowCount": min_rows, "columnCount": min_cols}}}}]}
+        sheets_execute(get_sheet_service().spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=req))
+        return _resize_sheet_if_needed(sheet_name, min_rows, min_cols)
+    except Exception:
         return False
 
 
-def get_sheet_colcount(sheet_name: str) -> Optional[int]:
+def get_sheet_colcount(sheet_name: str):
     now = time.time()
-    c = _sheet_colcount_cache.get(sheet_name)
-    if c and (now - float(c.get("ts", 0))) <= COLCOUNT_TTL_SEC:
-        n = c.get("n")
-        return int(n) if isinstance(n, int) and n > 0 else None
-
+    if sheet_name in _sheet_colcount_cache and (now - _sheet_colcount_cache[sheet_name]["ts"]) <= COLCOUNT_TTL_SEC:
+        return _sheet_colcount_cache[sheet_name]["n"]
     try:
         meta = _get_sheets_meta()
-        for sh in meta.get("sheets", []) or []:
-            p = (sh or {}).get("properties", {}) or {}
-            if p.get("title") == sheet_name:
-                cc = int(((p.get("gridProperties") or {}).get("columnCount") or 0))
-                if cc > 0:
-                    _sheet_colcount_cache[sheet_name] = {"ts": now, "n": cc}
-                    return cc
-                break
-    except Exception as e:
-        print(f"[WARN] get_sheet_colcount failed: sheet={sheet_name} err={e}")
+        target = next((s["properties"] for s in meta.get("sheets", []) if s["properties"]["title"] == sheet_name), None)
+        if target:
+            cc = int(target["gridProperties"]["columnCount"])
+            _sheet_colcount_cache[sheet_name] = {"ts": now, "n": cc}
+            return cc
+    except Exception:
+        pass
+    return None
 
-    fs = _expected_header_len(sheet_name)
-    return fs if fs > 0 else None
 
-def read_header_row(sheet_name: str) -> List[str]:
+def read_header_row(sheet_name: str):
     try:
-        service = get_sheet_service()
-        rng = f"{sheet_name}!A1:{HEADER_COL_END}1"
         res = sheets_execute(
-            service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng),
-            desc=f"read_header_row sheet={sheet_name}",
+            get_sheet_service().spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{sheet_name}!A1:{HEADER_COL_END}1"
+            )
         )
-        raw = (res.get("values", [[]]) or [[]])[0]
-        hs = _normalize_headers(raw)
+        hs = [str(h or "").strip() for h in (res.get("values", [[]])[0])]
+        while hs and not hs[-1]:
+            hs.pop()
         if hs:
             return hs
+    except Exception:
+        pass
+    return _sheet_header_cache.get(sheet_name, {}).get("headers", [])
 
-        # ここ重要：一時的に空が返ってもキャッシュを使って壊しにくくする
-        c = _sheet_header_cache.get(sheet_name)
-        prev = (c or {}).get("headers", [])
-        return prev if prev else []
 
-    except Exception as e:
-        print(f"[WARN] read_header_row failed: sheet={sheet_name} err={e}")
-        c = _sheet_header_cache.get(sheet_name)
-        prev = (c or {}).get("headers", [])
-        return prev if prev else []
-
-def write_header_row(sheet_name: str, headers: List[str]) -> bool:
+def write_header_row(sheet_name: str, headers: List[str]):
     try:
-        service = get_sheet_service()
-        end_col = col_to_a1(max(len(headers) - 1, 0))
-        rng = f"{sheet_name}!A1:{end_col}1"
+        rng = f"{sheet_name}!A1:{col_to_a1(len(headers) - 1)}1"
         sheets_execute(
-            service.spreadsheets().values().update(
+            get_sheet_service().spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=rng,
                 valueInputOption="RAW",
-                body={"values": [headers]},
-            ),
-            desc=f"write_header_row sheet={sheet_name}",
+                body={"values": [headers]}
+            )
         )
         _invalidate_sheet_caches(sheet_name)
         return True
-    except Exception as e:
-        print(f"[WARN] write_header_row failed: sheet={sheet_name} err={e}")
+    except Exception:
         return False
 
-def update_single_cell(sheet_name: str, col0: int, row1: int, value: str) -> bool:
+
+def update_single_cell(sheet_name: str, col0: int, row1: int, value: Any):
     try:
-        service = get_sheet_service()
-        a1 = col_to_a1(col0)
-        rng = f"{sheet_name}!{a1}{row1}"
         sheets_execute(
-            service.spreadsheets().values().update(
+            get_sheet_service().spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=rng,
+                range=f"{sheet_name}!{col_to_a1(col0)}{row1}",
                 valueInputOption="RAW",
-                body={"values": [[value]]},
-            ),
-            desc=f"update_single_cell sheet={sheet_name} cell={rng}",
+                body={"values": [[value]]}
+            )
         )
         _invalidate_sheet_caches(sheet_name)
         return True
-    except Exception as e:
-        print(f"[WARN] update_single_cell failed: sheet={sheet_name} err={e}")
+    except Exception:
         return False
 
-# ==========================================
-# ヘッダー自動修復
-# ==========================================
-def ensure_learn_headers() -> bool:
-    ensure_sheet_exists(LEARN_SHEET_NAME, min_rows=5000, min_cols=max(32, HEADER_LEN_LEARN, 40))
 
-    headers = read_header_row(LEARN_SHEET_NAME)
-    if headers[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN:
+def ensure_learn_headers():
+    ensure_sheet_exists(LEARN_SHEET_NAME, 5000, 40)
+    hs = read_header_row(LEARN_SHEET_NAME)
+    if hs[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN:
         return True
+    return write_header_row(LEARN_SHEET_NAME, EXPECTED_HEADERS_LEARN) if AUTO_FIX_HEADERS else (not STRICT_HEADER_CHECK)
 
-    if not AUTO_FIX_HEADERS:
-        return not STRICT_HEADER_CHECK
 
-    ok = write_header_row(LEARN_SHEET_NAME, EXPECTED_HEADERS_LEARN)
-    if ok:
-        print("[CFG] learn_log headers fixed.")
-    return ok
-
-def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
-    max_i = len(headers) if limit is None else min(len(headers), limit)
-    for i in range(max_i):
-        if str(headers[i]).strip() == "":
-            return i
-    return -1
-
-def ensure_table_headers() -> bool:
-    ensure_sheet_exists(MAIN_SHEET_NAME, min_rows=20000, min_cols=max(HEADER_LEN_TABLE, 40))
-
-    headers = read_header_row(MAIN_SHEET_NAME)
-    colcount = get_sheet_colcount(MAIN_SHEET_NAME)
-    hm = _build_headers_map(headers)
-
+def ensure_table_headers():
+    ensure_sheet_exists(MAIN_SHEET_NAME, 20000, 40)
+    hs = read_header_row(MAIN_SHEET_NAME)
+    hm = {str(h).strip(): i for i, h in enumerate(hs) if str(h).strip()}
     if AUTO_FIX_HEADERS:
-        for canonical in TABLE_REQUIRED_FIELDS:
-            if canonical in hm:
-                continue
-            for alias in FIELD_ALIASES.get(canonical, [canonical]):
-                if alias in hm:
-                    idx = int(hm[alias])
-                    if str(alias).strip() != canonical:
-                        update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical)
-                    break
+        for f in TABLE_REQUIRED_FIELDS:
+            if f not in hm:
+                for alias in FIELD_ALIASES.get(f, [f]):
+                    if alias in hm:
+                        update_single_cell(MAIN_SHEET_NAME, hm[alias], 1, f)
+                        break
+        hs = read_header_row(MAIN_SHEET_NAME)
+        hm = {str(h).strip(): i for i, h in enumerate(hs) if str(h).strip()}
+        for f in TABLE_REQUIRED_FIELDS:
+            if f not in hm:
+                idx = next((i for i, h in enumerate(hs + [""] * 10) if not h), -1)
+                if idx == -1:
+                    return False
+                update_single_cell(MAIN_SHEET_NAME, idx, 1, f)
+                hs = read_header_row(MAIN_SHEET_NAME)
+                hm = {str(h).strip(): i for i, h in enumerate(hs) if str(h).strip()}
+    return all(f in hm for f in TABLE_REQUIRED_FIELDS) if STRICT_HEADER_CHECK else True
 
-        headers = read_header_row(MAIN_SHEET_NAME)
-        hm = _build_headers_map(headers)
-        for canonical in TABLE_REQUIRED_FIELDS:
-            if canonical in hm:
-                continue
-            limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
-            blank_idx = _find_first_blank_index(headers + [""] * 5, limit)
-            if blank_idx == -1:
-                msg = f"[WARN] table missing required col '{canonical}' and no blank header cell. Please add a blank column."
-                print(msg)
-                send_discord_message(msg)
-                return False
-            update_single_cell(MAIN_SHEET_NAME, blank_idx, 1, canonical)
-            headers = read_header_row(MAIN_SHEET_NAME)
-            hm = _build_headers_map(headers)
 
-    headers = read_header_row(MAIN_SHEET_NAME)
-    hm = _build_headers_map(headers)
-    missing = [f for f in TABLE_REQUIRED_FIELDS if _resolve_col_idx(hm, f) == -1]
-    if missing:
-        msg = f"[WARN] table headers still missing: {missing}"
-        print(msg)
-        send_discord_message(msg)
-        return (not STRICT_HEADER_CHECK)
-
-    return True
-
-def get_headers_and_len(sheet_name: str) -> Tuple[List[str], Optional[int], bool]:
+def get_headers_and_len(sheet_name: str):
     now = time.time()
+    if sheet_name in _sheet_header_cache and (now - _sheet_header_cache[sheet_name]["ts"]) <= HEADER_TTL_SEC:
+        return _sheet_header_cache[sheet_name]["headers"], get_sheet_colcount(sheet_name), _sheet_header_cache[sheet_name]["ok"]
 
-    if sheet_name in _sheet_header_cache:
-        c = _sheet_header_cache[sheet_name]
-        ts = float(c.get("ts", 0))
-        if (now - ts) <= HEADER_TTL_SEC:
-            headers = c.get("headers", [])
-            ok = bool(c.get("ok", True))
-            colcount = get_sheet_colcount(sheet_name)
-            return headers, colcount, ok
-
-    headers = read_header_row(sheet_name)
-    colcount = get_sheet_colcount(sheet_name)
-
+    hs = read_header_row(sheet_name)
     ok = True
     if STRICT_HEADER_CHECK:
         if sheet_name == LEARN_SHEET_NAME:
-            ok = (headers[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN)
-        elif sheet_name == MAIN_SHEET_NAME:
-            hm = _build_headers_map(headers)
-            ok = all(_resolve_col_idx(hm, f) != -1 for f in TABLE_REQUIRED_FIELDS)
+            ok = hs[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN
+        else:
+            hm = {str(h).strip(): i for i, h in enumerate(hs)}
+            ok = all(any(a in hm for a in FIELD_ALIASES.get(f, [f])) for f in TABLE_REQUIRED_FIELDS)
 
-    # ここ重要：headersが空の時にキャッシュを空で上書きしない（壊れにくくする）
-    if headers:
-        _sheet_header_cache[sheet_name] = {"headers": headers, "ts": now, "ok": ok}
-    else:
-        if sheet_name not in _sheet_header_cache:
-            _sheet_header_cache[sheet_name] = {"headers": [], "ts": now, "ok": ok}
+    if hs:
+        _sheet_header_cache[sheet_name] = {"headers": hs, "ts": now, "ok": ok}
+    return hs, get_sheet_colcount(sheet_name), ok
 
-    return headers, colcount, ok
-
-# ==========================================
-# append（列拡張防止）
-# ==========================================
-def _compute_out_len(sheet_name: str, headers: List[str], colcount: Optional[int], fields: List[str]) -> Optional[int]:
-    hm = _build_headers_map(headers)
-    idxs = []
-    for f in fields:
-        col = _resolve_col_idx(hm, f)
-        if col >= 0:
-            idxs.append(col)
-
-    base_len = max(len(headers), _expected_header_len(sheet_name), 1)
-    need_len = max(base_len, (max(idxs) + 1) if idxs else base_len)
-
-    if colcount is not None and need_len > colcount:
-        return None
-    return need_len
-
-def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_values: List[Any]) -> List[Any]:
-    hm = _build_headers_map(headers)
-    out = [""] * out_len
-    for f, v in zip(fields, row_values):
-        col = _resolve_col_idx(hm, f)
-        if col == -1:
-            continue
-        if 0 <= col < out_len:
-            out[col] = v
-    return out
 
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
-    headers, colcount, ok = get_headers_and_len(sheet_name)
-
-    # ★重要：learn_log は「一時的にヘッダーが空」でも自己回復して記録を落とさない
+    headers, cc, ok = get_headers_and_len(sheet_name)
     if not headers:
         if sheet_name == LEARN_SHEET_NAME:
-            try:
-                ensure_learn_headers()  # ヘッダー自己修復（AUTO_FIX_HEADERS が有効なら書き直す）
-            except Exception:
-                pass
-            headers = list(EXPECTED_HEADERS_LEARN)  # 空のまま落とさず、このヘッダーで整列して追記する
-            colcount = get_sheet_colcount(sheet_name)
-            ok = True
-            print(f"[WARN] Headers empty but recovered for learn_log. sheet={sheet_name}")
+            ensure_learn_headers()
+            headers, cc, ok = list(EXPECTED_HEADERS_LEARN), get_sheet_colcount(sheet_name), True
         else:
-            msg = f"[WARN] Headers empty. Skip append to prevent corruption. sheet={sheet_name}"
-            print(msg)
-            send_discord_message(msg)
             return
-
     if STRICT_HEADER_CHECK and not ok:
-        # learn_log は上で ok=True にしているので通常ここで止まらない
-        msg = f"[WARN] Header check failed. Skip append to prevent corruption. sheet={sheet_name}"
-        print(msg)
-        send_discord_message(msg)
         return
 
-
-    if colcount is None:
-        out_len = len(headers)
-    else:
-        out_len = _compute_out_len(sheet_name, headers, colcount, fields)
-
-    if not out_len or out_len <= 0:
-        msg = f"[WARN] Output length invalid. Skip append. sheet={sheet_name}"
-        print(msg)
-        send_discord_message(msg)
-        return
-
-    if colcount is not None and out_len > colcount:
-        msg = f"[WARN] Output length cannot fit sheet columnCount. Skip append. sheet={sheet_name}"
-        print(msg)
-        send_discord_message(msg)
+    hm = {str(h).strip(): i for i, h in enumerate(headers)}
+    idxs = [next((hm[a] for a in FIELD_ALIASES.get(f, [f]) if a in hm), -1) for f in fields]
+    out_len = max(len(headers), (max(idxs) + 1) if idxs else 0)
+    if cc and out_len > cc:
         return
 
     try:
-        adjusted_rows: List[List[Any]] = []
-        for r in rows_values:
-            adjusted_rows.append(_make_aligned_row(headers, out_len, fields, r))
+        adj = []
+        for rv in rows_values:
+            row = [""] * out_len
+            for f_idx, val in enumerate(rv):
+                if idxs[f_idx] >= 0:
+                    row[idxs[f_idx]] = val
+            adj.append(row)
 
-        service = get_sheet_service()
         sheets_execute(
-            service.spreadsheets().values().append(
+            get_sheet_service().spreadsheets().values().append(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"{sheet_name}!A1",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": adjusted_rows},
-            ),
-            desc=f"append_rows_to_sheet sheet={sheet_name} rows={len(adjusted_rows)}",
+                body={"values": adj}
+            )
         )
-
         _invalidate_sheet_caches(sheet_name)
-
     except Exception as e:
-        print(f"[WARN] Sheet append error ({sheet_name}): {e}")
-        send_discord_message(f"[WARN] Sheet append error: sheet={sheet_name} err={str(e)[:180]}")
+        send_discord_message(f"[WARN] Append error {sheet_name}: {str(e)[:180]}")
+
 
 # ==========================================
-# 数値系
+# 数値 / 取引所
 # ==========================================
-def safe_float(x, default=""):
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if not np.isfinite(v):
-            return default
-        return v
-    except Exception:
-        return default
-
 def to_float(val, default=None):
     try:
-        if val is None:
-            return default
-        s = str(val).strip()
-        if s == "":
-            return default
+        s = str(val or "").strip().replace(",", "")
         if s.startswith("'"):
             s = s[1:].strip()
-        v = float(s.replace(",", ""))
-        if not np.isfinite(v):
-            return default
-        return v
+        v = float(s)
+        return v if np.isfinite(v) else default
     except Exception:
         return default
+
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    loss = loss.replace(0, np.nan)
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.replace([np.inf, -np.inf], np.nan)
-    return rsi
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean().replace(0, np.nan)
+    rsi = 100 - (100 / (1 + (gain / loss)))
+    return rsi.replace([np.inf, -np.inf], np.nan)
 
-def find_cols(headers, name: str) -> List[int]:
-    return [i for i, h in enumerate(headers) if str(h).strip() == name]
 
-def fmt_opt(label: str, v, suffix=""):
-    if v == "" or v is None:
-        return ""
-    return f"{label}{v}{suffix}"
-
-# ==========================================
-# OKX
-# ==========================================
-def build_exchange() -> ccxt.Exchange:
+def build_exchange():
     now = time.time()
-    ex = _exchange_cache.get("ex")
-    ts = float(_exchange_cache.get("ts", 0.0))
-    if ex is not None and (now - ts) <= EXCHANGE_TTL_SEC:
-        return ex
-
-    exchange = ccxt.okx({
-        "enableRateLimit": True,
-        "timeout": 10000,
-        "options": {"defaultType": OKX_DEFAULT_TYPE},
-    })
+    if _exchange_cache["ex"] and (now - _exchange_cache["ts"]) <= EXCHANGE_TTL_SEC:
+        return _exchange_cache["ex"]
+    ex = ccxt.okx({"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": OKX_DEFAULT_TYPE}})
     try:
-        exchange.load_markets()
-    except Exception as e:
-        print(f"[WARN] okx.load_markets failed: {e}")
-
-    _exchange_cache["ex"] = exchange
-    _exchange_cache["ts"] = now
+        ex.load_markets()
+    except Exception:
+        pass
+    _exchange_cache.update({"ex": ex, "ts": now})
     _symbol_resolve_cache.clear()
-    return exchange
+    return ex
 
-def _resolve_okx_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
-    if not symbol:
-        return symbol
-    if symbol in _symbol_resolve_cache:
-        return _symbol_resolve_cache[symbol]
 
-    mk = getattr(exchange, "markets", None)
-    if not isinstance(mk, dict) or not mk:
-        _symbol_resolve_cache[symbol] = symbol
-        return symbol
-
+def _resolve_okx_symbol(exchange, symbol: str):
+    if not symbol or symbol in _symbol_resolve_cache:
+        return _symbol_resolve_cache.get(symbol, symbol)
+    mk = getattr(exchange, "markets", {})
+    res = symbol
     if symbol in mk:
-        _symbol_resolve_cache[symbol] = symbol
-        return symbol
-
-    if "/" in symbol and ":" not in symbol:
-        try:
-            base, quote = symbol.split("/")
-            cand = f"{base}/{quote}:{quote}"
+        res = symbol
+    elif "/" in symbol and f"{symbol.split('/')[0]}/{symbol.split('/')[1]}:{symbol.split('/')[1]}" in mk:
+        res = f"{symbol.split('/')[0]}/{symbol.split('/')[1]}:{symbol.split('/')[1]}"
+    elif "/" not in symbol:
+        for cand in [f"{symbol}/USDT", f"{symbol}/USDT:USDT"]:
             if cand in mk:
-                _symbol_resolve_cache[symbol] = cand
-                return cand
-        except Exception:
-            pass
+                res = cand
+                break
+    _symbol_resolve_cache[symbol] = res
+    return res
 
-    if "/" not in symbol:
-        base = symbol
-        quote = "USDT"
-        for cand in (f"{base}/{quote}", f"{base}/{quote}:{quote}"):
-            if cand in mk:
-                _symbol_resolve_cache[symbol] = cand
-                return cand
 
-    _symbol_resolve_cache[symbol] = symbol
-    return symbol
-
-def fetch_ohlcv_safe(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int,
-                     since: Optional[int] = None, retries: int = FETCH_RETRY) -> Optional[List[List[Any]]]:
-    last_err = None
+def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int, since=None, retries=FETCH_RETRY):
     sym = _resolve_okx_symbol(exchange, symbol)
-
     for k in range(retries + 1):
         try:
-            if since is None:
-                return exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
             return exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
-        except Exception as e:
-            last_err = e
+        except Exception:
             if k < retries:
                 time.sleep(FETCH_RETRY_SLEEP_SEC * (k + 1))
-                continue
-            break
-
-    print(f"[WARN] fetch_ohlcv_safe failed: {symbol} (resolved={sym}) err={last_err}")
     return None
 
-# ==========================================
-# 行数/重複キー
-# ==========================================
-def _get_row_count_cached(sheet_name: str) -> int:
+
+def _get_row_count_cached(sheet_name: str):
     now = time.time()
-    c = _row_count_cache.get(sheet_name)
-    if c and (now - float(c.get("ts", 0))) <= ROWCOUNT_TTL_SEC:
-        return int(c.get("n", 0))
-
+    if sheet_name in _row_count_cache and (now - _row_count_cache[sheet_name]["ts"]) <= ROWCOUNT_TTL_SEC:
+        return _row_count_cache[sheet_name]["n"]
     try:
-        headers, _, _ = get_headers_and_len(sheet_name)
-        hm = _build_headers_map(headers)
-        col_time = _resolve_col_idx(hm, "Time")
-        col_letter = "A" if col_time < 0 else col_to_a1(col_time)
-
-        service = get_sheet_service()
+        hs, _, _ = get_headers_and_len(sheet_name)
+        hm = {str(h).strip(): i for i, h in enumerate(hs)}
+        col = col_to_a1(hm.get("Time", 0))
         res = sheets_execute(
-            service.spreadsheets().values().get(
+            get_sheet_service().spreadsheets().values().get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{sheet_name}!{col_letter}:{col_letter}",
-            ),
-            desc=f"row_count sheet={sheet_name} col={col_letter}",
+                range=f"{sheet_name}!{col}:{col}"
+            )
         )
-        vals = res.get("values", [])
-        n = len(vals)
+        n = len(res.get("values", []))
         _row_count_cache[sheet_name] = {"ts": now, "n": n}
         return n
-    except Exception as e:
-        print(f"[WARN] row_count fetch failed: sheet={sheet_name} err={e}")
-        return int(c.get("n", 0)) if c else 0
+    except Exception:
+        return 0
 
-def _get_recent_dedup_keys(sheet_name: str) -> Set[str]:
+
+def _get_recent_dedup_keys(sheet_name: str):
     now = time.time()
-    c = _dedup_cache.get(sheet_name)
-    if c and (now - float(c.get("ts", 0))) <= DEDUP_TTL_SEC:
-        return set(c.get("keys", set()))
+    if sheet_name in _dedup_cache and (now - _dedup_cache[sheet_name]["ts"]) <= DEDUP_TTL_SEC:
+        return _dedup_cache[sheet_name]["keys"]
 
-    keys: Set[str] = set()
+    keys = set()
     try:
-        last_row = _get_row_count_cached(sheet_name)
-        if last_row < 2:
-            _dedup_cache[sheet_name] = {"ts": now, "keys": keys}
-            return keys
-
-        start = max(2, last_row - DEDUP_LOOKBACK_ROWS + 1)
-
-        headers, _, _ = get_headers_and_len(sheet_name)
-        hm = _build_headers_map(headers)
-        col_time = _resolve_col_idx(hm, "Time")
-        col_sym = _resolve_col_idx(hm, "Symbol")
-
-        if col_time == -1 or col_sym == -1:
-            col_time, col_sym = 0, 1
-
-        c1 = min(col_time, col_sym)
-        c2 = max(col_time, col_sym)
-        off_time = col_time - c1
-        off_sym = col_sym - c1
-
-        a1 = col_to_a1(c1)
-        a2 = col_to_a1(c2)
-
-        service = get_sheet_service()
-        res = sheets_execute(
-            service.spreadsheets().values().get(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{sheet_name}!{a1}{start}:{a2}{last_row}",
-            ),
-            desc=f"dedup_scan sheet={sheet_name} range={a1}{start}:{a2}{last_row}",
-        )
-
-        rows = res.get("values", []) or []
-        for r in rows:
-            t_raw = str(r[off_time]).strip() if len(r) > off_time else ""
-            sym = str(r[off_sym]).strip() if len(r) > off_sym else ""
-            if not t_raw or not sym:
-                continue
-            t_key = normalize_dt_str(t_raw)
-            keys.add(f"{sym}|{t_key}")
-
-    except Exception as e:
-        print(f"[WARN] dedup scan failed: sheet={sheet_name} err={e}")
+        last = _get_row_count_cached(sheet_name)
+        if last >= 2:
+            start = max(2, last - DEDUP_LOOKBACK_ROWS + 1)
+            hs, _, _ = get_headers_and_len(sheet_name)
+            hm = {str(h).strip(): i for i, h in enumerate(hs)}
+            c_t, c_s = hm.get("Time", 0), hm.get("Symbol", 1)
+            c1, c2 = min(c_t, c_s), max(c_t, c_s)
+            res = sheets_execute(
+                get_sheet_service().spreadsheets().values().get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{sheet_name}!{col_to_a1(c1)}{start}:{col_to_a1(c2)}{last}"
+                )
+            )
+            for r in res.get("values", []):
+                t = str(r[c_t - c1]).strip() if len(r) > (c_t - c1) else ""
+                s = str(r[c_s - c1]).strip() if len(r) > (c_s - c1) else ""
+                if t and s:
+                    keys.add(f"{s}|{normalize_dt_str(t)}")
+    except Exception:
+        pass
 
     _dedup_cache[sheet_name] = {"ts": now, "keys": keys}
     return keys
 
-# ==========================================
-# 簡易分散ロック（_lock自動作成）
-# ==========================================
-def _ensure_mutex_sheet():
-    ensure_sheet_exists(RUN_MUTEX_SHEET, min_rows=50, min_cols=5)
 
-def _mutex_read() -> str:
-    _ensure_mutex_sheet()
-    service = get_sheet_service()
-    rng = f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}"
+# ==========================================
+# 分散ロック / 自己修復
+# ==========================================
+def _mutex_read():
+    ensure_sheet_exists(RUN_MUTEX_SHEET, 50, 5)
     res = sheets_execute(
-        service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=rng),
-        desc=f"mutex_read {rng}",
+        get_sheet_service().spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}"
+        )
     )
-    v = (res.get("values", [[]]) or [[]])[0]
-    return "" if not v else str(v[0]).strip()
+    v = res.get("values", [[]])[0]
+    return str(v[0]).strip() if v else ""
+
 
 def _mutex_write(value: str):
-    _ensure_mutex_sheet()
-    service = get_sheet_service()
-    rng = f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}"
     sheets_execute(
-        service.spreadsheets().values().update(
+        get_sheet_service().spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=rng,
+            range=f"{RUN_MUTEX_SHEET}!{RUN_MUTEX_CELL}",
             valueInputOption="RAW",
-            body={"values": [[value]]},
-        ),
-        desc=f"mutex_write {rng}",
+            body={"values": [[value]]}
+        )
     )
 
-def acquire_run_mutex() -> Tuple[bool, str]:
+
+def acquire_run_mutex():
     if not RUN_MUTEX_ENABLED:
         return True, ""
-
     token = f"{int(time.time())}|{_INSTANCE_ID}"
     try:
         cur = _mutex_read()
-        if cur:
-            try:
-                ts_str = cur.split("|", 1)[0].strip()
-                ts = int(float(ts_str))
-            except Exception:
-                ts = 0
-
-            if ts > 0 and (time.time() - ts) <= RUN_MUTEX_TTL_SEC:
-                return False, ""
-
+        if cur and (time.time() - int(float(cur.split("|")[0]))) <= RUN_MUTEX_TTL_SEC:
+            return False, ""
         _mutex_write(token)
         time.sleep(0.25)
-        after = _mutex_read()
-        if after == token:
-            return True, token
-        return False, ""
-    except Exception as e:
-        print(f"[WARN] acquire_run_mutex failed (fallback allow): {e}")
+        return (True, token) if _mutex_read() == token else (False, "")
+    except Exception:
         return True, ""
 
+
 def release_run_mutex(token: str):
-    if not RUN_MUTEX_ENABLED:
-        return
-    if not token:
-        return
-    try:
-        cur = _mutex_read()
-        if cur == token:
-            _mutex_write("")
-    except Exception as e:
-        print(f"[WARN] release_run_mutex failed: {e}")
-
-# ==========================================
-# モデル読み込み
-# ==========================================
-def _boot_notify_model_status_once(bucket, gcs_uri: str, local_path: str, ver: str, ok: bool, err: str):
-    key = os.environ.get("K_REVISION", "").strip() or ver or "unknown"
-    marker_name = f"markers/crypto-alert/boot/{key}.json"
-    blob = bucket.blob(marker_name)
-
-    body = {
-        "ok": bool(ok),
-        "service": os.environ.get("K_SERVICE", ""),
-        "revision": os.environ.get("K_REVISION", ""),
-        "model_version": ver,
-        "model_uri": gcs_uri,
-        "model_local_path": local_path,
-        "loaded_at": _AI_LOADED_AT,
-        "last_error": ("" if ok else (err or ""))[:500],
-    }
-
-    try:
-        blob.upload_from_string(
-            data=json.dumps(body, ensure_ascii=False),
-            content_type="application/json",
-            if_generation_match=0,
-        )
-    except Exception as e:
-        s = str(e)
-        if "412" in s or "Precondition" in s:
-            print(f"[AI] boot notify skipped (marker exists): {marker_name}")
-            return
-        print(f"[WARN] boot marker create failed: {e}")
-        return
-
-    msg = (
-        f"[AI] Boot Model Status\n"
-        f"ok={ok}\n"
-        f"ver={ver}\n"
-        f"uri={gcs_uri}\n"
-        f"path={local_path}\n"
-        f"rev={os.environ.get('K_REVISION','')}\n"
-        f"err={(err or '')[:180]}"
-    )
-    send_discord_message(msg)
-
-
-def load_ai_model():
-    """
-    優先順位:
-    1) MODEL_GCS_URI が gs://... の場合 -> GCS から MODEL_LOCAL_PATH にダウンロードして joblib.load
-    2) それ以外 -> ローカルの trade_ai_model.pkl を joblib.load
-    """
-    global _AI_LOADED_AT, _AI_LAST_ERROR
-
-    gcs_uri = os.environ.get("MODEL_GCS_URI", "").strip()
-    local_path = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
-    ver = os.environ.get("MODEL_VERSION", "").strip()
-
-    try:
-        if gcs_uri.startswith("gs://"):
-            tmp = gcs_uri[5:]
-            bucket_name, blob_name = tmp.split("/", 1)
-
-            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_name)
-            blob.download_to_filename(local_path)
-
-            m = joblib.load(local_path)
-            _AI_LOADED_AT = datetime.now(JST).isoformat()
-            _AI_LAST_ERROR = ""
-            print(f"[AI] Model Loaded Successfully uri={gcs_uri} path={local_path} ver={ver}")
-            _boot_notify_model_status_once(bucket, gcs_uri, local_path, ver, True, "")
-            return m
-
-# 1) GCS（MODEL_GCS_URI） -> /tmp キャッシュ を優先
-gcs_uri = os.environ.get("MODEL_GCS_URI", "").strip()
-
-def _parse_gs_uri(gs: str) -> tuple[str, str]:
-    # gs://bucket/path/to/file.pkl -> ("bucket", "path/to/file.pkl")
-    if not gs.startswith("gs://"):
-        raise ValueError(f"MODEL_GCS_URI must start with gs:// (got: {gs})")
-    rest = gs[5:]
-    parts = rest.split("/", 1)
-    bucket_name = parts[0].strip()
-    blob_name = parts[1].strip() if len(parts) > 1 else ""
-    if not bucket_name or not blob_name:
-        raise ValueError(f"Invalid gs:// uri (got: {gs})")
-    return bucket_name, blob_name
-
-def _download_from_gcs(gs: str, dst_path: str) -> None:
-    from google.cloud import storage
-    import google.auth
-
-    bucket_name, blob_name = _parse_gs_uri(gs)
-    creds, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
-    client = storage.Client(credentials=creds, project=project_id)
-
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-
-    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-    blob.download_to_filename(dst_path)
-
-# /tmp に ver 付きでキャッシュ（Cloud Runで書ける）
-safe_ver = str(ver).replace("/", "_").replace(":", "_")
-tmp_model_path = f"/tmp/trade_ai_model_{safe_ver}.pkl" if safe_ver else "/tmp/trade_ai_model.pkl"
-
-# --- GCS 経由でロード（最優先） ---
-if gcs_uri:
-    try:
-        if (not os.path.exists(tmp_model_path)) or (os.path.getsize(tmp_model_path) == 0):
-            print(f"[AI] downloading model from GCS... uri=GCS ver={ver} -> {tmp_model_path}")
-            _download_from_gcs(gcs_uri, tmp_model_path)
-        else:
-            print(f"[AI] using cached model: {tmp_model_path} ver={ver}")
-
-        if os.path.exists(tmp_model_path) and os.path.getsize(tmp_model_path) > 0:
-            m = joblib.load(tmp_model_path)
-            _AI_LOADED_AT = datetime.now(JST).isoformat()
-            _AI_LAST_ERROR = ""
-            print(f"[AI] Model Loaded Successfully uri=GCS path={tmp_model_path} ver={ver}")
-            return m
-    except Exception as e:
-        # GCSが落ちてもローカルへフォールバックする
-        _AI_LAST_ERROR = f"gcs load failed: {e}"
-        print(f"[AI] GCS load failed -> fallback to local. err={e}")
-
-# --- ローカル同梱（最後の手段） ---
-MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "trade_ai_model.pkl")
-
-if os.path.exists(MODEL_LOCAL_PATH) and os.path.getsize(MODEL_LOCAL_PATH) > 0:
-    try:
-        m = joblib.load(MODEL_LOCAL_PATH)
-        _AI_LOADED_AT = datetime.now(JST).isoformat()
-        _AI_LAST_ERROR = ""
-        print(f"[AI] Model Loaded Successfully uri=LOCAL path={MODEL_LOCAL_PATH} ver={ver}")
-        return m
-    except Exception as e:
-        _AI_LAST_ERROR = f"local load failed: {e}"
-        print(f"[AI] local load failed -> bypass. err={e}")
-
-print(f"[AI] {MODEL_LOCAL_PATH} not found -> AI gate is bypassed (ai_pass=True).")
-_AI_LOADED_AT = ""
-_AI_LAST_ERROR = "model file not found (AI bypassed)"
-return None
-
-
-
-    except Exception as e:
-        _AI_LOADED_AT = ""
-        _AI_LAST_ERROR = str(e)
-        print(f"[AI] Load Failed: {e}")
+    if RUN_MUTEX_ENABLED and token:
         try:
-            if gcs_uri.startswith("gs://"):
-                client = storage.Client()
-                tmp = gcs_uri[5:]
-                bucket_name, _ = tmp.split("/", 1)
-                bucket = client.bucket(bucket_name)
-                _boot_notify_model_status_once(bucket, gcs_uri, local_path, ver, False, str(e))
+            if _mutex_read() == token:
+                _mutex_write("")
         except Exception:
             pass
-        return None
 
 
-ai_model = load_ai_model()
-
-# ==========================================
-# ★起動時に「必要シート/ヘッダー」を自己修復
-# ==========================================
-def self_heal_prerequisites() -> Tuple[bool, str]:
+def self_heal_prerequisites():
     try:
-        ok_lock = ensure_sheet_exists(RUN_MUTEX_SHEET, min_rows=50, min_cols=5)
-        ok_learn = ensure_learn_headers()
-        ok_table = ensure_table_headers()
-        ok_all = bool(ok_lock and ok_learn and ok_table)
-        return ok_all, f"lock={ok_lock} learn={ok_learn} table={ok_table}"
+        ok_l = ensure_sheet_exists(RUN_MUTEX_SHEET, 50, 5)
+        ok_ln = ensure_learn_headers()
+        ok_t = ensure_table_headers()
+        return (ok_l and ok_ln and ok_t), f"lock={ok_l} learn={ok_ln} table={ok_t}"
     except Exception as e:
-        return False, f"self_heal failed: {e}"
+        return False, str(e)
+
 
 # ==========================================
-# ロジック本体 (/run)
+# ロジック本体
 # ==========================================
 def logic_main():
-    global last_alert_records, last_candidate_records, ai_model
+    global ai_model
 
-    start = time.time()
     now_jst = datetime.now(JST)
-    print(f"[RUN] start {now_jst.isoformat()}  VERSION={VERSION}")
-
     ok, msg = self_heal_prerequisites()
     if not ok:
-        send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
-        return f"SelfHealFailed: {msg}"
+        send_discord_message(f"[WARN] self_heal failed: {msg}")
+        return f"Fail: {msg}"
 
-    force = (request.args.get("force", "0") == "1")
+    # force=1 でない限り、15分足の確定後窓以外は待機
+    if (request.args.get("force") != "1") and (now_jst.minute % 15 >= 10):
+        return "Waiting..."
 
-    if (not force) and ((now_jst.minute % 15) >= 10):
-        print(f"[RUN] skip (waiting window) minute={now_jst.minute}")
-        return "Waiting...", 200
+    load_ai_model_if_needed(force=False)
+    ai_model = get_ai_model()
 
+    ex = build_exchange()
 
-    exchange = build_exchange()
-
-    btc_mode = "Range"
-    btc_1h_change = 0.0
-    median_sigma = 0.0
-    btc_ret = 0.0
-    btc_vol = 0.0
-    btc_ok = False
-
-    # ===== BTC地合い（安全なデフォルトを先に用意）=====
-    btc_ok = False
-    btc_mode = "Range"
-    median_sigma = 0.01
-    btc_1h_change = 0.0
-    btc_vol = 0.0
-
+    btc_ok, btc_mode, median_sigma, btc_1h_change, btc_ret, btc_vol = False, "Range", 0.01, 0.0, 0.0, 0.0
     try:
-        btc_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=60)
-        if not btc_ohlcv or len(btc_ohlcv) < MIN_BARS:
-            raise ValueError(f"BTC ohlcv bars不足: {0 if not btc_ohlcv else len(btc_ohlcv)}")
-
-        btc_df = pd.DataFrame(btc_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-        btc_df["Pct_Change"] = btc_df["Close"].pct_change(fill_method=None)
-        btc_df["Dynamic_Sigma"] = btc_df["Pct_Change"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
-
-        median_sigma = float(btc_df["Dynamic_Sigma"].tail(20).median())
-        btc_current = float(btc_df.iloc[-2]["Close"])
-        btc_1h_ago = float(btc_df.iloc[-6]["Close"])
-        btc_1h_change = (btc_current - btc_1h_ago) / btc_1h_ago
-        btc_ret = float(btc_df.iloc[-2]["Pct_Change"])
-        btc_vol = abs(btc_ret)
-
-        if btc_1h_change > 0.001:
-            btc_mode = "Up"
-        elif btc_1h_change < -0.001:
-            btc_mode = "Down"
-        else:
-            btc_mode = "Range"
-
-        btc_ok = True
+        ohlcv = fetch_ohlcv_safe(ex, "BTC/USDT", "15m", 60)
+        if ohlcv and len(ohlcv) >= MIN_BARS:
+            df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+            df["Pct"] = df["Close"].pct_change()
+            df["Sig"] = df["Pct"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
+            median_sigma = float(df["Sig"].tail(20).median())
+            c_now, c_1h = float(df.iloc[-2]["Close"]), float(df.iloc[-6]["Close"])
+            btc_1h_change = (c_now - c_1h) / c_1h
+            btc_ret, btc_vol, btc_ok = float(df.iloc[-2]["Pct"]), abs(float(df.iloc[-2]["Pct"])), True
+            btc_mode = "Up" if btc_1h_change > 0.001 else "Down" if btc_1h_change < -0.001 else "Range"
     except Exception as e:
-        print(f"[WARN] BTC fetch failed: {e}")
+        print(f"[WARN] BTC fetch fail: {e}")
 
-    BTC_CALM = bool(btc_ok and (median_sigma < 0.005))
-    ALLOW_LONG = (btc_mode != "Down")
-    ALLOW_SHORT = (btc_mode != "Up")
+    BTC_CALM = bool(btc_ok and median_sigma < 0.005)
 
-    # ==========================================
-    # 改善③：地合い別の “可変しきい値”
-    #  - alert_sigma_eff：通知のσしきい値（厳しさ）
-    #  - e_th_eff       ：期待値Eのしきい値（厳しさ）
-    # ==========================================
-    alert_sigma_eff = float(ALERT_SIGMA)
-    e_th_eff = float(os.environ.get("E_TH", "0"))
-
-    if BTC_CALM:
-        alert_sigma_eff -= 0.20  # calmは少し出しやすく
-    else:
-        alert_sigma_eff += 0.40  # 非calmは絞る
-        e_th_eff += 0.05         # 非calmは期待値も厳しく
-
+    alert_sigma_eff = float(ALERT_SIGMA) + (0.4 if not BTC_CALM else -0.2)
     if btc_mode == "Down":
-        alert_sigma_eff += 0.10
-        e_th_eff += 0.02
+        alert_sigma_eff += 0.1
     elif btc_mode == "Up":
         alert_sigma_eff += 0.05
-
-    # 安全下限（極端に出しすぎない）
-    if alert_sigma_eff < 1.0:
-        alert_sigma_eff = 1.0
-
-
+    alert_sigma_eff = max(alert_sigma_eff, 1.0)
 
     symbols = [
-        "BTC/USDT", "DOT/USDT", "BONK/USDT", "DOGE/USDT", "LINK/USDT", "ETH/USDT", "SUI/USDT", "BNB/USDT", "UNI/USDT",
-        "ADA/USDT", "ATOM/USDT", "XRP/USDT", "NEAR/USDT", "LTC/USDT", "TRX/USDT", "SHIB/USDT", "HBAR/USDT", "SEI/USDT",
-        "SOL/USDT", "AAVE/USDT", "AVAX/USDT", "APT/USDT", "FET/USDT", "ARB/USDT", "INJ/USDT", "POL/USDT",
-        "STX/USDT", "XLM/USDT"
+        "BTC/USDT", "DOT/USDT", "BONK/USDT", "DOGE/USDT", "LINK/USDT", "ETH/USDT",
+        "SUI/USDT", "BNB/USDT", "UNI/USDT", "ADA/USDT", "ATOM/USDT", "XRP/USDT",
+        "NEAR/USDT", "LTC/USDT", "TRX/USDT", "SHIB/USDT", "HBAR/USDT", "SEI/USDT",
+        "SOL/USDT", "AAVE/USDT", "AVAX/USDT", "APT/USDT", "FET/USDT", "ARB/USDT",
+        "INJ/USDT", "POL/USDT", "STX/USDT", "XLM/USDT"
     ]
 
-    pending_candidates: List[Dict[str, Any]] = []
-    pending_alerts: List[Dict[str, Any]] = []
-    def calc_tp_sl(item):
-        tp_mult = 3.8
-        sl_mult = 1.5
-        cp = float(item["close"])
-        sig = float(item["sigma"])
-        if item["is_buy"]:
-            tp = cp * (1 + sig * tp_mult)
-            sl = cp * (1 - sig * sl_mult)
-        else:
-            tp = cp * (1 - sig * tp_mult)
-            sl = cp * (1 + sig * sl_mult)
-        tp_pct = abs((tp - cp) / cp) * 100.0
-        sl_pct = abs((sl - cp) / cp) * 100.0
-        return tp, sl, tp_pct, sl_pct
+    pending_c, pending_a = [], []
 
-    for symbol in symbols:
+    def calc_tp_sl(item):
+        cp, sig = item["close"], item["sigma"]
+        tp = cp * (1 + sig * 3.8) if item["is_buy"] else cp * (1 - sig * 3.8)
+        sl = cp * (1 - sig * 1.5) if item["is_buy"] else cp * (1 + sig * 1.5)
+        return tp, sl, abs(tp / cp - 1) * 100, abs(sl / cp - 1) * 100
+
+    for sym in symbols:
         try:
-            ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
+            ohlcv = fetch_ohlcv_safe(ex, sym, "15m", 60)
             if not ohlcv or len(ohlcv) < MIN_BARS:
                 continue
 
             df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-            df["Pct_Change"] = df["Close"].pct_change(fill_method=None)
-            df["Dynamic_Sigma"] = df["Pct_Change"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
-
+            df["Pct"] = df["Close"].pct_change()
+            df["Sig"] = df["Pct"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
             df["MA20"] = df["Close"].rolling(20).mean()
-            df["Upper2"] = df["MA20"] + (2 * df["Close"] * df["Dynamic_Sigma"])
-            df["Lower2"] = df["MA20"] - (2 * df["Close"] * df["Dynamic_Sigma"])
-            df["BandWidth"] = np.where(df["MA20"] != 0, (df["Upper2"] - df["Lower2"]) / df["MA20"], 0)
 
-            df["BW_Change"] = df["BandWidth"].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
-            df["RSI"] = calculate_rsi(df["Close"]).replace([np.inf, -np.inf], np.nan).fillna(50)
+            df["BW"] = (df["MA20"] + 2 * df["Close"] * df["Sig"] - (df["MA20"] - 2 * df["Close"] * df["Sig"])) / df["MA20"]
+            df["BWC"] = df["BW"].pct_change().fillna(0)
 
-            v = pd.to_numeric(df["Volume"], errors="coerce").replace(0, np.nan)
-            df["Vol_Change"] = v.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
+            df["RSI"] = calculate_rsi(df["Close"]).fillna(50)
+            df["VolC"] = pd.to_numeric(df["Volume"]).pct_change().fillna(0)
+            df["DS"] = df["Pct"].apply(lambda x: abs(x) if x < 0 else 0) / df["Sig"]
+            df["RS"] = df["Pct"].apply(lambda x: abs(x) if x > 0 else 0) / df["Sig"]
+            df["VMA"] = pd.to_numeric(df["Volume"]).rolling(20).mean()
 
-            df["Drop_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x < 0 else 0) / df["Dynamic_Sigma"]
-            df["Rise_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x > 0 else 0) / df["Dynamic_Sigma"]
+            r = df.iloc[-2]
+            vol_r = float(r["Volume"]) / float(r["VMA"]) if float(r["VMA"]) else 0.0
 
-            df["Vol_MA20"] = pd.to_numeric(df["Volume"], errors="coerce").rolling(20).mean()
-
-            row = df.iloc[-2]
-            chg = safe_float(row.get("Pct_Change", None), default="")
-            chg_pct_val = "" if chg == "" else (chg * 100.0)
-
-            vol_ma20 = safe_float(row.get("Vol_MA20", None), default="")
-            vol_now = safe_float(row.get("Volume", None), default="")
-            if vol_ma20 == "" or vol_now == "" or vol_ma20 == 0:
-                vol_ratio_val = ""
-            else:
-                vol_ratio_val = vol_now / vol_ma20
-
-            is_buy = False
-            is_sell = False
-            signal_type = ""
-
-            if (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT:
-                is_sell = True
-                signal_type = "SHORT"
-            elif (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG:
-                if row["Close"] > df.iloc[-6]["Close"]:
-                    is_buy = True
-                    signal_type = "LONG"
-
-            if not (is_buy or is_sell):
+            is_b = (r["RS"] >= CAND_SIGMA and btc_mode != "Down" and r["Close"] > df.iloc[-6]["Close"])
+            is_s = (r["DS"] >= CAND_SIGMA and btc_mode != "Up")
+            if not (is_b or is_s):
                 continue
 
-            # ===== AI確率（ここでは確率だけ計算）=====
-            ai_score = None
-            if ai_model is not None:
+            ai_s = None
+            if ai_model:
                 feats = pd.DataFrame([{
-                    "Sigma": float(row["Dynamic_Sigma"]),
-                    "BandWidth": float(row["BandWidth"]),
-                    "BW_Change": float(row["BW_Change"]),
-                    "RSI": float(row["RSI"]),
-                    "Vol_Change": float(row["Vol_Change"]),
-                    "Rise_Score": float(row["Rise_Score"]),
-                    "Drop_Score": float(row["Drop_Score"]),
+                    "Sigma": float(r["Sig"]),
+                    "BandWidth": float(r["BW"]),
+                    "BW_Change": float(r["BWC"]),
+                    "RSI": float(r["RSI"]),
+                    "Vol_Change": float(r["VolC"]),
+                    "Rise_Score": float(r["RS"]),
+                    "Drop_Score": float(r["DS"]),
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
                 try:
-                    ai_score = float(ai_model.predict_proba(feats)[0][1])
-                except Exception as e:
-                    print(f"[AI] predict_proba failed for {symbol}: {e}")
-                    ai_score = None
+                    ai_s = float(ai_model.predict_proba(feats)[0][1])
+                except Exception:
+                    ai_s = None
 
-            # ===== item（辞書なのでSheets列ズレと無関係）=====
             item = {
-                "symbol": symbol.replace("/USDT", ""),
-                "time": int(row["Time"]),
-                "is_buy": bool(is_buy),
-                "is_sell": bool(is_sell),
-                "close": float(row["Close"]),
-                "score": float(max(row["Drop_Score"], row["Rise_Score"])),
-                "sigma": float(row["Dynamic_Sigma"]),
-                "rsi": float(row["RSI"]),
-                "type": signal_type,
-                "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
-                "ai_score": ai_score,
-                "ai_pass": True,  # 仮（この後にEで確定する）
-                "chg_pct": chg_pct_val,
-                "vol_ratio": vol_ratio_val,
+                "symbol": sym.replace("/USDT", ""),
+                "time": int(r["Time"]),
+                "is_buy": bool(is_b),
+                "is_sell": bool(is_s),
+                "close": float(r["Close"]),
+                "score": float(max(r["DS"], r["RS"])),
+                "sigma": float(r["Sig"]),
+                "rsi": float(r["RSI"]),
+                "type": "LONG" if is_b else "SHORT",
+                "dt": datetime.fromtimestamp(int(r["Time"]) / 1000, JST),
+                "ai_score": ai_s,
+                "ai_pass": True,
+                "chg_pct": float(r["Pct"]) * 100,
+                "vol_ratio": float(vol_r),
             }
 
-            # ===== 期待値E（calc_tp_sl(item) を使う）=====
-            E = None
-            try:
-                tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
+            tp, sl, tp_p, sl_p = calc_tp_sl(item)
+            item["E"] = (ai_s * tp_p - (1 - ai_s) * sl_p) if ai_s is not None else None
 
-                p_tp = 0.0 if ai_score is None else float(ai_score)
-                p_sl = 1.0 - p_tp
+            if ai_model and ai_s is not None:
+                base_e_th = to_float(os.environ.get("E_TH", ""), default=0.0)
+                ath = float(AI_TH) + (0.07 if not BTC_CALM else -0.03)
+                eth = float(base_e_th) + (0.03 if not BTC_CALM else -0.02)
 
-                E = (p_tp * float(tp_pct)) - (p_sl * float(sl_pct))
-            except Exception as e:
-                print(f"[AI] calc_tp_sl failed for {symbol}: {e}")
-                E = None
+                if (is_b and btc_mode == "Down") or (is_s and btc_mode == "Up"):
+                    ath += 0.05
+                    eth += 0.02
 
-            item["E"] = E
+                th = max(0.05, min(0.95, ath))
+                item["ai_pass"] = (item["E"] is not None and (ai_s >= th) and (item["E"] > eth))
 
-            # ===== 最終判定（改善③：地合いで閾値を動かす）=====
-            if ai_model is None or ai_score is None:
-                item["ai_pass"] = True
-            else:
-                # ベース閾値（既存の設定を尊重）
-                base_ai_th = float(AI_TH)
-                base_e_th = float(os.environ.get("E_TH", "0"))
+            pending_c.append(item)
+            if item["ai_pass"] and item["score"] >= alert_sigma_eff:
+                pending_a.append(item)
 
-                # 地合いで調整：Calmは緩める / Stormは厳しくする
-                ai_th = base_ai_th
-                e_th = base_e_th
-
-                # median_sigma（BTCの代表ボラ）で大きく分岐
-                # 目安：CALM < 0.005 は既存定義通り
-                if BTC_CALM:
-                    # Calm：取り逃しを減らす（少し緩める）
-                    ai_th -= 0.03
-                    # Eは「0付近に大量に潰れる」ので、Calm時だけ僅かに負を許容すると機会損失が減る
-                    e_th -= 0.02
-                else:
-                    # Storm：ノイズを減らす（厳しく）
-                    ai_th += 0.07
-                    e_th += 0.03
-
-                # 方向性（btc_mode）で微調整：逆方向はより厳しく
-                # ※ALLOW_LONG/SHORT は既に使っている想定なので、ここは“判定強度”だけ調整
-                if item.get("is_buy", False) and btc_mode == "Down":
-                    ai_th += 0.05
-                    e_th += 0.02
-                if item.get("is_sell", False) and btc_mode == "Up":
-                    ai_th += 0.05
-                    e_th += 0.02
-
-                # 安全な上下限（暴れ防止）
-                if ai_th < 0.05:
-                    ai_th = 0.05
-                if ai_th > 0.95:
-                    ai_th = 0.95
-
-                # 採用：AI確率とEの両方で判定（改善③の“地合い適応”の最短で強い形）
-                item["ai_pass"] = (E is not None) and (float(ai_score) >= ai_th) and (float(E) > e_th)
-
-            pending_candidates.append(item)
-
-            # 通知候補（改善③：地合いで通知条件を動かす）
-            # - score は地合いで動く alert_sigma_eff を採用
-            # - ai_pass は上で確定済み（AI_TH/E_th 地合い補正込み）
-            if item["ai_pass"] and (item["score"] >= float(alert_sigma_eff)):
-                pending_alerts.append(item)
-
-
-
-    learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
-    table_keys = _get_recent_dedup_keys(MAIN_SHEET_NAME)
-
-    # =========================
-    # learn_log 追記（候補行）
-    # =========================
-    candidate_rows: List[List[Any]] = []
-    for item in pending_candidates:
-        sym = item["symbol"]
-        ts_ms = item["time"]
-
-        dt_str = normalize_dt_str(item["dt"].strftime("%Y-%m-%d %H:%M:%S"))
-        dt_cell = "'" + dt_str
-
-        if sym in last_candidate_records and last_candidate_records[sym] == ts_ms:
-            continue
-        if (now_jst - item["dt"]).total_seconds() > 3000:
+        except Exception as e:
+            print(f"[WARN] loop fail {sym}: {e}")
             continue
 
-        k = f"{sym}|{dt_str}"
-        if k in learn_keys:
+    l_keys, t_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME), _get_recent_dedup_keys(MAIN_SHEET_NAME)
+
+    c_rows = []
+    for it in pending_c:
+        dt_s = normalize_dt_str(it["dt"].strftime("%Y-%m-%d %H:%M:%S"))
+        if it["symbol"] in last_candidate_records and last_candidate_records[it["symbol"]] == it["time"]:
+            continue
+        if f"{it['symbol']}|{dt_s}" in l_keys:
             continue
 
-        last_candidate_records[sym] = ts_ms
+        last_candidate_records[it["symbol"]] = it["time"]
+        tp, sl, tp_p, sl_p = calc_tp_sl(it)
+        status = "AI_REJECT" if (ai_model and (not it["ai_pass"])) else "CANDIDATE"
 
-        tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
+        ai_str = f"{float(it['ai_score']) * 100:.1f}%" if it.get("ai_score") is not None else "N/A"
+        e_str = f"{float(it['E']):+.2f}%" if it.get("E") is not None else ""
+        note = f"AI:{ai_str} E:{e_str} Pass:{it['ai_pass']} BTC:{btc_mode}"
 
-        ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
-        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
+        row = [
+            "'" + dt_s, it["symbol"], it["type"], it["close"], it["score"], it["sigma"],
+            status, tp, sl, tp_p, sl_p, DEFAULT_LEV,
+            it.get("ai_score") if it.get("ai_score") is not None else "",
+            it.get("E") if it.get("E") is not None else "",
+            it["ai_pass"], BTC_CALM, VERSION, it["type"], 0, 0,
+            "CALM" if BTC_CALM else "STORM", btc_mode, btc_1h_change, it["rsi"], note
+        ] + [""] * 7
+        c_rows.append(row[:len(EXPECTED_HEADERS_LEARN)])
 
-        # ★ learn_log の Status を分ける（後で抽出しやすくする）
-        # - AIモデルがあるのに ai_pass=False → AI_REJECT
-        # - それ以外 → CANDIDATE
-        status = "AI_REJECT" if (ai_model is not None and (not bool(item["ai_pass"]))) else "CANDIDATE"
+    if c_rows:
+        append_rows_to_sheet(LEARN_SHEET_NAME, c_rows, EXPECTED_HEADERS_LEARN)
 
-        # ★ Reserved1/Reserved2 を活用（列追加しない）
-        # Reserved1 = ai_score（確率）
-        # Reserved2 = E（期待値 %）
-        reserved1 = "" if item["ai_score"] is None else float(item["ai_score"])
-        reserved2 = "" if item.get("E") is None else float(item["E"])
-
-        note_str = (
-            f"AI:{ai_disp} E:{e_disp} Pass:{bool(item['ai_pass'])} "
-            f"AI_TH:{AI_TH} Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
-            f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
-        )
-
-        # ★重要：この配列の要素数は絶対に増減しない（列ズレ防止）
-        # ===== learn_log へ書く1行を作る（列数を強制一致させて Skip append を防ぐ）=====
-
-        ai_disp = "N/A" if item.get("ai_score") is None else f"{float(item['ai_score']):.1%}"
-        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
-
-        # AIがあるのに通らなかったものは AI_REJECT にして後で抽出しやすくする
-        status = "AI_REJECT" if (ai_model is not None and (not bool(item.get("ai_pass", False)))) else "CANDIDATE"
-
-        # Reserved1/2 は列追加せずに情報を残す用途（既存運用があるなら上書きになる点だけ注意）
-        reserved1 = "" if item.get("ai_score") is None else float(item["ai_score"])
-        reserved2 = "" if item.get("E") is None else float(item["E"])
-
-        note_str = (
-            f"AI:{ai_disp} E:{e_disp} Pass:{bool(item.get('ai_pass', False))} "
-            f"AI_TH:{AI_TH} Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
-            f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
-        )
-
-        row_out = [
-            dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
-            float(item["close"]), float(item["score"]), float(item["sigma"]), status,
-            float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, reserved1, reserved2, bool(item["ai_pass"]), bool(BTC_CALM),
-            VERSION, item["type"], 0, 0,
-            ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
-            float(item["rsi"]), note_str,
-            "", "", "", "", "", "", ""
-        ]
-
-        # ★ここが肝：EXPECTED_HEADERS_LEARN と列数を必ず一致させる（多い→切る、少ない→空で埋める）
-        expected_n = len(EXPECTED_HEADERS_LEARN)
-        if len(row_out) != expected_n:
-            print(f"[WARN] learn_log row length mismatch: out={len(row_out)} expected={expected_n} sym={sym} dt={dt_str}")
-            if len(row_out) < expected_n:
-                row_out = row_out + ([""] * (expected_n - len(row_out)))
-            else:
-                row_out = row_out[:expected_n]
-
-        candidate_rows.append(row_out)
-
-
-        learn_keys.add(k)
-
-    if candidate_rows:
-        append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, EXPECTED_HEADERS_LEARN)
-
-    # =========================
-    # table / Discord（通知）
-    # =========================
-    filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)[:3]
-    count = 0
-    alert_rows: List[List[Any]] = []
-
-    for item in filtered:
-        sym = item["symbol"]
-        ts_ms = item["time"]
-
-        dt_str = normalize_dt_str(item["dt"].strftime("%Y-%m-%d %H:%M:%S"))
-        dt_cell = "'" + dt_str
-
-        if sym in last_alert_records and last_alert_records[sym] == ts_ms:
+    a_rows = []
+    for it in sorted(pending_a, key=lambda x: x["score"], reverse=True)[:3]:
+        dt_s = normalize_dt_str(it["dt"].strftime("%Y-%m-%d %H:%M:%S"))
+        if it["symbol"] in last_alert_records and last_alert_records[it["symbol"]] == it["time"]:
             continue
-        if (now_jst - item["dt"]).total_seconds() > 3000:
+        if f"{it['symbol']}|{dt_s}" in t_keys:
             continue
 
-        k = f"{sym}|{dt_str}"
-        if k in table_keys:
-            continue
-
-        last_alert_records[sym] = ts_ms
-
-        tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
-        cp = float(item["close"])
-        lev = DEFAULT_LEV
-
-        if item["is_buy"]:
-            icon = "🚀"
-            d_str = "買い(LONG)"
-        else:
-            icon = "☄️"
-            d_str = "売り(SHORT)"
-
-        ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
-        e_disp = "" if item.get("E") is None else f"{float(item['E']):+.2f}%"
+        last_alert_records[it["symbol"]] = it["time"]
+        tp, sl, tp_p, sl_p = calc_tp_sl(it)
+        ai_str = f"{float(it['ai_score']) * 100:.1f}%" if it.get("ai_score") is not None else "N/A"
+        side_str = "🚀 LONG" if it["is_buy"] else "☄️ SHORT"
 
         msg = (
-            f"{icon} **{d_str}** {icon}\n"
-            f"{VERSION}\n"
-            f"💎 {sym} ({item['type']})\n"
-            f"📈 Score:{item['score']:.2f}σ  AI:{ai_disp}  E:{e_disp}\n"
-            f"🟦 BTC:{btc_mode} 1h:{btc_1h_change:.2%}  Calm:{BTC_CALM}  BTC_OK:{btc_ok}\n"
-            f"💰 {cp:.4f}\n"
-            f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%)\n"
-            f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%)"
+            f"{side_str} {it['symbol']}\n"
+            f"Score:{it['score']:.2f} AI:{ai_str}\n"
+            f"BTC:{btc_mode} Calm:{BTC_CALM}\n"
+            f"Price:{it['close']:.4f}\n"
+            f"TP:{tp:.4f} ({tp_p:.2f}%)\n"
+            f"SL:{sl:.4f} ({sl_p:.2f}%)"
         )
-
         send_discord_message(msg)
-        count += 1
 
-        parts = [
-            f"{item['type']}",
-            f"AI:{ai_disp}",
-            f"RSI:{item['rsi']:.1f}",
-            fmt_opt("Chg:", item["chg_pct"], "%"),
-            fmt_opt("VolR:", item["vol_ratio"]),
-            f"BTC:{btc_mode}",
-            f"1h:{btc_1h_change:.2%}",
-            f"BTC_OK:{btc_ok}",
-        ]
-        note_compact = " | ".join([p for p in parts if p])
-
-        alert_rows.append([
-            dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
-            float(cp), float(item["score"]), float(item["sigma"]), "AI_PASS",
-            float(tp), float(sl), float(tp_pct), float(sl_pct),
-            lev, float(tp_pct * lev), float(sl_pct * lev),
-            bool(BTC_CALM), True, VERSION, note_compact,
-            item["chg_pct"], item["vol_ratio"], "MARKET",
+        note = f"{it['type']} | AI:{ai_str} | BTC:{btc_mode}"
+        a_rows.append([
+            "'" + dt_s, it["symbol"], it["type"], it["close"], it["score"], it["sigma"],
+            "AI_PASS", tp, sl, tp_p, sl_p, DEFAULT_LEV, tp_p * DEFAULT_LEV, sl_p * DEFAULT_LEV,
+            BTC_CALM, True, VERSION, note, it["chg_pct"], it["vol_ratio"], "MARKET"
         ])
 
-        table_keys.add(k)
+    if a_rows:
+        append_rows_to_sheet(MAIN_SHEET_NAME, a_rows, TABLE_FIELDS)
 
-    if alert_rows:
-        append_rows_to_sheet(MAIN_SHEET_NAME, alert_rows, TABLE_FIELDS)
+    return f"Alerts:{len(a_rows)} Candidates:{len(c_rows)}"
 
-    elapsed = time.time() - start
-    print(f"[RUN] done alerts={count} candidates={len(candidate_rows)} elapsed={elapsed:.2f}s")
-    print(f"[DBG] pending_candidates={len(pending_candidates)} pending_alerts={len(pending_alerts)} "
-          f"BTC_CALM={BTC_CALM} btc_mode={btc_mode} median_sigma={median_sigma} btc_ok={btc_ok}")
-    return f"Sent {count} alerts, Logged {len(candidate_rows)} candidates"
 
 # ==========================================
-# 判定係 (/judge)
+# 判定係 / 分析
 # ==========================================
-def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_judge: int = 30) -> int:
-    service = get_sheet_service()
-    exchange = build_exchange()
-
-    ok, msg = self_heal_prerequisites()
-    if not ok:
-        print(f"[WARN] self_heal_prerequisites failed (judge): {msg}")
-        return 0
-
-    headers, _, okh = get_headers_and_len(sheet_name)
+def judge_sheet(sheet_name: str, lookback=JUDGE_LOOKBACK_ROWS, max_j=30):
+    svc, ex = get_sheet_service(), build_exchange()
+    hs, _, okh = get_headers_and_len(sheet_name)
     if STRICT_HEADER_CHECK and not okh:
-        print(f"[WARN] judge_sheet header check failed -> skip. sheet={sheet_name}")
         return 0
 
-    last_row = _get_row_count_cached(sheet_name)
-    if last_row < 2:
+    last = _get_row_count_cached(sheet_name)
+    if last < 2:
         return 0
 
-    start_row = max(2, last_row - lookback_rows + 1)
-
-    res = sheets_execute(
-        service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}",
-        ),
-        desc=f"judge_read sheet={sheet_name} A{start_row}:{HEADER_COL_END}{last_row}",
-    )
-
-    rows = res.get("values", []) or []
+    start = max(2, last - lookback + 1)
+    res = sheets_execute(svc.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=f"{sheet_name}!A{start}:{HEADER_COL_END}{last}"))
+    rows = res.get("values", [])
     if not rows:
         return 0
 
-    hm = _build_headers_map(headers)
-
-    col_symbol = _resolve_col_idx(hm, "Symbol")
-    col_time = _resolve_col_idx(hm, "Time")
-    col_entry = _resolve_col_idx(hm, "EntryPrice")
-    col_dir = _resolve_col_idx(hm, "Direction")
-    col_tp = _resolve_col_idx(hm, "TP_Price")
-    col_sl = _resolve_col_idx(hm, "SL_Price")
-    col_lev = _resolve_col_idx(hm, "Lev")
-    col_slpct = _resolve_col_idx(hm, "SL_%")
-
-    cols_eval = find_cols(headers, "EvalStatus")
-    cols_exit_time = find_cols(headers, "ExitTime")
-    cols_exit_price = find_cols(headers, "ExitPrice")
-    cols_reason_old = find_cols(headers, "Reason")
-    cols_exit_reason = find_cols(headers, "ExitReason")
-    cols_pnl_old = find_cols(headers, "PnL%")
-    cols_pnl_new = find_cols(headers, "PnL_Pct")
-    cols_winlose = find_cols(headers, "Win/Lose")
-    cols_holdmin = find_cols(headers, "HoldMin")
-
-    cols_levpnl = find_cols(headers, "LevPnL%")
-    cols_rmult = find_cols(headers, "R-Mult")
-
-    must = [col_symbol, col_time, col_entry, col_tp, col_sl]
-    if any(c == -1 for c in must):
-        print(f"[WARN] judge_sheet missing required columns in {sheet_name}")
+    hm = {str(h).strip(): i for i, h in enumerate(hs)}
+    c_ev = next((i for i, h in enumerate(hs) if h == "EvalStatus"), -1)
+    if c_ev == -1:
         return 0
 
-    if not cols_eval:
-        print(f"[WARN] judge_sheet: EvalStatus not found in {sheet_name}")
-        return 0
-
-    updates: List[Dict[str, Any]] = []
-    judged = 0
-
-    def get_cell(row: List[Any], idx: int) -> str:
-        if idx < 0:
-            return ""
-        return str(row[idx]).strip() if idx < len(row) else ""
-
-    def put_many(row_idx_1based: int, col_indices: list, value):
-        for col_idx in col_indices:
-            if col_idx < 0:
-                continue
-            a1 = col_to_a1(col_idx)
-            updates.append({"range": f"{sheet_name}!{a1}{row_idx_1based}", "values": [[value]]})
-
-    for offset in range(len(rows) - 1, -1, -1):
-        if judged >= max_judge:
+    updates, judged = [], 0
+    for i, row in enumerate(reversed(rows)):
+        if judged >= max_j:
             break
-
-        row = rows[offset]
-        sheet_row_idx = start_row + offset
-
-        col_eval_last = cols_eval[-1]
-        status = get_cell(row, col_eval_last)
-        if status != "":
+        if len(row) > c_ev and row[c_ev]:
             continue
 
-        sym = get_cell(row, col_symbol)
-        tstr_raw = get_cell(row, col_time)
-        tstr = normalize_dt_str(tstr_raw)
+        if any(f not in hm for f in ["Symbol", "Time", "EntryPrice", "TP_Price", "SL_Price", "Direction"]):
+            return 0
 
-        entry = to_float(get_cell(row, col_entry), default=None)
-        tp = to_float(get_cell(row, col_tp), default=None)
-        sl = to_float(get_cell(row, col_sl), default=None)
-
-        direction = get_cell(row, col_dir).upper()
-
-        if (not sym) or (not tstr) or entry is None or tp is None or sl is None or tp == 0 or sl == 0:
+        sym, t_raw = row[hm["Symbol"]], row[hm["Time"]]
+        entry, tp, sl = to_float(row[hm["EntryPrice"]]), to_float(row[hm["TP_Price"]]), to_float(row[hm["SL_Price"]])
+        if not (sym and entry and tp and sl):
             continue
 
-        market = sym if "/USDT" in sym else f"{sym}/USDT"
-
-        dt0 = parse_dt_any(tstr)
-        if dt0 is None:
+        dt = parse_dt_any(t_raw)
+        if not dt:
             continue
 
-        if getattr(dt0, "tzinfo", None) is None:
-            dt_jst = dt0.replace(tzinfo=JST)
-        else:
-            dt_jst = dt0.astimezone(JST)
-
-        actual_entry_jst = dt_jst + timedelta(minutes=15)
-        since_ms = int(actual_entry_jst.astimezone(timezone.utc).timestamp() * 1000)
-
-        if "SHORT" in direction:
-            side = "SHORT"
-        elif "LONG" in direction:
-            side = "LONG"
-        else:
-            side = "LONG" if tp > entry else "SHORT"
-
-        candles = fetch_ohlcv_safe(exchange, market, timeframe="15m", since=since_ms, limit=100)
+        since = int((dt + timedelta(minutes=15)).timestamp() * 1000)
+        side = "LONG" if "LONG" in str(row[hm["Direction"]]).upper() else "SHORT"
+        candles = fetch_ohlcv_safe(ex, sym, "15m", 100, since=since)
         if not candles:
             continue
 
-        res_status = "PENDING"
-        res_win = ""
-        res_reason = ""
-        res_exit_price = None
-        res_exit_time_ms = None
-
+        res_s, res_w, res_r, res_p, res_t = "PENDING", "", "", None, None
         for ts, o, h, l, c, v in candles:
-            if ts < since_ms:
-                continue
-
-            if side == "LONG":
-                tp_hit = (h >= tp)
-                sl_hit = (l <= sl)
-            else:
-                tp_hit = (l <= tp)
-                sl_hit = (h >= sl)
-
-            if tp_hit and sl_hit:
-                res_status = "AMBIGUOUS"
-                res_reason = "Both"
-                res_exit_time_ms = ts
-                res_exit_price = entry
+            tp_h, sl_h = (h >= tp, l <= sl) if side == "LONG" else (l <= tp, h >= sl)
+            if tp_h and sl_h:
+                res_s, res_r, res_p, res_t = "AMBIGUOUS", "Both", entry, ts
+                break
+            if tp_h:
+                res_s, res_w, res_r, res_p, res_t = "DONE", "Win", "TP", tp, ts
+                break
+            if sl_h:
+                res_s, res_w, res_r, res_p, res_t = "DONE", "Lose", "SL", sl, ts
                 break
 
-            if tp_hit:
-                res_status = "DONE"
-                res_reason = "TP"
-                res_exit_time_ms = ts
-                res_exit_price = tp
-                res_win = "Win"
-                break
-
-            if sl_hit:
-                res_status = "DONE"
-                res_reason = "SL"
-                res_exit_time_ms = ts
-                res_exit_price = sl
-                res_win = "Lose"
-                break
-
-        if res_status == "PENDING" and len(candles) >= 96:
-            res_status = "EXPIRED"
-            res_reason = "TimeOver"
-
-        if res_status not in {"DONE", "AMBIGUOUS", "EXPIRED"}:
-            continue
-
-        if res_exit_time_ms is not None:
-            exit_dt_jst = datetime.fromtimestamp(res_exit_time_ms / 1000, JST)
-            exit_time_str = exit_dt_jst.strftime("%Y-%m-%d %H:%M:%S")
-            hold_min = int((exit_dt_jst - actual_entry_jst).total_seconds() / 60)
-        else:
-            exit_time_str = ""
-            hold_min = ""
-
-        if res_exit_price is not None and entry is not None and res_status == "DONE":
-            if side == "LONG":
-                pnl_pct = (res_exit_price / entry - 1.0) * 100.0
-            else:
-                pnl_pct = (entry / res_exit_price - 1.0) * 100.0
-        else:
-            pnl_pct = ""
-
-        lev = to_float(get_cell(row, col_lev), default=DEFAULT_LEV) if col_lev != -1 else DEFAULT_LEV
-        levpnl = (pnl_pct * lev) if (pnl_pct != "" and lev is not None) else ""
-
-        sl_pct_val = to_float(get_cell(row, col_slpct), default=None) if col_slpct != -1 else None
-        if sl_pct_val not in (None, 0) and pnl_pct != "":
-            r_mult = float(pnl_pct) / float(sl_pct_val)
-        else:
-            r_mult = ""
-
-        put_many(sheet_row_idx, cols_eval, res_status)
-        put_many(sheet_row_idx, cols_winlose, res_win)
-        put_many(sheet_row_idx, cols_exit_time, exit_time_str)
-        put_many(sheet_row_idx, cols_exit_price, "" if res_exit_price is None else res_exit_price)
-        put_many(sheet_row_idx, cols_reason_old, res_reason)
-        put_many(sheet_row_idx, cols_exit_reason, res_reason)
-        put_many(sheet_row_idx, cols_pnl_old, pnl_pct)
-        put_many(sheet_row_idx, cols_pnl_new, pnl_pct)
-        put_many(sheet_row_idx, cols_holdmin, hold_min)
-        if cols_levpnl:
-            put_many(sheet_row_idx, cols_levpnl, levpnl)
-        if cols_rmult:
-            put_many(sheet_row_idx, cols_rmult, r_mult)
-
-        judged += 1
-        time.sleep(0.12)
+        if res_s == "PENDING" and len(candles) >= 96:
+            res_s, res_r = "EXPIRED", "TimeOver"
+        if res_s in ("DONE", "AMBIGUOUS", "EXPIRED"):
+            ridx = start + len(rows) - 1 - i
+            pnl = (res_p / entry - 1) * 100 if (entry and res_p and res_s == "DONE") else 0
+            if side == "SHORT":
+                pnl = -pnl
+            for col_n, val in [("EvalStatus", res_s), ("Win/Lose", res_w), ("ExitPrice", res_p), ("PnL_Pct", pnl), ("ExitReason", res_r)]:
+                c_idx = next((ci for ci, h in enumerate(hs) if h == col_n), -1)
+                if c_idx >= 0:
+                    updates.append({"range": f"{sheet_name}!{col_to_a1(c_idx)}{ridx}", "values": [[val]]})
+            judged += 1
 
     if updates:
-        sheets_execute(
-            service.spreadsheets().values().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body={"valueInputOption": "USER_ENTERED", "data": updates},
-            ),
-            desc=f"judge_batchUpdate sheet={sheet_name} updates={len(updates)}",
-        )
-        _invalidate_sheet_caches(sheet_name)
-
+        sheets_execute(svc.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}))
     return judged
 
+
 def judge_main():
-    total = 0
-    total += judge_sheet(MAIN_SHEET_NAME)
-    total += judge_sheet(LEARN_SHEET_NAME)
-    return f"Judged {total} rows (table + learn_log)"
+    return f"Judged:{judge_sheet(MAIN_SHEET_NAME) + judge_sheet(LEARN_SHEET_NAME)}"
 
-# ==========================================
-# /preflight
-# ==========================================
-def preflight_check() -> Tuple[bool, str]:
+
+def _e_report(days=30):
     try:
-        _ = _get_sheets_meta()
+        creds = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])[0]
+        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        rows = svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{LEARN_SHEET_NAME}!A:ZZ"
+        ).execute().get("values", [])
 
-        ok, msg = self_heal_prerequisites()
-        if not ok:
-            return False, f"self_heal_ng: {msg}"
+        if len(rows) < 2:
+            return "Empty"
 
-        if RUN_MUTEX_ENABLED:
-            cur = _mutex_read()
-            _mutex_write(f"preflight|{int(time.time())}|{_INSTANCE_ID}")
-            time.sleep(0.1)
-            _mutex_write(cur)
+        hm = {str(h).strip(): i for i, h in enumerate(rows[0])}
+        for c in ["EvalStatus", "Reserved2", "PnL_Pct", "Time"]:
+            if c not in hm:
+                return f"Missing column: {c}"
 
-        return True, "ok"
-    except HttpError as e:
-        return False, f"google_api_http_error: {str(e)}"
+        cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+
+        data = []
+        for r in rows[1:]:
+            if len(r) <= max(hm["Reserved2"], hm["PnL_Pct"], hm["EvalStatus"], hm["Time"]):
+                continue
+
+            dt = parse_dt_any(r[hm["Time"]])
+            if not dt:
+                continue
+            # JST tz付きで返る前提でUTCに変換し、cutoffと比較
+            dt_utc = dt.astimezone(timezone.utc)
+            if dt_utc < cutoff_utc:
+                continue
+
+            if str(r[hm["EvalStatus"]]).strip().upper() != "DONE":
+                continue
+
+            e = to_float(r[hm["Reserved2"]])
+            pnl = to_float(r[hm["PnL_Pct"]])
+            if e is not None and pnl is not None:
+                data.append((e, pnl))
+
+        if not data:
+            return "No Data in target period"
+
+        es = sorted([x[0] for x in data])
+        q33 = es[int(len(es) * 0.33)]
+        q67 = es[int(len(es) * 0.67)]
+
+        stats = {"LOW": [0, 0, 0.0], "MID": [0, 0, 0.0], "HIGH": [0, 0, 0.0]}
+        for e, pnl in data:
+            b = "LOW" if e <= q33 else "HIGH" if e > q67 else "MID"
+            stats[b][0] += 1
+            stats[b][1] += 1 if pnl > 0 else 0
+            stats[b][2] += pnl
+
+        res = f"[E_REPORT] {days} days\n"
+        for k, v in stats.items():
+            if v[0]:
+                res += f"{k}: n={v[0]} WR:{v[1]/v[0]:.2f} Avg:{v[2]/v[0]:.2f}%\n"
+            else:
+                res += f"{k}: n=0\n"
+        return res
+
     except Exception as e:
-        return False, f"preflight_error: {e}"
+        return str(e)
+
 
 # ==========================================
 # ルーティング
 # ==========================================
-@app.route("/", methods=["GET"])
-def home():
-    return f"{VERSION} is Active", 200
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
-
-
-def _get_sheets_service_for_report():
-    """
-    既存コードに Sheets service 生成関数があっても壊さないため、
-    レポート専用にローカルで作る（必要十分・最短）。
-    """
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds, _ = google.auth.default(scopes=scopes)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-
-def _read_sheet_all_values(spreadsheet_id: str, sheet_name: str) -> List[List[Any]]:
-    svc = _get_sheets_service_for_report()
-    rng = f"{sheet_name}!A:ZZ"
-    resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
-    return resp.get("values", [])
-
-
-def _index_map(header_row: List[str]) -> Dict[str, int]:
-    m = {}
-    for i, name in enumerate(header_row):
-        m[str(name).strip()] = i
-    return m
-
-
-def _to_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "":
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-
-def _e_report(days: int = 30) -> str:
-    """
-    learn_log を読み、E(Reserved2)のレンジ別に成績を集計して返す。
-    前提：
-      - Reserved2 に E（期待値%）が入っている
-      - PnL_Pct / ExitReason / EvalStatus が入っている（あなたの添付と同じ系）
-    """
-    rows = _read_sheet_all_values(SPREADSHEET_ID, LEARN_SHEET_NAME)
-    if not rows or len(rows) < 2:
-        return "[E_REPORT] learn_log is empty."
-
-    header = rows[0]
-    idx = _index_map(header)
-
-    # 必須列
-    need_cols = ["Reserved2", "PnL_Pct", "EvalStatus", "ExitReason", "Symbol"]
-    missing = [c for c in need_cols if c not in idx]
-    if missing:
-        return f"[E_REPORT] missing columns in learn_log: {missing}"
-
-    i_e = idx["Reserved2"]
-    i_pnl = idx["PnL_Pct"]
-    i_status = idx["EvalStatus"]
-    i_exit = idx["ExitReason"]
-    i_sym = idx["Symbol"]
-
-    # 任意列（あれば便利）
-    i_exit_time = idx.get("ExitTime", None)
-    i_dt = idx.get("Datetime(SymbolTime_JST)", idx.get("Datetime", None))
-
-    # “最近days日” に絞る（ExitTimeがあればExitTime、なければDatetimeで）
-    # パースできない行は対象に残す（最短で壊さない）
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-    def parse_dt(val: Any) -> Optional[datetime]:
-        if val is None:
-            return None
-        s = str(val).strip()
-        if s == "":
-            return None
-        # いくつかの形式を雑に吸収
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                return dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-        return None
-
-    data = []
-    for r in rows[1:]:
-        if len(r) <= max(i_e, i_pnl, i_status, i_exit, i_sym):
-            continue
-
-        status = str(r[i_status]).strip().upper()
-        if status != "DONE":
-            continue
-
-        e = _to_float(r[i_e])
-        pnl = _to_float(r[i_pnl])
-        sym = str(r[i_sym]).strip()
-        exr = str(r[i_exit]).strip().upper()
-
-        if e is None or pnl is None or sym == "":
-            continue
-
-        dt_val = None
-        if i_exit_time is not None and i_exit_time < len(r):
-            dt_val = parse_dt(r[i_exit_time])
-        if dt_val is None and i_dt is not None and i_dt < len(r):
-            dt_val = parse_dt(r[i_dt])
-
-        if dt_val is not None and dt_val < cutoff:
-            continue
-
-        data.append((sym, e, pnl, exr))
-
-    if not data:
-        return f"[E_REPORT] No DONE rows with E/PnL found in last {days} days."
-
-    # E を 3段階に分ける（頑健：分位点は切り捨てで安定化）
-    es = sorted([x[1] for x in data])
-
-    def q(p: float) -> float:
-        n = len(es)
-        if n <= 0:
-            return 0.0
-        # round ではなく floor（切り捨て）で分位を安定化
-        k = int((n - 1) * p)
-        if k < 0:
-            k = 0
-        if k > n - 1:
-            k = n - 1
-        return float(es[k])
-
-    q33 = q(0.33)
-    q67 = q(0.67)
-
-    # 分位が潰れる（q33==q67）場合のフォールバック：
-    # 直近データで E=0 が多数派のとき、分位3分割が成立しないため
-    # 「負 / 0 / 正」で必ず3群に分ける
-    if q33 == q67:
-        q_mode = "SIGN_FALLBACK"
-    else:
-        q_mode = "TERTILE"
-
-    def bucket(e: float) -> str:
-        if q_mode == "SIGN_FALLBACK":
-            if e < 0:
-                return "LOW"
-            if e == 0:
-                return "MID"
-            return "HIGH"
-
-        # 通常：分位3分割
-        if e <= q33:
-            return "LOW"
-        if e <= q67:
-            return "MID"
-        return "HIGH"
-
-
-    # 集計
-    stats = {
-        "LOW": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
-        "MID": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
-        "HIGH": {"n": 0, "win": 0, "pnl_sum": 0.0, "sl": 0, "tp": 0},
+@app.get("/ai_health")
+def ai_health():
+    load_ai_model_if_needed(force=False)
+    m = get_ai_model()
+    ok = (m is not None)
+    payload = {
+        "ok": bool(ok), "service": os.environ.get("K_SERVICE", ""),
+        "revision": os.environ.get("K_REVISION", ""), "model_version": _model_info.get("model_version", ""),
+        "model_uri": MODEL_GCS_URI, "model_local_path": _model_info.get("local_path", ""),
+        "loaded_at": _model_info.get("loaded_at", ""), "last_error": _model_info.get("error", ""),
     }
-
-    by_sym = {}  # sym -> same dict
-    for sym, e, pnl, exr in data:
-        b = bucket(e)
-        s = stats[b]
-        s["n"] += 1
-        s["win"] += 1 if pnl > 0 else 0
-        s["pnl_sum"] += pnl
-        s["sl"] += 1 if exr == "SL" else 0
-        s["tp"] += 1 if exr == "TP" else 0
-
-        if sym not in by_sym:
-            by_sym[sym] = {"n": 0, "win": 0, "pnl_sum": 0.0}
-        by_sym[sym]["n"] += 1
-        by_sym[sym]["win"] += 1 if pnl > 0 else 0
-        by_sym[sym]["pnl_sum"] += pnl
-
-    def line(b):
-        s = stats[b]
-        n = s["n"]
-        if n <= 0:
-            return f"{b}: n=0"
-        wr = s["win"] / n
-        avg = s["pnl_sum"] / n
-        slr = s["sl"] / n
-        tpr = s["tp"] / n
-        return f"{b}: n={n} win_rate={wr:.2f} avg_pnl={avg:.2f}% SL={slr:.2f} TP={tpr:.2f}"
-
-    # 銘柄別 上位（件数順）
-    top_syms = sorted(by_sym.items(), key=lambda kv: kv[1]["n"], reverse=True)[:10]
-    sym_lines = []
-    for sym, s in top_syms:
-        n = s["n"]
-        wr = s["win"] / n if n else 0.0
-        avg = s["pnl_sum"] / n if n else 0.0
-        sym_lines.append(f"{sym}: n={n} win_rate={wr:.2f} avg_pnl={avg:.2f}%")
-        
-    zeros = sum(1 for _, e, _, _ in data if e == 0)
-    negs = sum(1 for _, e, _, _ in data if e < 0)
-    poss = sum(1 for _, e, _, _ in data if e > 0)
-
-    msg = (
-        f"[E_REPORT] last {days} days (DONE only)  E_counts: neg={negs} zero={zeros} pos={poss}\n"
-        f"E tertiles: q33={q33:.2f}  q67={q67:.2f}\n"
-        f"{line('LOW')}\n"
-        f"{line('MID')}\n"
-        f"{line('HIGH')}\n"
-        f"Top symbols:\n" + "\n".join(sym_lines)
-    )
-
-    return msg
+    return jsonify(payload), (200 if ok else 503)
 
 
-@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/run")
+def run_route():
+    if not _run_lock.acquire(blocking=False):
+        return "Busy", 429
+    token = ""
+    try:
+        ok, t = acquire_run_mutex()
+        if not ok:
+            return "Busy Mutex", 429
+        token = t
+        res = str(logic_main())
+        if AUTO_JUDGE_AFTER_RUN:
+            res += " | " + str(judge_main())
+        return res, 200
+    finally:
+        release_run_mutex(token)
+        _run_lock.release()
+
+
+@app.route("/judge")
+def judge_route():
+    if not _run_lock.acquire(blocking=False):
+        return "Busy", 429
+    token = ""
+    try:
+        ok, t = acquire_run_mutex()
+        if not ok:
+            return "Busy Mutex", 429
+        token = t
+        return str(judge_main()), 200
+    finally:
+        release_run_mutex(token)
+        _run_lock.release()
+
+
+@app.route("/e_report")
+def e_report_route():
+    return _e_report(int(request.args.get("days", 30))), 200
+
+
+@app.route("/health")
+@app.route("/healthz")
 def health():
-    print(f"[HEALTH] {request.method} {request.path}")
     return "ok", 200
 
 
-
-@app.route("/e_report", methods=["GET"])
-def e_report():
-    """
-    手動確認用：
-      /e_report?days=30
-    Discordにも同じ内容を流す（確認しやすい）
-    """
-    days = request.args.get("days", "30")
-    try:
-        days_i = int(days)
-        if days_i < 1:
-            days_i = 1
-        if days_i > 365:
-            days_i = 365
-    except Exception:
-        days_i = 30
-
-    msg = _e_report(days=days_i)
-    try:
-        send_discord_message(msg)
-    except Exception:
-        pass
-    return msg, 200
+@app.route("/")
+def home():
+    return f"{VERSION} Active", 200
 
 
-@app.route("/preflight", methods=["GET"])
+@app.route("/preflight")
 def preflight():
-    ok, msg = preflight_check()
+    ok, msg = self_heal_prerequisites()
     return (f"OK: {msg}", 200) if ok else (f"NG: {msg}", 500)
 
-@app.route("/run", methods=["GET", "POST"])
-def run_process():
-    if not _run_lock.acquire(blocking=False):
-        return "Busy (run/judge already in progress).", 429
-
-    mutex_token = ""
-    try:
-        ok, msg = preflight_check()
-        if not ok:
-            return f"Preflight NG: {msg}", 500
-
-        okm, token = acquire_run_mutex()
-        if not okm:
-            return "Busy (distributed mutex).", 429
-        mutex_token = token
-
-        res_run = str(logic_main())
-
-        if AUTO_JUDGE_AFTER_RUN:
-            if not ENABLE_JUDGE:
-                return res_run + " / Judge disabled", 200
-            res_j = str(judge_main())
-            return res_run + " / " + res_j, 200
-
-        return res_run, 200
-
-    finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
-
-@app.route("/judge", methods=["GET", "POST"])
-def judge_process():
-    if not ENABLE_JUDGE:
-        return "Judge is disabled (set ENABLE_JUDGE=1 to enable).", 403
-
-    if not _run_lock.acquire(blocking=False):
-        return "Busy (run/judge already in progress).", 429
-
-    mutex_token = ""
-    try:
-        ok, msg = preflight_check()
-        if not ok:
-            return f"Preflight NG: {msg}", 500
-
-        okm, token = acquire_run_mutex()
-        if not okm:
-            return "Busy (distributed mutex).", 429
-        mutex_token = token
-
-        return str(judge_main()), 200
-
-    finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
