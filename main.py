@@ -42,6 +42,8 @@ from config import (
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "").strip() or VERSION
 MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()  # 例: gs://your-bucket/models/trade_ai_model.pkl
 MODEL_LOCAL_FALLBACK = os.environ.get("MODEL_LOCAL_FALLBACK", "trade_ai_model.pkl").strip()
+MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
+
 
 _model_lock = threading.Lock()
 _model_obj = None
@@ -209,10 +211,18 @@ from discord_util import send_discord_message
 # Flask設定（Buildpacks標準：main.py の app を起動）
 # ==========================================
 app = Flask(__name__)
-AI_MODEL = None
 
-_AI_LOADED_AT = ""
-_AI_LAST_ERROR = ""
+# 起動時に1回だけモデルロードし、Discordに結果を通知（成功/失敗）
+# ※ ここで load_ai_model_if_needed() が動くので「AIをONにしたのにOFF扱い」を潰せます
+_startup_notify_model_status_once()
+
+# 互換：既存コードが AI_MODEL 変数を参照している場合に備えてセットしておく
+AI_MODEL = get_ai_model()
+
+# デバッグ表示用（/health 等で返したい場合に使える）
+_AI_LOADED_AT = _model_info.get("loaded_at", "")
+_AI_LAST_ERROR = _model_info.get("error", "")
+
 
 
 @app.get("/ai_health")
@@ -2253,6 +2263,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
