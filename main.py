@@ -236,7 +236,7 @@ def ai_health():
         "revision": os.environ.get("K_REVISION", ""),
         "model_version": os.environ.get("MODEL_VERSION", "").strip(),
         "model_uri": os.environ.get("MODEL_GCS_URI", "").strip(),
-        "model_local_path": os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip(),
+        "model_local_path": MODEL_LOCAL_PATH,
         "loaded_at": _AI_LOADED_AT,
         "last_error": _AI_LAST_ERROR,
     }
@@ -2263,6 +2263,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
