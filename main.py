@@ -34,13 +34,15 @@ from config import (
     RUN_MUTEX,
 )
 
+from discord_util import send_discord_message
+
 # ==========================================================
 # AIモデル運用の堅牢化
 # ==========================================================
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "").strip() or VERSION
 MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()
 MODEL_LOCAL_FALLBACK = os.environ.get("MODEL_LOCAL_FALLBACK", "trade_ai_model.pkl").strip()
-MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "/tmp/trade_ai_model.pkl").strip()
+MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "").strip()
 
 _model_lock = threading.Lock()
 _model_obj = None
@@ -88,10 +90,17 @@ def _download_model_from_gcs(gs_uri: str, dst_path: str) -> None:
 
 
 def _resolve_model_path() -> Tuple[str, str]:
+    # 明示指定があれば最優先（ローカルの絶対パス等）
+    if MODEL_LOCAL_PATH:
+        return MODEL_LOCAL_PATH, "local"
+
+    # GCS指定があれば /tmp/models/{MODEL_VERSION}/trade_ai_model.pkl に落とす
     if MODEL_GCS_URI:
         dst_dir = f"/tmp/models/{MODEL_VERSION}"
         dst_path = os.path.join(dst_dir, "trade_ai_model.pkl")
         return dst_path, "gcs"
+
+    # それ以外は repo 同梱のファイル（または Cloud Run の作業ディレクトリにある想定）
     return MODEL_LOCAL_FALLBACK, "local"
 
 
@@ -173,9 +182,8 @@ def _startup_notify_model_status_once() -> None:
     global _startup_model_notify_done
     if _startup_model_notify_done:
         return
+
     ok = load_ai_model_if_needed(force=False)
-    if "send_discord_message" not in globals():
-        return
     try:
         if ok:
             msg = (
@@ -197,14 +205,21 @@ def _startup_notify_model_status_once() -> None:
         pass
 
 
-from discord_util import send_discord_message
-
 # ==========================================
-# Flask設定
+# Flask設定（起動を軽くする）
 # ==========================================
 app = Flask(__name__)
-_startup_notify_model_status_once()
-ai_model = get_ai_model()
+
+def kickoff_startup_model_notify():
+    """起動をブロックしないよう、モデルロード＋通知は別スレッドで実行する。"""
+    def _task():
+        try:
+            _startup_notify_model_status_once()
+        except Exception as e:
+            print(f"[WARN] startup model notify failed: {e}")
+    threading.Thread(target=_task, daemon=True).start()
+
+kickoff_startup_model_notify()
 
 # ==========================================
 # グローバル & ヘルパー
@@ -255,9 +270,6 @@ def parse_dt_any(s: str) -> Optional[datetime]:
     if dt is None:
         return None
 
-    # Time列はJST文字列で保存している前提：
-    # - naive は JST を付与
-    # - tz付きは JST に寄せて統一（Z/UTC混在でも dedup がズレない）
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=JST)
     else:
@@ -713,18 +725,15 @@ def self_heal_prerequisites():
 
 
 # ==========================================
-# ロジック本体
+# ロジック本体（あなたの版を維持）
 # ==========================================
 def logic_main():
-    global ai_model
-
     now_jst = datetime.now(JST)
     ok, msg = self_heal_prerequisites()
     if not ok:
         send_discord_message(f"[WARN] self_heal failed: {msg}")
         return f"Fail: {msg}"
 
-    # force=1 でない限り、15分足の確定後窓以外は待機
     if (request.args.get("force") != "1") and (now_jst.minute % 15 >= 10):
         return "Waiting..."
 
@@ -929,6 +938,13 @@ def logic_main():
 # ==========================================
 # 判定係 / 分析
 # ==========================================
+def _hm_pick_index(hm: Dict[str, int], names: List[str]) -> Optional[int]:
+    for n in names:
+        if n in hm:
+            return hm[n]
+    return None
+
+
 def judge_sheet(sheet_name: str, lookback=JUDGE_LOOKBACK_ROWS, max_j=30):
     svc, ex = get_sheet_service(), build_exchange()
     hs, _, okh = get_headers_and_len(sheet_name)
@@ -940,28 +956,53 @@ def judge_sheet(sheet_name: str, lookback=JUDGE_LOOKBACK_ROWS, max_j=30):
         return 0
 
     start = max(2, last - lookback + 1)
-    res = sheets_execute(svc.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=f"{sheet_name}!A{start}:{HEADER_COL_END}{last}"))
+    res = sheets_execute(
+        svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{sheet_name}!A{start}:{HEADER_COL_END}{last}"
+        )
+    )
     rows = res.get("values", [])
     if not rows:
         return 0
 
-    hm = {str(h).strip(): i for i, h in enumerate(hs)}
-    c_ev = next((i for i, h in enumerate(hs) if h == "EvalStatus"), -1)
-    if c_ev == -1:
+    hm = {str(h).strip(): i for i, h in enumerate(hs) if str(h).strip()}
+
+    # EvalStatus 列は固定名が多いが、念のため候補で拾う
+    c_ev = _hm_pick_index(hm, ["EvalStatus", "Eval", "Status"])
+    if c_ev is None:
+        return 0
+
+    # 列名揺れを吸収（Time / Direction など）
+    idx_symbol = _hm_pick_index(hm, ["Symbol"])
+    idx_time = _hm_pick_index(hm, ["Time", "Datetime(SymbolTime_JST)", "Datetime", "SymbolTime_JST", "DateTime", "Timestamp"])
+    idx_entry = _hm_pick_index(hm, ["EntryPrice", "Entry", "Entry_Price", "Price"])
+    idx_tp = _hm_pick_index(hm, ["TP_Price", "TP", "TPPrice"])
+    idx_sl = _hm_pick_index(hm, ["SL_Price", "SL", "SLPrice"])
+    idx_dir = _hm_pick_index(hm, ["Direction", "Side", "SignalType", "Type"])
+
+    if any(x is None for x in [idx_symbol, idx_time, idx_entry, idx_tp, idx_sl, idx_dir]):
         return 0
 
     updates, judged = [], 0
     for i, row in enumerate(reversed(rows)):
         if judged >= max_j:
             break
-        if len(row) > c_ev and row[c_ev]:
+
+        # EvalStatus列が存在し、かつ値が入っている行はスキップ
+        if len(row) > c_ev and str(row[c_ev]).strip():
             continue
 
-        if any(f not in hm for f in ["Symbol", "Time", "EntryPrice", "TP_Price", "SL_Price", "Direction"]):
-            return 0
+        max_idx = max(idx_symbol, idx_time, idx_entry, idx_tp, idx_sl, idx_dir)
+        if len(row) <= max_idx:
+            continue
 
-        sym, t_raw = row[hm["Symbol"]], row[hm["Time"]]
-        entry, tp, sl = to_float(row[hm["EntryPrice"]]), to_float(row[hm["TP_Price"]]), to_float(row[hm["SL_Price"]])
+        sym = str(row[idx_symbol]).strip()
+        t_raw = row[idx_time]
+        entry = to_float(row[idx_entry])
+        tp = to_float(row[idx_tp])
+        sl = to_float(row[idx_sl])
+
         if not (sym and entry and tp and sl):
             continue
 
@@ -970,39 +1011,54 @@ def judge_sheet(sheet_name: str, lookback=JUDGE_LOOKBACK_ROWS, max_j=30):
             continue
 
         since = int((dt + timedelta(minutes=15)).timestamp() * 1000)
-        side = "LONG" if "LONG" in str(row[hm["Direction"]]).upper() else "SHORT"
+        side = "LONG" if "LONG" in str(row[idx_dir]).upper() else "SHORT"
+
         candles = fetch_ohlcv_safe(ex, sym, "15m", 100, since=since)
         if not candles:
             continue
 
-        res_s, res_w, res_r, res_p, res_t = "PENDING", "", "", None, None
+        res_s, res_w, res_r, res_p = "PENDING", "", "", None
         for ts, o, h, l, c, v in candles:
             tp_h, sl_h = (h >= tp, l <= sl) if side == "LONG" else (l <= tp, h >= sl)
             if tp_h and sl_h:
-                res_s, res_r, res_p, res_t = "AMBIGUOUS", "Both", entry, ts
+                res_s, res_r, res_p = "AMBIGUOUS", "Both", entry
                 break
             if tp_h:
-                res_s, res_w, res_r, res_p, res_t = "DONE", "Win", "TP", tp, ts
+                res_s, res_w, res_r, res_p = "DONE", "Win", "TP", tp
                 break
             if sl_h:
-                res_s, res_w, res_r, res_p, res_t = "DONE", "Lose", "SL", sl, ts
+                res_s, res_w, res_r, res_p = "DONE", "Lose", "SL", sl
                 break
 
         if res_s == "PENDING" and len(candles) >= 96:
             res_s, res_r = "EXPIRED", "TimeOver"
+
         if res_s in ("DONE", "AMBIGUOUS", "EXPIRED"):
             ridx = start + len(rows) - 1 - i
             pnl = (res_p / entry - 1) * 100 if (entry and res_p and res_s == "DONE") else 0
             if side == "SHORT":
                 pnl = -pnl
-            for col_n, val in [("EvalStatus", res_s), ("Win/Lose", res_w), ("ExitPrice", res_p), ("PnL_Pct", pnl), ("ExitReason", res_r)]:
-                c_idx = next((ci for ci, h in enumerate(hs) if h == col_n), -1)
-                if c_idx >= 0:
+
+            for col_n, val in [
+                ("EvalStatus", res_s),
+                ("Win/Lose", res_w),
+                ("ExitPrice", res_p),
+                ("PnL_Pct", pnl),
+                ("ExitReason", res_r),
+            ]:
+                c_idx = _hm_pick_index(hm, [col_n])
+                if c_idx is not None:
                     updates.append({"range": f"{sheet_name}!{col_to_a1(c_idx)}{ridx}", "values": [[val]]})
+
             judged += 1
 
     if updates:
-        sheets_execute(svc.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}))
+        sheets_execute(
+            svc.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": updates}
+            )
+        )
     return judged
 
 
@@ -1025,45 +1081,24 @@ def _e_report(days=30):
         headers = [str(h or "").strip() for h in rows[0]]
         hm = {h: i for i, h in enumerate(headers) if h}
 
-        # 必須列（Time 以外）
         for c in ["EvalStatus", "Reserved2", "PnL_Pct"]:
             if c not in hm:
                 return f"Missing column: {c}"
 
-        # Time 列名の揺れに対応（learn_log の実態に合わせる）
-        time_candidates = [
-            "Time",
-            "Datetime(SymbolTime_JST)",
-            "Datetime",
-            "SymbolTime_JST",
-            "DateTime",
-            "Timestamp",
-        ]
-
-        time_col = None
-        for name in time_candidates:
-            if name in hm:
-                time_col = hm[name]
-                break
-
-        # 最後の保険：A列（0列目）を時刻として扱う（learn_log が「先頭列=日時」運用が多いため）
-        if time_col is None:
-            time_col = 0
+        time_candidates = ["Time", "Datetime(SymbolTime_JST)", "Datetime", "SymbolTime_JST", "DateTime", "Timestamp"]
+        time_col = next((hm[name] for name in time_candidates if name in hm), 0)
 
         cutoff_utc = datetime.now(timezone.utc) - timedelta(days=int(days))
 
         data = []
         for r in rows[1:]:
-            # 必須列までデータがあるか
             max_need = max(hm["Reserved2"], hm["PnL_Pct"], hm["EvalStatus"], time_col)
             if len(r) <= max_need:
                 continue
 
-            # DONE のみ対象
             if str(r[hm["EvalStatus"]]).strip().upper() != "DONE":
                 continue
 
-            # 時刻パース → UTC にして期間フィルタ
             dt = parse_dt_any(r[time_col])
             if not dt:
                 continue
@@ -1077,7 +1112,6 @@ def _e_report(days=30):
                 data.append((e, pnl))
 
         if not data:
-            # ここでヘッダー確認に使える情報も返す（運用で助かる）
             return "No Data in target period"
 
         es = sorted([x[0] for x in data])
@@ -1101,7 +1135,6 @@ def _e_report(days=30):
 
     except Exception as e:
         return str(e)
-
 
 
 # ==========================================
@@ -1180,4 +1213,3 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
