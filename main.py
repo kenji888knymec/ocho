@@ -1022,27 +1022,53 @@ def _e_report(days=30):
         if len(rows) < 2:
             return "Empty"
 
-        hm = {str(h).strip(): i for i, h in enumerate(rows[0])}
-        for c in ["EvalStatus", "Reserved2", "PnL_Pct", "Time"]:
+        headers = [str(h or "").strip() for h in rows[0]]
+        hm = {h: i for i, h in enumerate(headers) if h}
+
+        # 必須列（Time 以外）
+        for c in ["EvalStatus", "Reserved2", "PnL_Pct"]:
             if c not in hm:
                 return f"Missing column: {c}"
 
-        cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+        # Time 列名の揺れに対応（learn_log の実態に合わせる）
+        time_candidates = [
+            "Time",
+            "Datetime(SymbolTime_JST)",
+            "Datetime",
+            "SymbolTime_JST",
+            "DateTime",
+            "Timestamp",
+        ]
+
+        time_col = None
+        for name in time_candidates:
+            if name in hm:
+                time_col = hm[name]
+                break
+
+        # 最後の保険：A列（0列目）を時刻として扱う（learn_log が「先頭列=日時」運用が多いため）
+        if time_col is None:
+            time_col = 0
+
+        cutoff_utc = datetime.now(timezone.utc) - timedelta(days=int(days))
 
         data = []
         for r in rows[1:]:
-            if len(r) <= max(hm["Reserved2"], hm["PnL_Pct"], hm["EvalStatus"], hm["Time"]):
+            # 必須列までデータがあるか
+            max_need = max(hm["Reserved2"], hm["PnL_Pct"], hm["EvalStatus"], time_col)
+            if len(r) <= max_need:
                 continue
 
-            dt = parse_dt_any(r[hm["Time"]])
+            # DONE のみ対象
+            if str(r[hm["EvalStatus"]]).strip().upper() != "DONE":
+                continue
+
+            # 時刻パース → UTC にして期間フィルタ
+            dt = parse_dt_any(r[time_col])
             if not dt:
                 continue
-            # JST tz付きで返る前提でUTCに変換し、cutoffと比較
             dt_utc = dt.astimezone(timezone.utc)
             if dt_utc < cutoff_utc:
-                continue
-
-            if str(r[hm["EvalStatus"]]).strip().upper() != "DONE":
                 continue
 
             e = to_float(r[hm["Reserved2"]])
@@ -1051,6 +1077,7 @@ def _e_report(days=30):
                 data.append((e, pnl))
 
         if not data:
+            # ここでヘッダー確認に使える情報も返す（運用で助かる）
             return "No Data in target period"
 
         es = sorted([x[0] for x in data])
@@ -1064,7 +1091,7 @@ def _e_report(days=30):
             stats[b][1] += 1 if pnl > 0 else 0
             stats[b][2] += pnl
 
-        res = f"[E_REPORT] {days} days\n"
+        res = f"[E_REPORT] {int(days)} days\n"
         for k, v in stats.items():
             if v[0]:
                 res += f"{k}: n={v[0]} WR:{v[1]/v[0]:.2f} Avg:{v[2]/v[0]:.2f}%\n"
@@ -1074,6 +1101,7 @@ def _e_report(days=30):
 
     except Exception as e:
         return str(e)
+
 
 
 # ==========================================
@@ -1152,3 +1180,4 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
