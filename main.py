@@ -1178,17 +1178,72 @@ def load_ai_model():
             _boot_notify_model_status_once(bucket, gcs_uri, local_path, ver, True, "")
             return m
 
-        if os.path.exists("trade_ai_model.pkl"):
-            m = joblib.load("trade_ai_model.pkl")
+# 1) GCS（MODEL_GCS_URI） -> /tmp キャッシュ を優先
+gcs_uri = os.environ.get("MODEL_GCS_URI", "").strip()
+
+def _parse_gs_uri(gs: str) -> tuple[str, str]:
+    # gs://bucket/path/to/file.pkl -> ("bucket", "path/to/file.pkl")
+    if not gs.startswith("gs://"):
+        raise ValueError(f"MODEL_GCS_URI must start with gs:// (got: {gs})")
+    rest = gs[5:]
+    parts = rest.split("/", 1)
+    bucket_name = parts[0].strip()
+    blob_name = parts[1].strip() if len(parts) > 1 else ""
+    if not bucket_name or not blob_name:
+        raise ValueError(f"Invalid gs:// uri (got: {gs})")
+    return bucket_name, blob_name
+
+def _download_from_gcs(gs: str, dst_path: str) -> None:
+    from google.cloud import storage
+    import google.auth
+
+    bucket_name, blob_name = _parse_gs_uri(gs)
+    creds, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/devstorage.read_only"])
+    client = storage.Client(credentials=creds, project=project_id)
+
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    blob.download_to_filename(dst_path)
+
+# /tmp に ver 付きでキャッシュ（Cloud Runで書ける）
+safe_ver = str(ver).replace("/", "_").replace(":", "_")
+tmp_model_path = f"/tmp/trade_ai_model_{safe_ver}.pkl" if safe_ver else "/tmp/trade_ai_model.pkl"
+
+# --- GCS 経由でロード（最優先） ---
+if gcs_uri:
+    try:
+        if (not os.path.exists(tmp_model_path)) or (os.path.getsize(tmp_model_path) == 0):
+            print(f"[AI] downloading model from GCS... uri=GCS ver={ver} -> {tmp_model_path}")
+            _download_from_gcs(gcs_uri, tmp_model_path)
+        else:
+            print(f"[AI] using cached model: {tmp_model_path} ver={ver}")
+
+        if os.path.exists(tmp_model_path) and os.path.getsize(tmp_model_path) > 0:
+            m = joblib.load(tmp_model_path)
             _AI_LOADED_AT = datetime.now(JST).isoformat()
             _AI_LAST_ERROR = ""
-            print(f"[AI] Model Loaded Successfully uri=LOCAL path=trade_ai_model.pkl ver={ver}")
+            print(f"[AI] Model Loaded Successfully uri=GCS path={tmp_model_path} ver={ver}")
             return m
+    except Exception as e:
+        # GCSが落ちてもローカルへフォールバックする
+        _AI_LAST_ERROR = f"gcs load failed: {e}"
+        print(f"[AI] GCS load failed -> fallback to local. err={e}")
 
-        print("[AI] trade_ai_model.pkl not found -> AI gate is bypassed (ai_pass=True).")
-        _AI_LOADED_AT = ""
-        _AI_LAST_ERROR = "model file not found (AI bypassed)"
-        return None
+# --- ローカル同梱（最後の手段） ---
+if os.path.exists("trade_ai_model.pkl") and os.path.getsize("trade_ai_model.pkl") > 0:
+    m = joblib.load("trade_ai_model.pkl")
+    _AI_LOADED_AT = datetime.now(JST).isoformat()
+    _AI_LAST_ERROR = ""
+    print(f"[AI] Model Loaded Successfully uri=LOCAL path=trade_ai_model.pkl ver={ver}")
+    return m
+
+print("[AI] model not found -> AI gate is bypassed (ai_pass=True).")
+_AI_LOADED_AT = ""
+_AI_LAST_ERROR = "model file not found (AI bypassed)"
+return None
+
 
     except Exception as e:
         _AI_LOADED_AT = ""
@@ -2263,6 +2318,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
