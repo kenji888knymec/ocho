@@ -1232,17 +1232,24 @@ if gcs_uri:
         print(f"[AI] GCS load failed -> fallback to local. err={e}")
 
 # --- ローカル同梱（最後の手段） ---
-if os.path.exists("trade_ai_model.pkl") and os.path.getsize("trade_ai_model.pkl") > 0:
-    m = joblib.load("trade_ai_model.pkl")
-    _AI_LOADED_AT = datetime.now(JST).isoformat()
-    _AI_LAST_ERROR = ""
-    print(f"[AI] Model Loaded Successfully uri=LOCAL path=trade_ai_model.pkl ver={ver}")
-    return m
+MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "trade_ai_model.pkl")
 
-print("[AI] model not found -> AI gate is bypassed (ai_pass=True).")
+if os.path.exists(MODEL_LOCAL_PATH) and os.path.getsize(MODEL_LOCAL_PATH) > 0:
+    try:
+        m = joblib.load(MODEL_LOCAL_PATH)
+        _AI_LOADED_AT = datetime.now(JST).isoformat()
+        _AI_LAST_ERROR = ""
+        print(f"[AI] Model Loaded Successfully uri=LOCAL path={MODEL_LOCAL_PATH} ver={ver}")
+        return m
+    except Exception as e:
+        _AI_LAST_ERROR = f"local load failed: {e}"
+        print(f"[AI] local load failed -> bypass. err={e}")
+
+print(f"[AI] {MODEL_LOCAL_PATH} not found -> AI gate is bypassed (ai_pass=True).")
 _AI_LOADED_AT = ""
 _AI_LAST_ERROR = "model file not found (AI bypassed)"
 return None
+
 
 
     except Exception as e:
@@ -2318,6 +2325,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
