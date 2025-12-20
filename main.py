@@ -197,11 +197,8 @@ def _startup_notify_model_status_once() -> None:
         pass
 
 
-# ★起動時に “ロードだけ” 先に済ませる（通知は send_discord_message が使える時点で1回）
-try:
-    load_ai_model_if_needed(force=False)
-except Exception:
-    pass
+# （削除）起動時の先行ロードは行わない：load_ai_model() 側で一元化する（GCS配布＆通知も一本化）
+
 
 
 
@@ -2163,9 +2160,9 @@ def _e_report(days: int = 30) -> str:
 
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
-    _startup_notify_model_status_once()
     print(f"[HEALTH] {request.method} {request.path}")
     return "ok", 200
+
 
 
 @app.route("/e_report", methods=["GET"])
@@ -2256,6 +2253,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
