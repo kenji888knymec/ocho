@@ -599,7 +599,7 @@ def _resolve_okx_symbol(exchange, symbol: str):
 
     mk = getattr(exchange, "markets", None)
 
-    # ★ここが今回の本質：mk が None のときに "symbol in mk" で落ちるので、確実にdict化する
+    # mk が None / dict以外のときに "symbol in mk" で落ちるので、確実に dict 化する
     if not isinstance(mk, dict):
         try:
             exchange.load_markets()
@@ -627,6 +627,7 @@ def _resolve_okx_symbol(exchange, symbol: str):
 
     _symbol_resolve_cache[symbol] = res
     return res
+
 
 
 
@@ -1245,6 +1246,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
