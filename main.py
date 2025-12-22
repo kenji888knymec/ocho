@@ -572,11 +572,22 @@ def build_exchange():
     now = time.time()
     if _exchange_cache["ex"] and (now - _exchange_cache["ts"]) <= EXCHANGE_TTL_SEC:
         return _exchange_cache["ex"]
-    ex = ccxt.okx({"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": OKX_DEFAULT_TYPE}})
+
+    ex = ccxt.okx({
+        "enableRateLimit": True,
+        "timeout": 10000,
+        "options": {"defaultType": OKX_DEFAULT_TYPE},
+    })
+
+    # markets が None のまま残ることがあるため、失敗しても「dictに補正」して落ちないようにする
     try:
         ex.load_markets()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] load_markets failed: {type(e).__name__}: {e}")
+
+    if not isinstance(getattr(ex, "markets", None), dict):
+        ex.markets = {}
+
     _exchange_cache.update({"ex": ex, "ts": now})
     _symbol_resolve_cache.clear()
     return ex
@@ -585,19 +596,38 @@ def build_exchange():
 def _resolve_okx_symbol(exchange, symbol: str):
     if not symbol or symbol in _symbol_resolve_cache:
         return _symbol_resolve_cache.get(symbol, symbol)
-    mk = getattr(exchange, "markets", {})
+
+    mk = getattr(exchange, "markets", None)
+
+    # ★ここが今回の本質：mk が None のときに "symbol in mk" で落ちるので、確実にdict化する
+    if not isinstance(mk, dict):
+        try:
+            exchange.load_markets()
+        except Exception as e:
+            print(f"[WARN] load_markets (retry) failed: {type(e).__name__}: {e}")
+        mk = getattr(exchange, "markets", None)
+
+    if not isinstance(mk, dict):
+        mk = {}
+
     res = symbol
+
     if symbol in mk:
         res = symbol
-    elif "/" in symbol and f"{symbol.split('/')[0]}/{symbol.split('/')[1]}:{symbol.split('/')[1]}" in mk:
-        res = f"{symbol.split('/')[0]}/{symbol.split('/')[1]}:{symbol.split('/')[1]}"
-    elif "/" not in symbol:
-        for cand in [f"{symbol}/USDT", f"{symbol}/USDT:USDT"]:
+    elif "/" in symbol:
+        base, quote = symbol.split("/", 1)
+        cand = f"{base}/{quote}:{quote}"
+        if cand in mk:
+            res = cand
+    else:
+        for cand in (f"{symbol}/USDT", f"{symbol}/USDT:USDT"):
             if cand in mk:
                 res = cand
                 break
+
     _symbol_resolve_cache[symbol] = res
     return res
+
 
 
 def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int, since=None, retries=FETCH_RETRY):
@@ -1213,3 +1243,4 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
