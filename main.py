@@ -631,6 +631,7 @@ def _resolve_okx_symbol(exchange, symbol: str):
 
 
 
+
 def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int, since=None, retries=FETCH_RETRY):
     sym = _resolve_okx_symbol(exchange, symbol)
     for k in range(retries + 1):
@@ -1244,5 +1245,6 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
