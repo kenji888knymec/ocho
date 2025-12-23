@@ -14,3 +14,5 @@ google-api-python-client==2.154.0
 gunicorn
 scikit-learn
 google-cloud-storage
+
+scikit-learn==1.6.1
