@@ -3,6 +3,7 @@ import time
 import threading
 import random
 import json
+import traceback
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -409,6 +410,57 @@ def sheets_execute(req, desc: str = ""):
                 continue
             raise
 
+def sheets_append_or_raise(
+    svc,
+    spreadsheet_id: str,
+    a1_range: str,
+    rows: list,
+    label: str,
+):
+    """
+    Google Sheets append を実行し、成功/失敗を必ずログに出す。
+    失敗時は握りつぶさず raise して Cloud Run 側にエラーを残す。
+    """
+    try:
+        row_count = len(rows) if rows is not None else 0
+        print(f"[SHEETS] append start label={label} range={a1_range} rows={row_count}")
+
+        if row_count == 0:
+            print(f"[SHEETS] skip append (0 rows) label={label}")
+            return None
+
+        body = {"values": rows}
+        resp = (
+            svc.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=spreadsheet_id,
+                range=a1_range,
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body=body,
+            )
+            .execute()
+        )
+
+        updates = resp.get("updates", {})
+        print(
+            "[SHEETS] append ok "
+            f"label={label} updatedRows={updates.get('updatedRows')} "
+            f"updatedCells={updates.get('updatedCells')} "
+            f"updatedRange={updates.get('updatedRange')}"
+        )
+        return resp
+
+    except Exception as e:
+        print(f"[SHEETS][ERROR] append failed label={label} range={a1_range} err={e}")
+        print("[SHEETS][ERROR] traceback:\n" + traceback.format_exc())
+        raise
+
+
+
+
+
 
 def get_sheet_service():
     now = time.time()
@@ -622,19 +674,30 @@ def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: 
                 if idxs[f_idx] >= 0:
                     row[idxs[f_idx]] = val
             adj.append(row)
-
+    
         sheets_execute(
             get_sheet_service().spreadsheets().values().append(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"{sheet_name}!A1",
                 valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
-                body={"values": adj}
+                body={"values": adj},
             )
         )
+    
         _invalidate_sheet_caches(sheet_name)
+    
     except Exception as e:
+        # 1) Cloud Run ログに「本当の原因」を必ず出す（ここが重要）
+        print(f"[SHEETS][ERROR] append failed sheet={sheet_name} out_len={out_len} rows={len(rows_values)} err={repr(e)}")
+    
+        # 2) Discord にも短く出す（既存運用を維持）
         send_discord_message(f"[WARN] Append error {sheet_name}: {str(e)[:180]}")
+    
+        # 3) 原因特定を最短化するなら、失敗は成功扱いにせず落とす
+        raise
+
+
 
 
 # ==========================================
@@ -1359,6 +1422,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
