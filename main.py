@@ -976,13 +976,24 @@ def logic_main():
                 base_e_th = to_float(os.environ.get("E_TH", ""), default=0.0)
                 ath = float(AI_TH) + (0.07 if not BTC_CALM else -0.03)
                 eth = float(base_e_th) + (0.03 if not BTC_CALM else -0.02)
-
+            
                 if (is_b and btc_mode == "Down") or (is_s and btc_mode == "Up"):
                     ath += 0.05
                     eth += 0.02
-
+            
                 th = max(0.05, min(0.95, ath))
-                item["ai_pass"] = (item["E"] is not None and (ai_s >= th) and (item["E"] > eth))
+            
+                # ★デバッグ用：実際に使った「しきい値」を item に保存（あとでNoteへ出せる）
+                item["ai_th_used"] = th
+                item["e_th_used"] = eth
+                item["e_th_base"] = base_e_th
+            
+                item["ai_pass"] = (
+                    (item["E"] is not None) and
+                    (ai_s >= th) and
+                    (item["E"] > eth)
+                )
+
 
             pending_c.append(item)
             if item["ai_pass"] and item["score"] >= alert_sigma_eff:
@@ -1008,7 +1019,18 @@ def logic_main():
 
         ai_str = f"{float(it['ai_score']) * 100:.1f}%" if it.get("ai_score") is not None else "N/A"
         e_str = f"{float(it['E']):+.2f}%" if it.get("E") is not None else ""
-        note = f"AI:{ai_str} E:{e_str} Pass:{it['ai_pass']} BTC:{btc_mode}"
+        
+        if it.get("ai_th_used") is not None and it.get("e_th_used") is not None:
+            note = (
+                f"AI:{ai_str} E:{e_str} "
+                f"th:{float(it['ai_th_used']):.2f} "
+                f"eth:{float(it['e_th_used']):.2f} "
+                f"baseE:{float(it.get('e_th_base', 0.0)):.2f} "
+                f"Pass:{it['ai_pass']} BTC:{btc_mode}"
+            )
+        else:
+            note = f"AI:{ai_str} E:{e_str} Pass:{it['ai_pass']} BTC:{btc_mode}"
+
 
         row = [
             "'" + dt_s, it["symbol"], it["type"], it["close"], it["score"], it["sigma"],
@@ -1337,6 +1359,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
