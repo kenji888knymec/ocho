@@ -16,7 +16,11 @@ import google.auth
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.cloud import storage
+try:
+    from google.cloud import storage  # type: ignore
+except Exception:
+    storage = None
+
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
@@ -85,12 +89,16 @@ def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
 
 
 def _download_model_from_gcs(gs_uri: str, dst_path: str) -> None:
+    if storage is None:
+        raise ImportError("google-cloud-storage is not installed. Add it to requirements.txt")
+
     bucket_name, blob_name = _parse_gs_uri(gs_uri)
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
     blob.download_to_filename(dst_path)
+
 
 
 def _resolve_model_path() -> Tuple[str, str]:
@@ -1513,6 +1521,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
