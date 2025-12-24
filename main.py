@@ -10,7 +10,10 @@ import joblib
 import numpy as np
 import pandas as pd
 import ccxt
+import requests
+import gc
 import google.auth
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import storage
@@ -722,85 +725,149 @@ def calculate_rsi(series, period=14):
     return rsi.replace([np.inf, -np.inf], np.nan)
 
 
+# --- OKX REST 用の HTTP セッション（接続再利用で高速化） ---
+_OKX_HTTP = requests.Session()
+_OKX_HTTP.headers.update({
+    "User-Agent": "CryptoAlertBot/1.0"
+})
+
 def build_exchange():
+    """
+    取引所オブジェクトは「REST直叩きの設定」を返すだけにする。
+    ccxt.load_markets() を踏むと TypeError 起点で長引き、WORKER TIMEOUT / SIGKILL の原因になり得るため。
+    """
     now = time.time()
     if _exchange_cache["ex"] and (now - _exchange_cache["ts"]) <= EXCHANGE_TTL_SEC:
         return _exchange_cache["ex"]
 
-    # ★ここが本命：OKX_DEFAULT_TYPE が None/空でも必ず文字列になるようにする
-    # 使いたいのが先物/永続なら "swap"、現物なら "spot"
     default_type = (OKX_DEFAULT_TYPE or "").strip() or "swap"
-
-    ex = ccxt.okx({
-        "enableRateLimit": True,
-        "timeout": 10000,
-        "options": {"defaultType": default_type},
-    })
-
-    # markets が None のまま残ることがあるため、失敗しても dict に補正して落ちないようにする
-    try:
-        ex.load_markets()
-    except Exception as e:
-        print(f"[WARN] load_markets failed: {type(e).__name__}: {e}")
-
-    if not isinstance(getattr(ex, "markets", None), dict):
-        ex.markets = {}
-
+    ex = {"defaultType": default_type}  # dictで十分
     _exchange_cache.update({"ex": ex, "ts": now})
     _symbol_resolve_cache.clear()
     return ex
 
 
+def _normalize_symbol_to_base_quote(symbol: str) -> Tuple[str, str]:
+    """
+    - "BTC/USDT" -> ("BTC","USDT")
+    - "BTC"      -> ("BTC","USDT")  ※シートは "BTC" なのでUSDTを既定に
+    - "BTC/USDT:USDT" -> ("BTC","USDT")  ※suffix除去
+    """
+    s = str(symbol or "").strip()
+    if not s:
+        return "", "USDT"
+
+    if ":" in s:
+        s = s.split(":", 1)[0].strip()
+
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        return base.strip(), quote.strip()
+
+    return s, "USDT"
+
+
+def _okx_bar_from_timeframe(timeframe: str) -> str:
+    tf = str(timeframe or "").strip()
+    mapping = {
+        "1m": "1m",
+        "3m": "3m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1H",
+        "2h": "2H",
+        "4h": "4H",
+        "1d": "1D",
+    }
+    return mapping.get(tf, "15m")
+
+
+def _okx_inst_id(symbol: str, default_type: str) -> str:
+    base, quote = _normalize_symbol_to_base_quote(symbol)
+    if not base:
+        return ""
+
+    dt = (default_type or "").strip() or "swap"
+    if dt == "spot":
+        return f"{base}-{quote}"
+    # 永続SWAP（あなたの想定）
+    return f"{base}-{quote}-SWAP"
+
+
+def _fetch_ohlcv_okx_rest(exchange_cfg: dict, symbol: str, timeframe: str, limit: int, since=None) -> Optional[List[List[Any]]]:
+    """
+    OKX REST: /api/v5/market/candles
+    戻り: [[ts_ms, open, high, low, close, volume], ...]（昇順）
+    """
+    default_type = str(exchange_cfg.get("defaultType") or "").strip() or "swap"
+    inst_id = _okx_inst_id(symbol, default_type)
+    if not inst_id:
+        return None
+
+    bar = _okx_bar_from_timeframe(timeframe)
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": str(int(limit or 60)),
+    }
+
+    since_ms = int(since) if since is not None else None
+
+    r = _OKX_HTTP.get(url, params=params, timeout=8)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data", [])
+    if not data:
+        return None
+
+    out = []
+    for row in data:
+        if not row or len(row) < 6:
+            continue
+        ts = int(row[0])
+        if since_ms is not None and ts < since_ms:
+            continue
+        out.append([ts, float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])])
+
+    out.sort(key=lambda x: x[0])
+    return out if out else None
+
 
 def _resolve_okx_symbol(exchange, symbol: str):
-    if not symbol or symbol in _symbol_resolve_cache:
-        return _symbol_resolve_cache.get(symbol, symbol)
-
-    mk = getattr(exchange, "markets", None)
-
-    # mk が None / dict以外のときに "symbol in mk" で落ちるので、確実に dict 化する
-    if not isinstance(mk, dict):
-        try:
-            exchange.load_markets()
-        except Exception as e:
-            print(f"[WARN] load_markets (retry) failed: {type(e).__name__}: {e}")
-        mk = getattr(exchange, "markets", None)
-
-    if not isinstance(mk, dict):
-        mk = {}
-
-    res = symbol
-
-    if symbol in mk:
-        res = symbol
-    elif "/" in symbol:
-        base, quote = symbol.split("/", 1)
-        cand = f"{base}/{quote}:{quote}"
-        if cand in mk:
-            res = cand
-    else:
-        for cand in (f"{symbol}/USDT", f"{symbol}/USDT:USDT"):
-            if cand in mk:
-                res = cand
-                break
-
-    _symbol_resolve_cache[symbol] = res
-    return res
-
-
-
-
+    """
+    互換のため残すが、REST直叩きでは markets 解決は不要。
+    ここでは正規化だけ返す。
+    """
+    base, quote = _normalize_symbol_to_base_quote(symbol)
+    if not base:
+        return symbol
+    return f"{base}/{quote}"
 
 
 def fetch_ohlcv_safe(exchange, symbol: str, timeframe: str, limit: int, since=None, retries=FETCH_RETRY):
-    sym = _resolve_okx_symbol(exchange, symbol)
-    for k in range(retries + 1):
+    """
+    最優先: OKX REST 直叩き
+    （ccxt/load_markets 起点の TypeError と、長時間化→WORKER TIMEOUT を断つ）
+    """
+    last_err = None
+    max_try = int(retries or 0) + 1
+
+    for k in range(max_try):
         try:
-            return exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
-        except Exception:
-            if k < retries:
-                time.sleep(FETCH_RETRY_SLEEP_SEC * (k + 1))
+            data = _fetch_ohlcv_okx_rest(exchange, symbol, timeframe, limit, since=since)
+            return data
+        except Exception as e:
+            last_err = e
+            if k < max_try - 1:
+                time.sleep(float(FETCH_RETRY_SLEEP_SEC or 1) * (k + 1))
+                continue
+
+    print(f"[WARN] fetch_ohlcv_safe failed symbol={symbol} tf={timeframe} limit={limit} err={type(last_err).__name__}: {last_err}")
     return None
+
 
 
 def _get_row_count_cached(sheet_name: str):
@@ -1427,6 +1494,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
