@@ -1,1 +1,1 @@
-web: gunicorn -b :$PORT -c gunicorn.conf.py main:app
+web: gunicorn -b :$PORT --workers 1 --threads 1 --timeout 1200 --graceful-timeout 30 main:app
