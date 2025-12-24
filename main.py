@@ -306,16 +306,29 @@ def _startup_notify_model_status_once() -> None:
 print(f"[BOOT] GUNICORN_CMD_ARGS={os.environ.get('GUNICORN_CMD_ARGS','')!r}")
 app = Flask(__name__)
 
-def kickoff_startup_model_notify():
-    """起動をブロックしないよう、モデルロード＋通知は別スレッドで実行する。"""
+_startup_kick_done = False
+_startup_kick_lock = threading.Lock()
+
+def kickoff_startup_model_notify_once():
+    """最初のリクエスト時に1回だけ、モデルロード＋通知を別スレッドで実行する。"""
+    global _startup_kick_done
+    with _startup_kick_lock:
+        if _startup_kick_done:
+            return
+        _startup_kick_done = True
+
     def _task():
         try:
             _startup_notify_model_status_once()
         except Exception as e:
             print(f"[WARN] startup model notify failed: {e}")
+
     threading.Thread(target=_task, daemon=True).start()
 
-kickoff_startup_model_notify()
+@app.before_request
+def _kickoff_on_first_request():
+    kickoff_startup_model_notify_once()
+
 
 # ==========================================
 # グローバル & ヘルパー
@@ -1495,6 +1508,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
