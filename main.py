@@ -727,13 +727,17 @@ def build_exchange():
     if _exchange_cache["ex"] and (now - _exchange_cache["ts"]) <= EXCHANGE_TTL_SEC:
         return _exchange_cache["ex"]
 
+    # ★ここが本命：OKX_DEFAULT_TYPE が None/空でも必ず文字列になるようにする
+    # 使いたいのが先物/永続なら "swap"、現物なら "spot"
+    default_type = (OKX_DEFAULT_TYPE or "").strip() or "swap"
+
     ex = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 10000,
-        "options": {"defaultType": OKX_DEFAULT_TYPE},
+        "options": {"defaultType": default_type},
     })
 
-    # markets が None のまま残ることがあるため、失敗しても「dictに補正」して落ちないようにする
+    # markets が None のまま残ることがあるため、失敗しても dict に補正して落ちないようにする
     try:
         ex.load_markets()
     except Exception as e:
@@ -745,6 +749,7 @@ def build_exchange():
     _exchange_cache.update({"ex": ex, "ts": now})
     _symbol_resolve_cache.clear()
     return ex
+
 
 
 def _resolve_okx_symbol(exchange, symbol: str):
@@ -1422,6 +1427,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
