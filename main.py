@@ -303,7 +303,11 @@ def _startup_notify_model_status_once() -> None:
 # ==========================================
 # Flask設定（起動を軽くする）
 # ==========================================
-print(f"[BOOT] GUNICORN_CMD_ARGS={os.environ.get('GUNICORN_CMD_ARGS','')!r}")
+_boot_args = os.environ.get("GUNICORN_CMD_ARGS", "")
+print(f"[BOOT] K_REVISION={os.environ.get('K_REVISION','')!r} PORT={os.environ.get('PORT','')!r}")
+print(f"[BOOT] GUNICORN_CMD_ARGS={_boot_args!r}")
+print(f"[BOOT] GUNICORN_CMD_ARGS_LEN={len(_boot_args)}")
+
 app = Flask(__name__)
 
 _startup_kick_done = False
@@ -328,6 +332,7 @@ def kickoff_startup_model_notify_once():
 @app.before_request
 def _kickoff_on_first_request():
     kickoff_startup_model_notify_once()
+
 
 
 # ==========================================
@@ -1508,6 +1513,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
