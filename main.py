@@ -179,30 +179,121 @@ def _boot_marker_once_if_possible(ok: bool, err: str) -> None:
 
 
 def _startup_notify_model_status_once() -> None:
+    """
+    起動時のAIモデル通知を「必要な時だけ」に抑制する。
+    - FAIL は常に通知（重要）
+    - OK は「モデルが変わった時だけ」通知（再起動ノイズを消す）
+    さらに、GCSへ状態を書き込むときに ifGenerationMatch を使わず上書きするため
+    412 (conditionNotMet / If-Match) のノイズも消える。
+    """
     global _startup_model_notify_done
     if _startup_model_notify_done:
         return
 
     ok = load_ai_model_if_needed(force=False)
-    try:
-        if ok:
-            msg = (
-                f"[BOOT] AI model loaded: OK\n"
-                f"- model_version: {MODEL_VERSION}\n"
-                f"- source: {_model_info.get('source')}\n"
-                f"- sha256: {_model_info.get('sha256')[:12]}..."
+    current_sha = str(_model_info.get("sha256") or "").strip()
+    current_ver = str(MODEL_VERSION or "").strip()
+    current_src = str(_model_info.get("source") or "").strip()
+    current_err = str(_model_info.get("error") or "").strip()
+
+    def _get_bucket_and_state_blob() -> Tuple[Optional[str], Optional[str]]:
+        # MODEL_GCS_URI がない場合は永続抑制できないため、None を返す
+        if not MODEL_GCS_URI:
+            return None, None
+        try:
+            bucket_name, _ = _parse_gs_uri(MODEL_GCS_URI)
+            # “前回通知状態”を固定ファイルに保存（上書き）
+            blob_name = "markers/crypto-alert/boot_state.json"
+            return bucket_name, blob_name
+        except Exception:
+            return None, None
+
+    def _read_last_state(bucket_name: str, blob_name: str) -> Dict[str, Any]:
+        try:
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            if not blob.exists():
+                return {}
+            txt = blob.download_as_text()
+            return json.loads(txt) if txt else {}
+        except Exception:
+            return {}
+
+    def _write_state(bucket_name: str, blob_name: str, body: Dict[str, Any]) -> None:
+        try:
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            # if_generation_match を使わず上書きする（→ 412を出さない）
+            blob.upload_from_string(
+                data=json.dumps(body, ensure_ascii=False),
+                content_type="application/json",
             )
+        except Exception as e:
+            print(f"[WARN] boot state write skipped/failed: {e}")
+
+    # ---- 通知要否判定（GCSに前回状態があるなら、それと比較してOKを抑制） ----
+    bucket_name, state_blob = _get_bucket_and_state_blob()
+    last = _read_last_state(bucket_name, state_blob) if (bucket_name and state_blob) else {}
+
+    last_ok = bool(last.get("ok"))
+    last_ver = str(last.get("model_version") or "").strip()
+    last_sha = str(last.get("sha256") or "").strip()
+
+    send_needed = False
+    reason = ""
+
+    if not ok:
+        # FAILは必ず通知
+        send_needed = True
+        reason = "fail"
+    else:
+        # OKは「モデルが変わったら」通知
+        if (not last_ok) or (last_ver != current_ver) or (last_sha != current_sha):
+            send_needed = True
+            reason = "changed"
         else:
-            msg = (
-                f"[BOOT] AI model loaded: FAIL\n"
-                f"- model_version: {MODEL_VERSION}\n"
-                f"- error: {_model_info.get('error')}"
-            )
-        send_discord_message(msg)
-        _boot_marker_once_if_possible(ok=ok, err=_model_info.get("error", ""))
+            send_needed = False
+            reason = "same"
+
+    try:
+        if send_needed:
+            if ok:
+                msg = (
+                    f"[BOOT] AI model loaded: OK\n"
+                    f"- model_version: {current_ver}\n"
+                    f"- source: {current_src}\n"
+                    f"- sha256: {current_sha[:12]}..."
+                )
+            else:
+                msg = (
+                    f"[BOOT] AI model loaded: FAIL\n"
+                    f"- model_version: {current_ver}\n"
+                    f"- error: {current_err}"
+                )
+            send_discord_message(msg)
+
+        # ---- 状態は毎回GCSへ保存（次回の抑制判定に使う） ----
+        if bucket_name and state_blob:
+            body = {
+                "ok": bool(ok),
+                "reason": reason,
+                "service": os.environ.get("K_SERVICE", ""),
+                "revision": os.environ.get("K_REVISION", ""),
+                "model_version": current_ver,
+                "source": current_src,
+                "sha256": current_sha,
+                "loaded_at": _model_info.get("loaded_at", ""),
+                "last_error": ("" if ok else current_err)[:500],
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_state(bucket_name, state_blob, body)
+
         _startup_model_notify_done = True
     except Exception:
         pass
+
 
 
 # ==========================================
@@ -1246,6 +1337,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
