@@ -44,6 +44,9 @@ from config import (
 
 from discord_util import send_discord_message
 
+# ★ここに以下の1行を追加してください
+NOTIFY_CANDIDATES = (os.environ.get("NOTIFY_CANDIDATES", "0").strip() == "1")
+
 # ==========================================================
 # AIモデル運用の堅牢化
 # ==========================================================
@@ -1210,7 +1213,33 @@ def logic_main():
 
     if c_rows:
         append_rows_to_sheet(LEARN_SHEET_NAME, c_rows, EXPECTED_HEADERS_LEARN)
-
+        if NOTIFY_CANDIDATES:
+            try:
+                lines = []
+                lines.append(
+                    f"[CANDIDATES] n={len(pending_c)} BTC:{btc_mode} CALM:{BTC_CALM} Ver:{VERSION}"
+                )
+                for it2 in pending_c[:10]:
+                    sym = str(it2.get("symbol", ""))
+                    side = str(it2.get("type", ""))
+                    sc = it2.get("score", None)
+                    sg = it2.get("sigma", None)
+                    rsi = it2.get("rsi", None)
+                    ai_val = it2.get("ai_score", None)
+                    e_val = it2.get("E", None)
+    
+                    sc_s = f"{float(sc):.2f}" if sc is not None and sc != "" else ""
+                    sg_s = f"{float(sg):.2f}" if sg is not None and sg != "" else ""
+                    rsi_s = f"{float(rsi):.1f}" if rsi is not None and rsi != "" else ""
+                    ai_s = f"{float(ai_val) * 100:.1f}%" if ai_val is not None and ai_val != "" else "N/A"
+                    e_s = f"{float(e_val):+.2f}%" if e_val is not None and e_val != "" else ""
+    
+                    lines.append(f"- {sym} {side} score={sc_s} sigma={sg_s} ai={ai_s} E={e_s} rsi={rsi_s}")
+    
+                send_discord_message("\n".join(lines))
+            except Exception:
+                pass
+    
     a_rows = []
     for it in sorted(pending_a, key=lambda x: x["score"], reverse=True)[:3]:
         dt_s = normalize_dt_str(it["dt"].strftime("%Y-%m-%d %H:%M:%S"))
@@ -1525,6 +1554,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
