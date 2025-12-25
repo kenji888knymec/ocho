@@ -1018,6 +1018,11 @@ def self_heal_prerequisites():
 # ==========================================
 def logic_main():
     now_jst = datetime.now(JST)
+    # ===== Debug（/run戻り値に原因を出す）=====
+    RUN_DEBUG = str(os.environ.get("RUN_DEBUG", "0")).strip() in ("1", "true", "True", "yes", "on")
+    dbg = {"btc_ok": 0, "sym_ok": 0, "fetch_none": 0, "too_short": 0, "loop_err": 0}
+    # ========================================
+
     ok, msg = self_heal_prerequisites()
     if not ok:
         send_discord_message(f"[WARN] self_heal failed: {msg}")
@@ -1042,6 +1047,9 @@ def logic_main():
             c_now, c_1h = float(df.iloc[-2]["Close"]), float(df.iloc[-6]["Close"])
             btc_1h_change = (c_now - c_1h) / c_1h
             btc_ret, btc_vol, btc_ok = float(df.iloc[-2]["Pct"]), abs(float(df.iloc[-2]["Pct"])), True
+            btc_ret, btc_vol, btc_ok = float(df.iloc[-2]["Pct"]), abs(float(df.iloc[-2]["Pct"])), True
+            dbg["btc_ok"] += 1
+
             btc_mode = "Up" if btc_1h_change > 0.001 else "Down" if btc_1h_change < -0.001 else "Range"
     except Exception as e:
         print(f"[WARN] BTC fetch fail: {e}")
@@ -1074,8 +1082,17 @@ def logic_main():
     for sym in symbols:
         try:
             ohlcv = fetch_ohlcv_safe(ex, sym, "15m", 60)
-            if not ohlcv or len(ohlcv) < MIN_BARS:
+
+            if not ohlcv:
+                dbg["fetch_none"] += 1
                 continue
+
+            if len(ohlcv) < MIN_BARS:
+                dbg["too_short"] += 1
+                continue
+
+            dbg["sym_ok"] += 1
+
 
             df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
             df["Pct"] = df["Close"].pct_change()
@@ -1165,8 +1182,10 @@ def logic_main():
                 pending_a.append(item)
 
         except Exception as e:
+            dbg["loop_err"] += 1
             print(f"[WARN] loop fail {sym}: {e}")
             continue
+
 
     l_keys, t_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME), _get_recent_dedup_keys(MAIN_SHEET_NAME)
 
@@ -1273,7 +1292,14 @@ def logic_main():
     if a_rows:
         append_rows_to_sheet(MAIN_SHEET_NAME, a_rows, TABLE_FIELDS)
 
-    return f"Alerts:{len(a_rows)} Candidates:{len(c_rows)}"
+    res = f"Alerts:{len(a_rows)} Candidates:{len(c_rows)}"
+    if RUN_DEBUG:
+        res += (
+            f" | DBG btc_ok={dbg['btc_ok']} sym_ok={dbg['sym_ok']}"
+            f" fetch_none={dbg['fetch_none']} too_short={dbg['too_short']} loop_err={dbg['loop_err']}"
+        )
+    return res
+
 
 
 # ==========================================
@@ -1554,6 +1580,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
