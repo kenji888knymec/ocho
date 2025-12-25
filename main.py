@@ -1199,10 +1199,13 @@ def logic_main():
             status, tp, sl, tp_p, sl_p, DEFAULT_LEV,
             it.get("ai_score") if it.get("ai_score") is not None else "",
             it.get("E") if it.get("E") is not None else "",
-            it["ai_pass"], BTC_CALM, VERSION, it["type"], 0, 0,
+            it["ai_pass"], BTC_CALM, VERSION,
+            it.get("signal_type", it["type"]),  # ← R列（SignalType）。無ければ type を入れる
+            0, 0,
             "CALM" if BTC_CALM else "STORM", btc_mode, btc_1h_change, it["rsi"], note
         ] + [""] * 7
         c_rows.append(row[:len(EXPECTED_HEADERS_LEARN)])
+
 
     if c_rows:
         append_rows_to_sheet(LEARN_SHEET_NAME, c_rows, EXPECTED_HEADERS_LEARN)
@@ -1521,6 +1524,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
