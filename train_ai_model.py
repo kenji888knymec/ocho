@@ -89,30 +89,157 @@ def main() -> int:
     print(f"[TRAIN] learn_log row_count(A)={row_count}", flush=True)
 
     # ==========================================================
-    # ここから「最小の学習成果物」を作る（まずは動線を完成させる）
-    #  - 本格学習は後でOK。まずは pkl/report が GCS に出る状態を作る。
+    # ここから「実学習版」
+    #  - learn_log を読み込んで学習し、欠損(NaN)を必ず処理して落ちないようにする
+    #  - 学習済み Pipeline を trade_ai_model.pkl として GCS に保存する
     # ==========================================================
-    model_obj = {
-        "trained_at_utc": _now_utc_str(),
-        "learn_sheet": learn_sheet,
-        "header_cols": header_cols,
-        "row_count_a": row_count,
-        "note": "minimal artifact to verify train -> upload pipeline",
-    }
+    import pandas as pd
+    import numpy as np
 
-    report_obj = {
-        "trained_at_utc": _now_utc_str(),
-        "spreadsheet_id_set": bool(spreadsheet_id),
-        "learn_sheet": learn_sheet,
-        "header_cols": header_cols,
-        "row_count_a": row_count,
-        "model_version": model_version,
-    }
+    from sklearn.model_selection import train_test_split
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score
 
+    # --- learn_log をシート丸ごと取得（A:ZZで広めに取る）---
+    data_range = f"{learn_sheet}!A:ZZ"
+    values = (
+        svc.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=data_range)
+        .execute()
+        .get("values", [])
+    )
+
+    if not values or len(values) < 2:
+        print("[TRAIN][ERROR] learn_log has no data rows.", flush=True)
+        return 5
+
+    header_row = values[0]
+    rows = values[1:]
+
+    df = pd.DataFrame(rows, columns=header_row)
+
+    # 空文字を NaN に寄せる（欠損処理しやすくする）
+    df = df.replace("", np.nan)
+
+    print(f"[TRAIN] df_shape={df.shape}", flush=True)
+    print(f"[TRAIN] df_cols={len(df.columns)}", flush=True)
+
+    # --- 目的変数(y)を決める（優先順位：Win/Lose -> PnL_Pct）---
+    y_col = None
+    if "Win/Lose" in df.columns:
+        y_col = "Win/Lose"
+
+        def _to_label(v):
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return np.nan
+            s = str(v).strip().lower()
+            if s in ["win", "w", "1", "true", "yes"]:
+                return 1
+            if s in ["lose", "loss", "l", "0", "false", "no"]:
+                return 0
+            return np.nan
+
+        y = df[y_col].map(_to_label)
+    elif "PnL_Pct" in df.columns:
+        y_col = "PnL_Pct"
+        pnl = pd.to_numeric(df[y_col], errors="coerce")
+        y = (pnl > 0).astype("float")
+    else:
+        print("[TRAIN][ERROR] No label column found. Need 'Win/Lose' or 'PnL_Pct' in learn_log.", flush=True)
+        return 6
+
+    # --- 特徴量X：まずは y_col を除いた全列から作る ---
+    X = df.drop(columns=[y_col], errors="ignore").copy()
+
+    # Google Sheets 由来で全部文字列になりがちなので、数値にできる列は数値へ寄せる
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="ignore")
+
+    numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+
+    print(f"[TRAIN] label_col={y_col}", flush=True)
+    print(f"[TRAIN] numeric_cols={len(numeric_cols)} categorical_cols={len(categorical_cols)}", flush=True)
+
+    # --- y の欠損行を落とす（学習できないため）---
+    ok_idx = ~y.isna()
+    X = X.loc[ok_idx].copy()
+    y = y.loc[ok_idx].astype(int).copy()
+
+    if len(y) < 50:
+        print(f"[TRAIN][ERROR] too few labeled rows after filtering: {len(y)}", flush=True)
+        return 7
+
+    numeric_tf = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
+
+    categorical_tf = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", numeric_tf, numeric_cols),
+            ("cat", categorical_tf, categorical_cols),
+        ],
+        remainder="drop",
+    )
+
+    model = LogisticRegression(max_iter=2000)
+
+    clf = Pipeline(steps=[
+        ("preprocess", pre),
+        ("model", model),
+    ])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y if len(set(y)) > 1 else None
+    )
+
+    print(f"[TRAIN] train_rows={len(y_train)} test_rows={len(y_test)}", flush=True)
+
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    acc = float(accuracy_score(y_test, y_pred))
+
+    print(f"[TRAIN] accuracy={acc:.4f}", flush=True)
+
+    # --- 成果物保存 ---
     local_pkl_path = "/tmp/" + out_pkl_name
     local_report_path = "/tmp/" + out_report_name
 
-    joblib.dump(model_obj, local_pkl_path)
+    joblib.dump(clf, local_pkl_path)
+
+    report_obj = {
+        "created_utc": _now_utc_str(),
+        "project": project,
+        "bucket": bucket_name,
+        "prefix": f"{out_dir_prefix}/{model_version}",
+        "out_pkl": f"gs://{bucket_name}/{out_dir_prefix}/{model_version}/{out_pkl_name}",
+        "out_report": f"gs://{bucket_name}/{out_dir_prefix}/{model_version}/{out_dir_prefix}/{out_report_name}".replace(f"/{out_dir_prefix}/{out_dir_prefix}/", f"/{out_dir_prefix}/"),
+        "learn_log": {
+            "sheet": learn_sheet,
+            "header_cols": header_cols,
+            "row_count": int(len(values) - 1),
+            "labeled_rows": int(len(y)),
+        },
+        "label_col": y_col,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "metrics": {
+            "accuracy": acc,
+        },
+        "note": "real training (Pipeline with imputers to avoid NaN crash)",
+    }
+
     with open(local_report_path, "w", encoding="utf-8") as f:
         json.dump(report_obj, f, ensure_ascii=False, indent=2)
 
