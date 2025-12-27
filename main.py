@@ -1117,7 +1117,8 @@ def logic_main():
                 continue
 
             ai_s = None
-            if ai_model:
+            ai_err = ""
+            if ai_model is not None:
                 feats = pd.DataFrame([{
                     "Sigma": float(r["Sig"]),
                     "BandWidth": float(r["BW"]),
@@ -1129,10 +1130,22 @@ def logic_main():
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
+
                 try:
-                    ai_s = float(ai_model.predict_proba(feats)[0][1])
-                except Exception:
+                    # --- 重要：学習済みモデルが期待する列順に合わせる（列名ズレ/順番ズレ対策） ---
+                    need_cols = getattr(ai_model, "feature_names_in_", None)
+                    if need_cols is not None:
+                        feats = feats.reindex(columns=list(need_cols), fill_value=0.0)
+
+                    proba = ai_model.predict_proba(feats)
+                    ai_s = float(proba[0][1])
+
+                except Exception as e:
+                    ai_err = f"{type(e).__name__}: {e}"
+                    print(f"[AI][ERROR] predict_proba failed sym={sym} err={ai_err}")
+                    print(f"[AI][ERROR] feats_cols={list(feats.columns)} feats={feats.to_dict(orient='records')}")
                     ai_s = None
+
 
             item = {
                 "symbol": sym.replace("/USDT", ""),
@@ -1145,36 +1158,47 @@ def logic_main():
                 "rsi": float(r["RSI"]),
                 "type": "LONG" if is_b else "SHORT",
                 "dt": datetime.fromtimestamp(int(r["Time"]) / 1000, JST),
+
+                # AI
                 "ai_score": ai_s,
-                "ai_pass": True,
+                "ai_error": ai_err,
+                # AIが有効なのに推論できていない場合は pass にしない（安全側）
+                "ai_pass": (True if (ai_model is None) else (ai_s is not None)),
+
                 "chg_pct": float(r["Pct"]) * 100,
                 "vol_ratio": float(vol_r),
             }
 
+
             tp, sl, tp_p, sl_p = calc_tp_sl(item)
             item["E"] = (ai_s * tp_p - (1 - ai_s) * sl_p) if ai_s is not None else None
 
-            if ai_model and ai_s is not None:
-                base_e_th = to_float(os.environ.get("E_TH", ""), default=0.0)
-                ath = float(AI_TH) + (0.07 if not BTC_CALM else -0.03)
-                eth = float(base_e_th) + (0.03 if not BTC_CALM else -0.02)
-            
-                if (is_b and btc_mode == "Down") or (is_s and btc_mode == "Up"):
-                    ath += 0.05
-                    eth += 0.02
-            
-                th = max(0.05, min(0.95, ath))
-            
-                # ★デバッグ用：実際に使った「しきい値」を item に保存（あとでNoteへ出せる）
-                item["ai_th_used"] = th
-                item["e_th_used"] = eth
-                item["e_th_base"] = base_e_th
-            
-                item["ai_pass"] = (
-                    (item["E"] is not None) and
-                    (ai_s >= th) and
-                    (item["E"] > eth)
-                )
+            if ai_model is not None:
+                if ai_s is None:
+                    # AIモデルがあるのに推論できていない → 明確に落とす
+                    item["ai_pass"] = False
+                else:
+                    base_e_th = to_float(os.environ.get("E_TH", ""), default=0.0)
+                    ath = float(AI_TH) + (0.07 if not BTC_CALM else -0.03)
+                    eth = float(base_e_th) + (0.03 if not BTC_CALM else -0.02)
+
+                    if (is_b and btc_mode == "Down") or (is_s and btc_mode == "Up"):
+                        ath += 0.05
+                        eth += 0.02
+
+                    th = max(0.05, min(0.95, ath))
+
+                    # デバッグ用
+                    item["ai_th_used"] = th
+                    item["e_th_used"] = eth
+                    item["e_th_base"] = base_e_th
+
+                    item["ai_pass"] = (
+                        (item["E"] is not None) and
+                        (ai_s >= th) and
+                        (item["E"] > eth)
+                    )
+
 
 
             pending_c.append(item)
@@ -1199,21 +1223,31 @@ def logic_main():
 
         last_candidate_records[it["symbol"]] = it["time"]
         tp, sl, tp_p, sl_p = calc_tp_sl(it)
-        status = "AI_REJECT" if (ai_model and (not it["ai_pass"])) else "CANDIDATE"
+        ai_has = (ai_model is not None)
+        ai_err = str(it.get("ai_error") or "").strip()
+
+        if ai_has and (it.get("ai_score") is None) and ai_err:
+            status = "AI_ERROR"
+        elif ai_has and (not it.get("ai_pass", True)):
+            status = "AI_REJECT"
+        else:
+            status = "CANDIDATE"
 
         ai_str = f"{float(it['ai_score']) * 100:.1f}%" if it.get("ai_score") is not None else "N/A"
         e_str = f"{float(it['E']):+.2f}%" if it.get("E") is not None else ""
-        
+        err_str = f" err:{ai_err[:120]}" if ai_err else ""
+
         if it.get("ai_th_used") is not None and it.get("e_th_used") is not None:
             note = (
                 f"AI:{ai_str} E:{e_str} "
                 f"th:{float(it['ai_th_used']):.2f} "
                 f"eth:{float(it['e_th_used']):.2f} "
                 f"baseE:{float(it.get('e_th_base', 0.0)):.2f} "
-                f"Pass:{it['ai_pass']} BTC:{btc_mode}"
+                f"Pass:{it['ai_pass']} BTC:{btc_mode}{err_str}"
             )
         else:
-            note = f"AI:{ai_str} E:{e_str} Pass:{it['ai_pass']} BTC:{btc_mode}"
+            note = f"AI:{ai_str} E:{e_str} Pass:{it['ai_pass']} BTC:{btc_mode}{err_str}"
+
 
 
         row = [
@@ -1580,6 +1614,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
