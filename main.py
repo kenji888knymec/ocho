@@ -1047,7 +1047,6 @@ def logic_main():
             c_now, c_1h = float(df.iloc[-2]["Close"]), float(df.iloc[-6]["Close"])
             btc_1h_change = (c_now - c_1h) / c_1h
             btc_ret, btc_vol, btc_ok = float(df.iloc[-2]["Pct"]), abs(float(df.iloc[-2]["Pct"])), True
-            btc_ret, btc_vol, btc_ok = float(df.iloc[-2]["Pct"]), abs(float(df.iloc[-2]["Pct"])), True
             dbg["btc_ok"] += 1
 
             btc_mode = "Up" if btc_1h_change > 0.001 else "Down" if btc_1h_change < -0.001 else "Range"
@@ -1554,6 +1553,65 @@ def ai_health():
         "loaded_at": _model_info.get("loaded_at", ""), "last_error": _model_info.get("error", ""),
     }
     return jsonify(payload), (200 if ok else 503)
+@app.get("/ai_smoke")
+def ai_smoke():
+    """
+    AIモデルが predict_proba を返せるかのスモークテスト。
+    市場データや候補発生に依存せず、モデルの入出力だけを検証する。
+    """
+    load_ai_model_if_needed(force=False)
+    m = get_ai_model()
+    if m is None:
+        return jsonify({
+            "ok": False,
+            "error": "model is not loaded",
+            "model_version": _model_info.get("model_version", ""),
+            "last_error": _model_info.get("error", ""),
+        }), 503
+
+    feats = pd.DataFrame([{
+        "Sigma": 0.0020,
+        "BandWidth": 0.0300,
+        "BW_Change": 0.0010,
+        "RSI": 55.0,
+        "Vol_Change": 0.10,
+        "Rise_Score": 1.20,
+        "Drop_Score": 0.80,
+        "BTC_Ret": 0.0010,
+        "BTC_Vol": 0.0010,
+    }])
+
+    try:
+        # --- 重要: 学習済みモデルが期待する列順に合わせる（列名ズレ/順番ズレ対策） ---
+        need_cols = getattr(m, "feature_names_in_", None)
+        if need_cols is not None:
+            feats = feats.reindex(columns=list(need_cols), fill_value=0.0)
+
+        proba = m.predict_proba(feats)
+        ai_s = float(proba[0][1])
+
+        return jsonify({
+            "ok": True,
+            "ai_score": ai_s,
+            "model_version": _model_info.get("model_version", ""),
+            "source": _model_info.get("source", ""),
+            "sha256": _model_info.get("sha256", ""),
+        }), 200
+
+    except Exception as e:
+        ai_err = f"{type(e).__name__}: {e}"
+        print(f"[AI][ERROR] predict_proba failed err={ai_err}")
+        print(f"[AI][ERROR] feats_cols={list(feats.columns)} feats={feats.to_dict(orient='records')}")
+
+        return jsonify({
+            "ok": False,
+            "error": ai_err,
+            "model_version": _model_info.get("model_version", ""),
+            "source": _model_info.get("source", ""),
+            "sha256": _model_info.get("sha256", ""),
+        }), 500
+
+
 
 
 @app.route("/run")
@@ -1615,6 +1673,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
