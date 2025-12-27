@@ -1597,24 +1597,30 @@ def ai_health():
     - 503: model is not available (not loaded / load failed)
     """
     try:
+        # ★ ここで同期的にロードを試す（初回503を潰す）
+        load_ai_model_if_needed(force=False)
+
         m = get_ai_model()
         if m is None:
-            # モデルが無いのは「異常」ではなく「未準備」なので 503
             return jsonify({
                 "ok": False,
                 "model_loaded": False,
-                "error": _ai_model_last_error,
+                "model_version": _model_info.get("model_version", ""),
+                "source": _model_info.get("source", ""),
+                "sha256": _model_info.get("sha256", ""),
+                "error": _model_info.get("error", "") or _ai_model_last_error,
             }), 503
 
-        # “predict が呼べる”程度の簡易チェック（詳細は ai_smoke で）
         return jsonify({
             "ok": True,
             "model_loaded": True,
             "model_type": str(type(m)),
+            "model_version": _model_info.get("model_version", ""),
+            "source": _model_info.get("source", ""),
+            "sha256": _model_info.get("sha256", ""),
         }), 200
 
     except Exception as e:
-        # ここで 500 は出してよい（ただし内容を返す）
         return jsonify({
             "ok": False,
             "model_loaded": False,
