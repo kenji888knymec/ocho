@@ -47,6 +47,18 @@ from discord_util import send_discord_message
 # ★ここに以下の1行を追加してください
 NOTIFY_CANDIDATES = (os.environ.get("NOTIFY_CANDIDATES", "0").strip() == "1")
 
+# ==========================================
+# Flask App & Global Init
+# ==========================================
+app = Flask(__name__)
+
+# ==========================================
+# AI Model cache (must exist to avoid NameError)
+# ==========================================
+_ai_model = None
+_ai_model_lock = threading.Lock()
+_ai_model_last_error = ""
+
 # ==========================================================
 # AIモデル運用の堅牢化
 # ==========================================================
@@ -57,7 +69,8 @@ MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "").strip()
 
 _model_lock = threading.Lock()
 _model_obj = None
-_ai_model = None  # 旧コード互換（_ai_model参照でも落とさない）
+# _ai_model = None  # 上部で定義済みのためコメントアウト（二重定義防止）
+
 _model_info = {
     "enabled": bool(ENABLE_JUDGE),
     "loaded": False,
@@ -352,7 +365,7 @@ print(f"[BOOT] K_REVISION={os.environ.get('K_REVISION','')!r} PORT={os.environ.g
 print(f"[BOOT] GUNICORN_CMD_ARGS={_boot_args!r}")
 print(f"[BOOT] GUNICORN_CMD_ARGS_LEN={len(_boot_args)}")
 
-app = Flask(__name__)
+# app = Flask(__name__)  # ←先頭に移動したため削除
 
 _startup_kick_done = False
 _startup_kick_lock = threading.Lock()
@@ -1574,18 +1587,40 @@ def _e_report(days=30):
 # ==========================================
 # ルーティング
 # ==========================================
+from flask import jsonify  # 念のため明示
+
 @app.get("/ai_health")
 def ai_health():
-    load_ai_model_if_needed(force=False)
-    m = get_ai_model()
-    ok = (m is not None)
-    payload = {
-        "ok": bool(ok), "service": os.environ.get("K_SERVICE", ""),
-        "revision": os.environ.get("K_REVISION", ""), "model_version": _model_info.get("model_version", ""),
-        "model_uri": MODEL_GCS_URI, "model_local_path": _model_info.get("local_path", ""),
-        "loaded_at": _model_info.get("loaded_at", ""), "last_error": _model_info.get("error", ""),
-    }
-    return jsonify(payload), (200 if ok else 503)
+    """
+    AI model health check.
+    - 200: model is loaded and callable
+    - 503: model is not available (not loaded / load failed)
+    """
+    try:
+        m = get_ai_model()
+        if m is None:
+            # モデルが無いのは「異常」ではなく「未準備」なので 503
+            return jsonify({
+                "ok": False,
+                "model_loaded": False,
+                "error": _ai_model_last_error,
+            }), 503
+
+        # “predict が呼べる”程度の簡易チェック（詳細は ai_smoke で）
+        return jsonify({
+            "ok": True,
+            "model_loaded": True,
+            "model_type": str(type(m)),
+        }), 200
+
+    except Exception as e:
+        # ここで 500 は出してよい（ただし内容を返す）
+        return jsonify({
+            "ok": False,
+            "model_loaded": False,
+            "error": f"{type(e).__name__}: {e}",
+        }), 500
+
 @app.get("/ai_smoke")
 def ai_smoke():
     load_ai_model_if_needed(force=False)
