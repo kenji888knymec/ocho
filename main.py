@@ -1555,19 +1555,24 @@ def ai_health():
     return jsonify(payload), (200 if ok else 503)
 @app.get("/ai_smoke")
 def ai_smoke():
-    """
-    AIモデルが predict_proba を返せるかのスモークテスト。
-    市場データや候補発生に依存せず、モデルの入出力だけを検証する。
-    """
     load_ai_model_if_needed(force=False)
     m = get_ai_model()
-    if m is None:
+
+    # GCSのモデルは dict ラップになっている（例: {"pipeline": Pipeline, ...}）
+    if isinstance(m, dict):
+        for k in ("pipeline", "model", "clf", "estimator", "sk_model"):
+            if k in m:
+                m = m[k]
+                break
+
+    if (m is None) or (not hasattr(m, "predict_proba")):
         return jsonify({
             "ok": False,
-            "error": "model is not loaded",
+            "error": f"model invalid type={type(m).__name__} (need predict_proba)",
             "model_version": _model_info.get("model_version", ""),
             "last_error": _model_info.get("error", ""),
         }), 503
+
 
     feats = pd.DataFrame([{
         "Sigma": 0.0020,
@@ -1673,6 +1678,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
