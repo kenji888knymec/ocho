@@ -1326,13 +1326,14 @@ def logic_main():
     if a_rows:
         append_rows_to_sheet(MAIN_SHEET_NAME, a_rows, TABLE_FIELDS)
 
-    res = f"Alerts:{len(a_rows)} Candidates:{len(c_rows)}"
+    res = f"{VERSION} | Alerts:{len(a_rows)} Candidates:{len(c_rows)}"
     if RUN_DEBUG:
         res += (
             f" | DBG btc_ok={dbg['btc_ok']} sym_ok={dbg['sym_ok']}"
             f" fetch_none={dbg['fetch_none']} too_short={dbg['too_short']} loop_err={dbg['loop_err']}"
         )
     return res
+
 
 
 
@@ -1614,6 +1615,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
