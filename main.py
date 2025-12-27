@@ -57,6 +57,7 @@ MODEL_LOCAL_PATH = os.environ.get("MODEL_LOCAL_PATH", "").strip()
 
 _model_lock = threading.Lock()
 _model_obj = None
+_ai_model = None  # 旧コード互換（_ai_model参照でも落とさない）
 _model_info = {
     "enabled": bool(ENABLE_JUDGE),
     "loaded": False,
@@ -120,16 +121,19 @@ def _resolve_model_path() -> Tuple[str, str]:
 
 
 def load_ai_model_if_needed(force: bool = False) -> bool:
-    global _model_obj
+    global _model_obj, _ai_model
     with _model_lock:
         if not ENABLE_JUDGE:
             _model_info["enabled"] = False
             _model_info["loaded"] = False
             _model_info["error"] = "ENABLE_JUDGE is False"
             _model_obj = None
+            _ai_model = None  # 旧コード互換
             return False
 
         if _model_obj is not None and _model_info.get("loaded") and not force:
+            # 念のため同期（旧参照があっても落ちない）
+            _ai_model = _model_obj
             return True
 
         path, source = _resolve_model_path()
@@ -144,16 +148,27 @@ def load_ai_model_if_needed(force: bool = False) -> bool:
             sha = _sha256_file(path)
 
             _model_obj = obj
+            _ai_model = obj  # 旧コード互換（ここが重要）
+
             _model_info.update({
-                "enabled": True, "loaded": True, "source": source,
-                "local_path": path, "sha256": sha,
-                "loaded_at": datetime.now(timezone.utc).isoformat(), "error": ""
+                "enabled": True,
+                "loaded": True,
+                "source": source,
+                "local_path": path,
+                "sha256": sha,
+                "loaded_at": datetime.now(timezone.utc).isoformat(),
+                "error": ""
             })
             return True
+
         except Exception as e:
             _model_obj = None
+            _ai_model = None  # 旧コード互換
+
             _model_info.update({
-                "loaded": False, "source": source, "local_path": path,
+                "loaded": False,
+                "source": source,
+                "local_path": path,
                 "loaded_at": datetime.now(timezone.utc).isoformat(),
                 "error": f"{type(e).__name__}: {e}"
             })
@@ -162,23 +177,15 @@ def load_ai_model_if_needed(force: bool = False) -> bool:
 
 def get_ai_model() -> Optional[object]:
     """
-    ロード済みAIモデルを返す。
-    - グローバル変数名が環境や版で違っても落ちないように探索する
-    - GCS由来で dict に包まれている場合は中身（pipeline等）を取り出す
+    ロード済みAIモデルを返す（基本は _model_obj を正とする）。
+    - 旧コード互換として _ai_model も参照（_model_obj が None の時だけ）
+    - dict に包まれている場合は中身（pipeline等）を取り出す
     """
-    g = globals()
-
-    # まず「あり得る変数名」を順に探す（無ければ None）
-    m = None
-    for name in ("_ai_model", "AI_MODEL", "ai_model", "MODEL", "_MODEL", "model"):
-        if name in g:
-            m = g.get(name)
-            break
+    m = _model_obj if _model_obj is not None else globals().get("_ai_model")
 
     if m is None:
         return None
 
-    # GCS の pkl が dict で {'pipeline': Pipeline, ...} のケースに対応
     if isinstance(m, dict):
         for k in ("pipeline", "model", "clf", "estimator", "sk_model"):
             v = m.get(k)
@@ -1704,25 +1711,3 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
