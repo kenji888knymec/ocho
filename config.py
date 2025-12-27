@@ -6,8 +6,7 @@ from datetime import timedelta, timezone
 # ==========================================
 # 設定エリア（環境変数）
 # ==========================================
-VERSION = "Ver6.6 SelfHealHeaders+AutoCreateLockSheet+Preflight (Code v3.4.3)"
-
+VERSION = "Ver6.6 SelfHealHeaders+AutoCreateLockSheet+Preflight (Code v3.4.3)+AIERRTEST"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1XwWkzijIwRlafg2zDgPHQ4tgjYModapFI3T_wbYS9_8")
