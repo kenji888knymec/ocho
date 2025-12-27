@@ -161,7 +161,33 @@ def load_ai_model_if_needed(force: bool = False) -> bool:
 
 
 def get_ai_model() -> Optional[object]:
-    return _model_obj
+    """
+    ロード済みAIモデルを返す。
+    - グローバル変数名が環境や版で違っても落ちないように探索する
+    - GCS由来で dict に包まれている場合は中身（pipeline等）を取り出す
+    """
+    g = globals()
+
+    # まず「あり得る変数名」を順に探す（無ければ None）
+    m = None
+    for name in ("_ai_model", "AI_MODEL", "ai_model", "MODEL", "_MODEL", "model"):
+        if name in g:
+            m = g.get(name)
+            break
+
+    if m is None:
+        return None
+
+    # GCS の pkl が dict で {'pipeline': Pipeline, ...} のケースに対応
+    if isinstance(m, dict):
+        for k in ("pipeline", "model", "clf", "estimator", "sk_model"):
+            v = m.get(k)
+            if v is not None:
+                return v
+        return None
+
+    return m
+
 
 
 def _boot_marker_once_if_possible(ok: bool, err: str) -> None:
@@ -1678,6 +1704,7 @@ def preflight():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
