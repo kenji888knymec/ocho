@@ -30,12 +30,12 @@ SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1XwWkzijIwRlafg2zDgPHQ4tgjYMo
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "table")
 LEARN_SHEET_NAME = os.environ.get("LEARN_SHEET_NAME", "learn_log")
 
-VERSION = "Ver7.1 HeaderPreserve+DefaultCols (Code v3.4.8)"
+VERSION = "Ver7.1 HeaderPreserve+DefaultCols (Code v3.4.9 Fixed)"
 
 # --- Thresholds (env configurable) ---
-CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))     # learn_log用（候補を貯める）
-ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))   # 通知用（従来の厳しさ）
-AI_TH = float(os.environ.get("AI_TH", "0.55"))              # 通知用AI閾値（55%がデフォ）
+CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
+ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
+AI_TH = float(os.environ.get("AI_TH", "0.55"))
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
 
 ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
@@ -48,21 +48,20 @@ MIN_BARS = int(float(os.environ.get("MIN_BARS", "30")))
 HEADER_COL_END = os.environ.get("HEADER_COL_END", "ZZ")
 
 # ---- 期待最低列数（ヘッダー取得失敗時のフェイルセーフ）----
-# 実運用に合わせてデフォルト値を修正 (Table=37, Learn=34)
 HEADER_LEN_TABLE = int(float(os.environ.get("HEADER_LEN_TABLE", "37")))
 HEADER_LEN_LEARN = int(float(os.environ.get("HEADER_LEN_LEARN", "34")))
 
 # ---- Self-Heal 設定（重要：手作業を減らす）----
-AUTO_FIX_HEADERS = os.environ.get("AUTO_FIX_HEADERS", "1") == "1"     # ヘッダー崩れを自動修復
-AUTO_CREATE_SHEETS = os.environ.get("AUTO_CREATE_SHEETS", "1") == "1" # _lockなど無ければ作る
-STRICT_HEADER_CHECK = os.environ.get("STRICT_HEADER_CHECK", "0") == "1"  # 0推奨（自動修復優先）
+AUTO_FIX_HEADERS = os.environ.get("AUTO_FIX_HEADERS", "1") == "1"
+AUTO_CREATE_SHEETS = os.environ.get("AUTO_CREATE_SHEETS", "1") == "1"
+STRICT_HEADER_CHECK = os.environ.get("STRICT_HEADER_CHECK", "0") == "1"
 
 # TTL
 HEADER_TTL_SEC = int(float(os.environ.get("HEADER_TTL_SEC", "600")))
 SVC_TTL_SEC = int(float(os.environ.get("SVC_TTL_SEC", "1800")))
 COLCOUNT_TTL_SEC = int(float(os.environ.get("COLCOUNT_TTL_SEC", "3600")))
 
-# Sheets側の重複防止（直近N行をキーでスキャン）
+# Sheets側の重複防止
 DEDUP_LOOKBACK_ROWS = int(float(os.environ.get("DEDUP_LOOKBACK_ROWS", "500")))
 DEDUP_TTL_SEC = int(float(os.environ.get("DEDUP_TTL_SEC", "120")))
 
@@ -70,22 +69,22 @@ DEDUP_TTL_SEC = int(float(os.environ.get("DEDUP_TTL_SEC", "120")))
 FETCH_RETRY = int(float(os.environ.get("FETCH_RETRY", "2")))
 FETCH_RETRY_SLEEP_SEC = float(os.environ.get("FETCH_RETRY_SLEEP_SEC", "0.8"))
 
-# judge が参照する「最新側の行数ウィンドウ」（大きいシート対策）
+# judge が参照する「最新側の行数ウィンドウ」
 JUDGE_LOOKBACK_ROWS = int(float(os.environ.get("JUDGE_LOOKBACK_ROWS", "2500")))
 
-# ccxt exchange の軽いキャッシュ（load_markets負荷低減）
+# ccxt exchange の軽いキャッシュ
 EXCHANGE_TTL_SEC = int(float(os.environ.get("EXCHANGE_TTL_SEC", "600")))
 
-# OKX デフォルト種別（swap/spot など）: 既定は swap
+# OKX デフォルト種別
 OKX_DEFAULT_TYPE = os.environ.get("OKX_DEFAULT_TYPE", "swap")
 
 # ============================================================
-# 多重実行抑止：簡易分散ロック（_lock シートを自動作成）
+# 多重実行抑止：簡易分散ロック
 # ============================================================
 RUN_MUTEX_ENABLED = os.environ.get("RUN_MUTEX_ENABLED", "1") == "1"
 RUN_MUTEX_SHEET = os.environ.get("RUN_MUTEX_SHEET", "_lock")
 RUN_MUTEX_CELL = os.environ.get("RUN_MUTEX_CELL", "A1")
-RUN_MUTEX_TTL_SEC = int(float(os.environ.get("RUN_MUTEX_TTL_SEC", "900")))  # 15分
+RUN_MUTEX_TTL_SEC = int(float(os.environ.get("RUN_MUTEX_TTL_SEC", "900")))
 
 _INSTANCE_ID = "|".join(
     [
@@ -116,7 +115,7 @@ EXPECTED_HEADERS_LEARN = [
     "AI_Pass", "BTC_Calm", "Version", "SignalType", "Reserved3", "Reserved4",
     "MarketTag", "BTC_Mode", "BTC_1h_Change", "RSI", "Note",
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "Win/Lose", "HoldMin",
-]  # 32
+]
 
 TABLE_FIELDS = [
     "Time", "Symbol", "Direction", "EntryPrice", "Score", "Sigma", "Group",
@@ -178,7 +177,7 @@ ROWCOUNT_TTL_SEC = 180
 JST = timezone(timedelta(hours=9))
 
 http = requests.Session()
-http.headers.update({"User-Agent": "spidey-bot/v3.4.8"})
+http.headers.update({"User-Agent": "spidey-bot/v3.4.9"})
 
 _run_lock = threading.Lock()
 
@@ -415,58 +414,42 @@ def update_single_cell(sheet_name: str, col0: int, row1: int, value: str) -> boo
 # ヘッダー自動修復
 # ==========================================
 def ensure_learn_headers() -> bool:
-    # 先頭は EXPECTED_HEADERS_LEARN に揃えるが、既存の右側ヘッダーがあれば残す（34列運用などの保護）
     ensure_sheet_exists(LEARN_SHEET_NAME, min_rows=5000, min_cols=max(32, HEADER_LEN_LEARN, 40))
-
     current = read_header_row(LEARN_SHEET_NAME)
 
-    # 先頭32列が一致しているなら何もしない
     if current[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN:
         return True
 
     if not AUTO_FIX_HEADERS:
         return not STRICT_HEADER_CHECK
 
-    # 右側ヘッダーを保持（例：34列運用なら 33-34列目の列名を残す）
     trailing = []
     if len(current) > len(EXPECTED_HEADERS_LEARN):
         trailing = current[len(EXPECTED_HEADERS_LEARN):]
 
     new_headers = list(EXPECTED_HEADERS_LEARN) + trailing
-
     ok = write_header_row(LEARN_SHEET_NAME, new_headers)
     if ok:
         print("[CFG] learn_log headers fixed (preserve trailing headers).")
     return ok
 
 def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
-    """
-    headers: 末尾の空欄は _normalize_headers でトリムされる前提。
-    limit:   シートの columnCount 等。limit > len(headers) の場合、len(headers) 以降は空欄列が存在する扱い。
-    """
     max_i = len(headers) if limit is None else int(limit)
-
-    # 1) まず headers 内の空欄を探す
     scan_i = min(len(headers), max_i)
     for i in range(scan_i):
         if str(headers[i]).strip() == "":
             return i
-
-    # 2) headers の外側（末尾側）に空欄列が存在するケース
-    #    limit が headers より大きければ、len(headers) が最初の空欄インデックス
     if max_i > len(headers):
         return len(headers)
-
     return -1
 
 def ensure_table_headers() -> bool:
     ensure_sheet_exists(MAIN_SHEET_NAME, min_rows=20000, min_cols=max(HEADER_LEN_TABLE, 40))
 
     headers = read_header_row(MAIN_SHEET_NAME)
-    colcount = get_sheet_colcount(MAIN_SHEET_NAME)  # may be None
+    colcount = get_sheet_colcount(MAIN_SHEET_NAME)
     hm = _build_headers_map(headers)
 
-    # 1) 既存の別名を canonical 名にリネーム
     if AUTO_FIX_HEADERS:
         for canonical in TABLE_REQUIRED_FIELDS:
             if canonical in hm:
@@ -478,7 +461,6 @@ def ensure_table_headers() -> bool:
                         update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical)
                     break
 
-        # 2) 足りない必須列(EvalStatus等含む)は、空欄のヘッダーセルに追加
         headers = read_header_row(MAIN_SHEET_NAME)
         hm = _build_headers_map(headers)
         for canonical in TABLE_REQUIRED_FIELDS:
@@ -486,7 +468,6 @@ def ensure_table_headers() -> bool:
                 continue
 
             limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
-            # 修正: [""] * 5 の追加をやめ、_find_first_blank_index 内で limit を見て判定させる
             blank_idx = _find_first_blank_index(headers, limit)
             if blank_idx == -1:
                 msg = f"[WARN] table missing required col '{canonical}' and no blank header cell. Please add a blank column."
@@ -511,7 +492,6 @@ def ensure_table_headers() -> bool:
 
 def get_headers_and_len(sheet_name: str) -> Tuple[List[str], Optional[int], bool]:
     now = time.time()
-
     if sheet_name in _sheet_header_cache:
         c = _sheet_header_cache[sheet_name]
         ts = float(c.get("ts", 0))
@@ -891,8 +871,15 @@ def release_run_mutex(token: str):
 
 # ==========================================
 # AI 推論の安全化（feature mismatch 対策）
+# - 特徴量名が取れるなら列を揃えて再試行
+# - それでも無理なら例外で落とさず bypass する
+# - 戻り値: (proba, bypassed, debug_dict)
 # ==========================================
-def _extract_expected_feature_names(model) -> Optional[List[str]]:
+def _extract_feature_names(model) -> Optional[List[str]]:
+    if model is None:
+        return None
+
+    # 1) estimator 直下
     try:
         fni = getattr(model, "feature_names_in_", None)
         if fni is not None:
@@ -900,56 +887,111 @@ def _extract_expected_feature_names(model) -> Optional[List[str]]:
     except Exception:
         pass
 
+    # 2) Pipeline / named_steps
     try:
-        steps = getattr(model, "steps", None)
-        if isinstance(steps, list):
-            for _, step in steps:
-                fni = getattr(step, "feature_names_in_", None)
+        named_steps = getattr(model, "named_steps", None)
+        if isinstance(named_steps, dict):
+            for st in reversed(list(named_steps.values())):
+                fni = getattr(st, "feature_names_in_", None)
                 if fni is not None:
                     return [str(x) for x in list(fni)]
     except Exception:
         pass
+
+    # 3) Pipeline / steps
+    try:
+        steps = getattr(model, "steps", None)
+        if isinstance(steps, list):
+            for _, st in reversed(steps):
+                fni = getattr(st, "feature_names_in_", None)
+                if fni is not None:
+                    return [str(x) for x in list(fni)]
+    except Exception:
+        pass
+
     return None
 
-def _align_features(feats: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
-    # 学習時の特徴量に合わせて並べ替え。欠損は 0.0 で埋める（NaN だとモデル次第で落ちるため）
-    aligned = pd.DataFrame([{c: 0.0 for c in expected_cols}])
-    if isinstance(feats, pd.DataFrame) and len(feats) >= 1:
-        for c in expected_cols:
-            if c in feats.columns:
-                try:
-                    aligned.loc[0, c] = float(feats.iloc[0][c])
-                except Exception:
-                    aligned.loc[0, c] = 0.0
+def _infer_expected_n_features(model) -> int:
+    try:
+        if model is None:
+            return -1
+
+        if hasattr(model, "n_features_in_"):
+            return int(getattr(model, "n_features_in_"))
+
+        if hasattr(model, "steps"):
+            for _, step in getattr(model, "steps", []):
+                if hasattr(step, "n_features_in_"):
+                    return int(getattr(step, "n_features_in_"))
+
+        if hasattr(model, "named_steps"):
+            for step in getattr(model, "named_steps", {}).values():
+                if hasattr(step, "n_features_in_"):
+                    return int(getattr(step, "n_features_in_"))
+
+        return -1
+    except Exception:
+        return -1
+
+def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
+    aligned = pd.DataFrame(index=feats.index)
+    for col in expected_cols:
+        if col in feats.columns:
+            aligned[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0.0)
+        else:
+            aligned[col] = 0.0
     return aligned
 
-def safe_predict_proba(model, feats: pd.DataFrame) -> np.ndarray:
-    # 暫定ガード方針：推論できない場合は「AIゲートをバイパスして通す」
-    # proba[0][1] を使っているので、score=1.0 相当を返す
-    if model is None:
-        return np.array([[0.0, 1.0]], dtype=float)
+def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+    debug: Dict[str, Any] = {
+        "expected_cols": None,
+        "expected_n_features": -1,
+        "input_n_features": -1,
+        "action": "none",
+        "error": "",
+    }
 
     try:
-        return model.predict_proba(feats)
-    except ValueError as e:
-        msg = str(e)
-        if "features" in msg and "expecting" in msg:
-            try:
-                expected_cols = _extract_expected_feature_names(model)
-                if expected_cols and isinstance(feats, pd.DataFrame):
-                    aligned = _align_features(feats, expected_cols)
-                    return model.predict_proba(aligned)
-            except Exception as e2:
-                print(f"[AI] safe_predict_proba align retry failed: {e2}")
+        if model is None:
+            debug["action"] = "model_none_bypass"
+            return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-            print(f"[AI] safe_predict_proba fallback (feature mismatch bypass): {msg}")
-            return np.array([[0.0, 1.0]], dtype=float)
+        if feats is None:
+            feats = pd.DataFrame([{}])
+        elif not isinstance(feats, pd.DataFrame):
+            feats = pd.DataFrame(feats)
 
-        print(f"[AI] safe_predict_proba ValueError bypass: {msg}")
-        return np.array([[0.0, 1.0]], dtype=float)
+        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        debug["input_n_features"] = int(feats.shape[1])
+
+        expected_cols = _extract_feature_names(model)
+        if expected_cols:
+            debug["expected_cols"] = list(expected_cols)
+            feats = _align_by_feature_names(feats, expected_cols)
+            debug["action"] = "aligned_by_feature_names"
+            debug["expected_n_features"] = int(len(expected_cols))
+        else:
+            expected_n = _infer_expected_n_features(model)
+            debug["expected_n_features"] = int(expected_n)
+            if expected_n > 0 and int(feats.shape[1]) != int(expected_n):
+                debug["action"] = "feature_count_mismatch_bypass"
+                debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
+                return np.array([[0.5, 0.5]], dtype=float), True, debug
+
+        proba = np.asarray(model.predict_proba(feats), dtype=float)
+        if proba.ndim == 1:
+            proba = np.vstack([1.0 - proba, proba]).T
+        if proba.shape[1] == 1:
+            proba = np.hstack([1.0 - proba, proba])
+
+        debug["action"] = "predicted"
+        return proba, False, debug
+
     except Exception as e:
-        print(f"[AI] safe_predict_proba Exception bypass: {e}")
-        return np.array([[0.0, 1.0]], dtype=float)
+        debug["action"] = "exception_bypass"
+        debug["error"] = f"{type(e).__name__}: {e}"
+        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
+        return np.array([[0.5, 0.5]], dtype=float), True, debug
 
 # ==========================================
 # モデル読み込み（GCS対応）
@@ -984,115 +1026,6 @@ else:
     ai_model = None
 
 # ==========================================
-# AI推論の安全ラッパー（特徴量ズレ対策）
-# - model=None でも 500にせず、(1,2) の確率配列を返す
-# - 学習時特徴量(feature_names_in_) が取れる場合は列を揃える
-# ==========================================
-from typing import Optional, List
-
-def _extract_feature_names(model) -> Optional[List[str]]:
-    """
-    学習時の特徴量名を可能な限り取得する。
-    - sklearn の推定器: feature_names_in_
-    - Pipeline の場合: 後段から feature_names_in_ を探索
-    取れなければ None
-    """
-    if model is None:
-        return None
-
-    # 1) estimator 直下
-    if hasattr(model, "feature_names_in_"):
-        try:
-            names = list(getattr(model, "feature_names_in_"))
-            return [str(x) for x in names]
-        except Exception:
-            pass
-
-    # 2) Pipeline / named_steps
-    if hasattr(model, "named_steps"):
-        try:
-            steps = list(model.named_steps.values())
-            for st in reversed(steps):
-                if hasattr(st, "feature_names_in_"):
-                    names = list(getattr(st, "feature_names_in_"))
-                    return [str(x) for x in names]
-        except Exception:
-            pass
-
-    # 3) Pipeline / steps
-    if hasattr(model, "steps"):
-        try:
-            steps = [s for (_, s) in getattr(model, "steps")]
-            for st in reversed(steps):
-                if hasattr(st, "feature_names_in_"):
-                    names = list(getattr(st, "feature_names_in_"))
-                    return [str(x) for x in names]
-        except Exception:
-            pass
-
-    return None
-
-
-def safe_predict_proba(model, feats: pd.DataFrame) -> np.ndarray:
-    """
-    predict_proba の安全版。
-    - 例外を握りつぶして HTTP500 を防ぐ
-    - 特徴量が足りない/多い場合に列合わせする（可能なら）
-    戻り値は必ず shape=(n,2) を返す
-    """
-    # model が無い（=AIゲートをバイパスしている）場合でも落とさない
-    if model is None:
-        # (n,2) を返す。score は 0.0 扱いにする
-        n = 1 if feats is None else max(len(feats), 1)
-        return np.zeros((n, 2), dtype=float)
-
-    try:
-        if feats is None:
-            feats = pd.DataFrame([{}])
-        elif not isinstance(feats, pd.DataFrame):
-            feats = pd.DataFrame(feats)
-
-        # NaN/inf 対策
-        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-        expected = _extract_feature_names(model)
-        if expected:
-            # 学習時の列に揃える：不足は 0.0 で補完、余分は捨てる、順序も合わせる
-            aligned = pd.DataFrame(index=feats.index)
-            for col in expected:
-                if col in feats.columns:
-                    aligned[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0.0)
-                else:
-                    aligned[col] = 0.0
-            feats = aligned
-
-        proba = model.predict_proba(feats)
-
-        # list -> np.array などを統一
-        proba = np.asarray(proba, dtype=float)
-
-        # まれに shape=(n,) や (n,1) が返る実装を握る（念のため）
-        if proba.ndim == 1:
-            proba = np.vstack([1.0 - proba, proba]).T
-        if proba.shape[1] == 1:
-            # 1列しか無い場合、2列に拡張（安全策）
-            proba = np.hstack([1.0 - proba, proba])
-
-        return proba
-
-    except Exception as e:
-        # ここで例外が出ても HTTP500 にしない
-        try:
-            print(f"[AI] safe_predict_proba failed: {e}")
-            if isinstance(feats, pd.DataFrame):
-                print(f"[AI] feats_cols={list(feats.columns)} feats_shape={feats.shape}")
-        except Exception:
-            pass
-
-        n = 1 if feats is None else max(len(feats), 1)
-        return np.zeros((n, 2), dtype=float)
-
-# ==========================================
 # ★起動時に「必要シート/ヘッダー」を自己修復
 # ==========================================
 def self_heal_prerequisites() -> Tuple[bool, str]:
@@ -1104,79 +1037,6 @@ def self_heal_prerequisites() -> Tuple[bool, str]:
         return ok_all, f"lock={ok_lock} learn={ok_learn} table={ok_table}"
     except Exception as e:
         return False, f"self_heal failed: {e}"
-
-def _infer_expected_n_features(model) -> int:
-    """
-    sklearn Pipeline/Estimator から「学習時に期待する特徴量数」を推定する。
-    取れなければ -1 を返す。
-    """
-    try:
-        if model is None:
-            return -1
-
-        # 単体推定器
-        if hasattr(model, "n_features_in_"):
-            return int(getattr(model, "n_features_in_"))
-
-        # Pipeline
-        if hasattr(model, "steps"):
-            for _, step in getattr(model, "steps", []):
-                if hasattr(step, "n_features_in_"):
-                    return int(getattr(step, "n_features_in_"))
-
-        # named_steps がある場合
-        if hasattr(model, "named_steps"):
-            for step in getattr(model, "named_steps", {}).values():
-                if hasattr(step, "n_features_in_"):
-                    return int(getattr(step, "n_features_in_"))
-
-        return -1
-    except Exception:
-        return -1
-
-
-def safe_predict_proba(model, feats: pd.DataFrame):
-    """
-    戻り値: (proba, bypassed, debug_dict)
-
-    - bypassed=True のときは「AIゲートをバイパス」する想定（= model無しと同等に扱う）
-    - 特徴量数が合わない場合でも例外で落とさない
-    """
-    debug = {
-        "expected_n_features": -1,
-        "input_n_features": -1,
-        "action": "none",
-        "error": "",
-    }
-
-    try:
-        if model is None:
-            debug["action"] = "model_none"
-            # proba は形だけ返す（score表示用）。ゲートは bypassed=True で caller 側が通す。
-            return np.array([[0.5, 0.5]]), True, debug
-
-        X = feats.copy()
-        expected = _infer_expected_n_features(model)
-        debug["expected_n_features"] = int(expected)
-        debug["input_n_features"] = int(X.shape[1])
-
-        # 期待数が取れていて、かつ本数不一致なら「バイパス」して落ちないようにする
-        if expected > 0 and X.shape[1] != expected:
-            debug["action"] = "feature_mismatch_bypass"
-            debug["error"] = f"feature mismatch: X={X.shape[1]} expected={expected}"
-            # ここで predict_proba は呼ばない（呼ぶと ValueError になるため）
-            return np.array([[0.5, 0.5]]), True, debug
-
-        # 本数OKなら通常推論
-        proba = model.predict_proba(X)
-        debug["action"] = "predicted"
-        return proba, False, debug
-
-    except Exception as e:
-        debug["action"] = "exception_bypass"
-        debug["error"] = f"{type(e).__name__}: {e}"
-        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
-        return np.array([[0.5, 0.5]]), True, debug
 
 # ==========================================
 # ロジック本体 (/run)
@@ -1912,5 +1772,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
