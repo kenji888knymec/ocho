@@ -1105,6 +1105,79 @@ def self_heal_prerequisites() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"self_heal failed: {e}"
 
+def _infer_expected_n_features(model) -> int:
+    """
+    sklearn Pipeline/Estimator から「学習時に期待する特徴量数」を推定する。
+    取れなければ -1 を返す。
+    """
+    try:
+        if model is None:
+            return -1
+
+        # 単体推定器
+        if hasattr(model, "n_features_in_"):
+            return int(getattr(model, "n_features_in_"))
+
+        # Pipeline
+        if hasattr(model, "steps"):
+            for _, step in getattr(model, "steps", []):
+                if hasattr(step, "n_features_in_"):
+                    return int(getattr(step, "n_features_in_"))
+
+        # named_steps がある場合
+        if hasattr(model, "named_steps"):
+            for step in getattr(model, "named_steps", {}).values():
+                if hasattr(step, "n_features_in_"):
+                    return int(getattr(step, "n_features_in_"))
+
+        return -1
+    except Exception:
+        return -1
+
+
+def safe_predict_proba(model, feats: pd.DataFrame):
+    """
+    戻り値: (proba, bypassed, debug_dict)
+
+    - bypassed=True のときは「AIゲートをバイパス」する想定（= model無しと同等に扱う）
+    - 特徴量数が合わない場合でも例外で落とさない
+    """
+    debug = {
+        "expected_n_features": -1,
+        "input_n_features": -1,
+        "action": "none",
+        "error": "",
+    }
+
+    try:
+        if model is None:
+            debug["action"] = "model_none"
+            # proba は形だけ返す（score表示用）。ゲートは bypassed=True で caller 側が通す。
+            return np.array([[0.5, 0.5]]), True, debug
+
+        X = feats.copy()
+        expected = _infer_expected_n_features(model)
+        debug["expected_n_features"] = int(expected)
+        debug["input_n_features"] = int(X.shape[1])
+
+        # 期待数が取れていて、かつ本数不一致なら「バイパス」して落ちないようにする
+        if expected > 0 and X.shape[1] != expected:
+            debug["action"] = "feature_mismatch_bypass"
+            debug["error"] = f"feature mismatch: X={X.shape[1]} expected={expected}"
+            # ここで predict_proba は呼ばない（呼ぶと ValueError になるため）
+            return np.array([[0.5, 0.5]]), True, debug
+
+        # 本数OKなら通常推論
+        proba = model.predict_proba(X)
+        debug["action"] = "predicted"
+        return proba, False, debug
+
+    except Exception as e:
+        debug["action"] = "exception_bypass"
+        debug["error"] = f"{type(e).__name__}: {e}"
+        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
+        return np.array([[0.5, 0.5]]), True, debug
+
 # ==========================================
 # ロジック本体 (/run)
 # ==========================================
@@ -1242,9 +1315,17 @@ def logic_main(force: bool = False):
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
-                proba = safe_predict_proba(ai_model, feats)
-                ai_score = float(proba[0][1])
-                ai_pass = (ai_score >= AI_TH)
+                proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
+                
+                # bypassed=True のときは「モデル無し」と同等に扱って AIゲートは通す（機会損失を防ぐ）
+                if bypassed:
+                    ai_score = None
+                    ai_pass = True
+                    print(f"[AI] bypassed in logic_main: {dbg}")
+                else:
+                    ai_score = float(proba[0][1])
+                    ai_pass = (ai_score >= AI_TH)
+
 
 
             item = {
@@ -1754,15 +1835,18 @@ def ai_smoke():
         "BTC_Vol": 0.0,
     }])
 
-    proba = safe_predict_proba(ai_model, feats)
+    proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
     score = float(proba[0][1])
-
+    
     return jsonify({
         "ok": True,
         "model_loaded": (ai_model is not None),
         "score": score,
+        "bypassed": bool(bypassed),
+        "debug": dbg,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
+
 
 
 @app.route("/run", methods=["GET", "POST"])
@@ -1828,4 +1912,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
