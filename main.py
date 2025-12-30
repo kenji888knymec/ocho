@@ -984,6 +984,115 @@ else:
     ai_model = None
 
 # ==========================================
+# AI推論の安全ラッパー（特徴量ズレ対策）
+# - model=None でも 500にせず、(1,2) の確率配列を返す
+# - 学習時特徴量(feature_names_in_) が取れる場合は列を揃える
+# ==========================================
+from typing import Optional, List
+
+def _extract_feature_names(model) -> Optional[List[str]]:
+    """
+    学習時の特徴量名を可能な限り取得する。
+    - sklearn の推定器: feature_names_in_
+    - Pipeline の場合: 後段から feature_names_in_ を探索
+    取れなければ None
+    """
+    if model is None:
+        return None
+
+    # 1) estimator 直下
+    if hasattr(model, "feature_names_in_"):
+        try:
+            names = list(getattr(model, "feature_names_in_"))
+            return [str(x) for x in names]
+        except Exception:
+            pass
+
+    # 2) Pipeline / named_steps
+    if hasattr(model, "named_steps"):
+        try:
+            steps = list(model.named_steps.values())
+            for st in reversed(steps):
+                if hasattr(st, "feature_names_in_"):
+                    names = list(getattr(st, "feature_names_in_"))
+                    return [str(x) for x in names]
+        except Exception:
+            pass
+
+    # 3) Pipeline / steps
+    if hasattr(model, "steps"):
+        try:
+            steps = [s for (_, s) in getattr(model, "steps")]
+            for st in reversed(steps):
+                if hasattr(st, "feature_names_in_"):
+                    names = list(getattr(st, "feature_names_in_"))
+                    return [str(x) for x in names]
+        except Exception:
+            pass
+
+    return None
+
+
+def safe_predict_proba(model, feats: pd.DataFrame) -> np.ndarray:
+    """
+    predict_proba の安全版。
+    - 例外を握りつぶして HTTP500 を防ぐ
+    - 特徴量が足りない/多い場合に列合わせする（可能なら）
+    戻り値は必ず shape=(n,2) を返す
+    """
+    # model が無い（=AIゲートをバイパスしている）場合でも落とさない
+    if model is None:
+        # (n,2) を返す。score は 0.0 扱いにする
+        n = 1 if feats is None else max(len(feats), 1)
+        return np.zeros((n, 2), dtype=float)
+
+    try:
+        if feats is None:
+            feats = pd.DataFrame([{}])
+        elif not isinstance(feats, pd.DataFrame):
+            feats = pd.DataFrame(feats)
+
+        # NaN/inf 対策
+        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        expected = _extract_feature_names(model)
+        if expected:
+            # 学習時の列に揃える：不足は 0.0 で補完、余分は捨てる、順序も合わせる
+            aligned = pd.DataFrame(index=feats.index)
+            for col in expected:
+                if col in feats.columns:
+                    aligned[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0.0)
+                else:
+                    aligned[col] = 0.0
+            feats = aligned
+
+        proba = model.predict_proba(feats)
+
+        # list -> np.array などを統一
+        proba = np.asarray(proba, dtype=float)
+
+        # まれに shape=(n,) や (n,1) が返る実装を握る（念のため）
+        if proba.ndim == 1:
+            proba = np.vstack([1.0 - proba, proba]).T
+        if proba.shape[1] == 1:
+            # 1列しか無い場合、2列に拡張（安全策）
+            proba = np.hstack([1.0 - proba, proba])
+
+        return proba
+
+    except Exception as e:
+        # ここで例外が出ても HTTP500 にしない
+        try:
+            print(f"[AI] safe_predict_proba failed: {e}")
+            if isinstance(feats, pd.DataFrame):
+                print(f"[AI] feats_cols={list(feats.columns)} feats_shape={feats.shape}")
+        except Exception:
+            pass
+
+        n = 1 if feats is None else max(len(feats), 1)
+        return np.zeros((n, 2), dtype=float)
+
+# ==========================================
 # ★起動時に「必要シート/ヘッダー」を自己修復
 # ==========================================
 def self_heal_prerequisites() -> Tuple[bool, str]:
@@ -1719,3 +1828,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
