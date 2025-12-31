@@ -1184,7 +1184,15 @@ def logic_main(force: bool = False):
                     print(f"[AI] bypassed in logic_main: {dbg}")
                 else:
                     ai_score = float(proba[0][1])
-                    ai_pass = (ai_score >= AI_TH)
+
+                    # 念のため：NaN/inf を検知したら bypass 扱い（500回避＋機会損失も抑える）
+                    if not np.isfinite(ai_score):
+                        ai_score = None
+                        ai_pass = True
+                        print(f"[AI] bypassed (non-finite score) in logic_main: {dbg}")
+                    else:
+                        ai_pass = (ai_score >= AI_TH)
+
 
 
 
@@ -1772,3 +1780,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
