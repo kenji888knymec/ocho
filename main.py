@@ -1837,17 +1837,69 @@ def e_report():
 
 @app.route("/ai_health", methods=["GET"])
 def ai_health():
+    """
+    - 通常: 設定状態と、MODEL_MAPの登録状況、キャッシュ状況だけ返す（軽い）
+    - probe=1: MODEL_MAPに登録された銘柄について get_ai_model_for_symbol() を実際に呼び、
+               「ロードできるか」を返す（初回はGCSダウンロードが走るので少し重い）
+    """
     loaded = (ai_model is not None)
-    return jsonify({
+
+    # どの銘柄がMODEL_MAPに登録されているか（設定の見える化）
+    m_map = _parse_kv_map(MODEL_MAP)
+    v_map = _parse_kv_map(MODEL_VERSION_MAP)
+
+    # キャッシュ状況（どのURIがキャッシュされているか）
+    cache_uris = list(_model_cache.keys()) if isinstance(_model_cache, dict) else []
+
+    resp: Dict[str, Any] = {
         "ok": True,
-        "model_loaded": loaded,
-        "model_type": (str(type(ai_model)) if loaded else None),
-        "model_version": str(AI_MODEL_VERSION_RUNTIME),
-        "source": str(AI_MODEL_SOURCE_RUNTIME),
-        "multi_model_enabled": bool(ENABLE_MULTI_MODEL),
-        "dynamic_ai_th_enabled": bool(DYNAMIC_AI_TH),
-        "e_filter_enabled": bool(ENABLE_E_FILTER),
-    }), 200
+        "default_model": {
+            "model_loaded": loaded,
+            "model_type": (str(type(ai_model)) if loaded else None),
+            "model_version": str(AI_MODEL_VERSION_RUNTIME),
+            "source": str(AI_MODEL_SOURCE_RUNTIME),
+        },
+        "flags": {
+            "multi_model_enabled": bool(ENABLE_MULTI_MODEL),
+            "dynamic_ai_th_enabled": bool(DYNAMIC_AI_TH),
+            "e_filter_enabled": bool(ENABLE_E_FILTER),
+        },
+        "multi_model_config": {
+            "model_map_keys": sorted(list(m_map.keys())),
+            "model_map_uris": m_map,          # どこを指しているかをそのまま返す
+            "model_version_map": v_map,       # 任意
+            "cache_ttl_sec": int(MODEL_CACHE_TTL_SEC),
+            "cached_uris": cache_uris,
+        },
+    }
+
+    probe = str(request.args.get("probe", "0")).strip() == "1"
+    if probe and bool(ENABLE_MULTI_MODEL) and len(m_map) > 0:
+        # 実際にロードして結果を返す（候補が出なくても確認できる）
+        results: Dict[str, Any] = {}
+        for sym in sorted(list(m_map.keys())):
+            try:
+                m, ver, src = get_ai_model_for_symbol(sym)
+                results[sym] = {
+                    "loaded": (m is not None),
+                    "model_type": (str(type(m)) if m is not None else None),
+                    "version": str(ver),
+                    "source": str(src),
+                }
+            except Exception as e:
+                results[sym] = {
+                    "loaded": False,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+        resp["multi_model_probe"] = results
+    else:
+        resp["multi_model_probe"] = {
+            "ran": False,
+            "hint": "Use /ai_health?probe=1 to actually try loading models (may download from GCS).",
+        }
+
+    return jsonify(resp), 200
+
 
 
 @app.route("/ai_smoke", methods=["GET"])
@@ -1952,3 +2004,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
