@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -37,6 +38,23 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
+
+# --- Advanced toggles (SAFE DEFAULT: OFF) ---
+ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
+E_TH = float(os.environ.get("E_TH", "0.0"))
+
+DYNAMIC_AI_TH = os.environ.get("DYNAMIC_AI_TH", "0") == "1"
+AI_TH_MIN = float(os.environ.get("AI_TH_MIN", "0.45"))
+AI_TH_MAX = float(os.environ.get("AI_TH_MAX", "0.75"))
+AI_TH_UP_ADD = float(os.environ.get("AI_TH_UP_ADD", "0.00"))
+AI_TH_DOWN_ADD = float(os.environ.get("AI_TH_DOWN_ADD", "0.02"))
+AI_TH_STORM_ADD = float(os.environ.get("AI_TH_STORM_ADD", "0.05"))
+
+ENABLE_MULTI_MODEL = os.environ.get("ENABLE_MULTI_MODEL", "0") == "1"
+# 例: "BTC=gs://bucket/models/btc.pkl;ETH=gs://bucket/models/eth.pkl"
+MODEL_MAP = os.environ.get("MODEL_MAP", "")
+MODEL_VERSION_MAP = os.environ.get("MODEL_VERSION_MAP", "")
+MODEL_CACHE_TTL_SEC = int(float(os.environ.get("MODEL_CACHE_TTL_SEC", "3600")))
 
 ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
 AUTO_JUDGE_AFTER_RUN = os.environ.get("AUTO_JUDGE_AFTER_RUN", "0") == "1"
@@ -993,37 +1011,155 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+def compute_dynamic_ai_th(base_th: float, btc_mode: str, median_sigma: float, btc_ok: bool, btc_calm: bool) -> float:
+    """
+    DYNAMIC_AI_TH=1 のときだけ使う想定。
+    事故らないように「少しだけ」動かし、上下限でクランプする。
+    """
+    th = float(base_th)
+
+    if not btc_ok:
+        th += float(AI_TH_STORM_ADD)
+
+    if not btc_calm:
+        th += float(AI_TH_STORM_ADD)
+
+    mode = ("" if btc_mode is None else str(btc_mode)).strip().upper()
+    if mode == "UP":
+        th += float(AI_TH_UP_ADD)
+    elif mode == "DOWN":
+        th += float(AI_TH_DOWN_ADD)
+
+    th = max(float(AI_TH_MIN), min(float(AI_TH_MAX), th))
+    return th
+
 # ==========================================
-# モデル読み込み（GCS対応）
+# モデル読み込み（GCS対応） + 銘柄別モデル（任意） + リロード
 # ==========================================
 MODEL_LOCAL_PATH = "trade_ai_model.pkl"
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "")
 MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "")
 
-if not os.path.exists(MODEL_LOCAL_PATH) and MODEL_GCS_URI.startswith("gs://"):
+AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
+AI_MODEL_SOURCE_RUNTIME = "none"
+
+_model_cache: Dict[str, Dict[str, Any]] = {}  # key: uri -> {model, ts, version, source}
+
+def _parse_kv_map(s: str) -> Dict[str, str]:
+    """
+    "BTC=gs://...;ETH=gs://..." -> {"BTC":"gs://...","ETH":"gs://..."}
+    """
+    out: Dict[str, str] = {}
+    if not s:
+        return out
+    parts = [p.strip() for p in str(s).split(";") if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.strip().upper()
+        v = v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+def _gcs_download_to(uri: str, dst_path: str) -> bool:
+    if (not uri) or (not uri.startswith("gs://")):
+        return False
     try:
-        print(f"[AI] Downloading model from {MODEL_GCS_URI}...")
-        parts = MODEL_GCS_URI.replace("gs://", "").split("/", 1)
+        print(f"[AI] Downloading model from {uri} -> {dst_path}")
+        parts = uri.replace("gs://", "").split("/", 1)
         bucket_name = parts[0]
         blob_name = parts[1]
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        blob.download_to_filename(MODEL_LOCAL_PATH)
+        blob.download_to_filename(dst_path)
         print("[AI] Download complete.")
+        return True
     except Exception as e:
         print(f"[AI] GCS Download failed: {e}")
+        return False
 
-if os.path.exists(MODEL_LOCAL_PATH):
+def _load_model_from_path(path: str):
     try:
-        ai_model = joblib.load(MODEL_LOCAL_PATH)
-        print(f"[AI] Model Loaded Successfully path={MODEL_LOCAL_PATH} ver={MODEL_VERSION}")
+        return joblib.load(path)
     except Exception as e:
         print(f"[AI] Load Failed: {e}")
-        ai_model = None
-else:
-    print("[AI] trade_ai_model.pkl not found -> AI gate is bypassed (ai_pass=True).")
+        return None
+
+def reload_default_model() -> bool:
+    """
+    既定モデル(ai_model)を MODEL_GCS_URI / trade_ai_model.pkl から再ロードする。
+    失敗しても例外で落とさず、ai_model=None にして bypass させる。
+    """
+    global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME, _model_cache
+
+    _model_cache = {}
+
+    if (not os.path.exists(MODEL_LOCAL_PATH)) and MODEL_GCS_URI.startswith("gs://"):
+        _gcs_download_to(MODEL_GCS_URI, MODEL_LOCAL_PATH)
+
+    if os.path.exists(MODEL_LOCAL_PATH):
+        m = _load_model_from_path(MODEL_LOCAL_PATH)
+        if m is not None:
+            ai_model = m
+            AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
+            AI_MODEL_SOURCE_RUNTIME = "local"
+            print(f"[AI] Model Loaded Successfully path={MODEL_LOCAL_PATH} ver={AI_MODEL_VERSION_RUNTIME}")
+            return True
+
+    print("[AI] trade_ai_model.pkl not found or load failed -> AI gate is bypassed (ai_pass=True).")
     ai_model = None
+    AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
+    AI_MODEL_SOURCE_RUNTIME = "none"
+    return False
+
+def _safe_tmp_path_for_uri(uri: str) -> str:
+    h = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:16]
+    d = "/tmp/models"
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return f"{d}/model_{h}.pkl"
+
+def get_ai_model_for_symbol(symbol_code: str):
+    """
+    ENABLE_MULTI_MODEL=1 かつ MODEL_MAP に該当がある銘柄だけ別モデルを使う。
+    それ以外は既定モデル(ai_model)を使う。
+    """
+    if not ENABLE_MULTI_MODEL:
+        return ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+
+    sym = ("" if symbol_code is None else str(symbol_code)).strip().upper()
+    m_map = _parse_kv_map(MODEL_MAP)
+    v_map = _parse_kv_map(MODEL_VERSION_MAP)
+    uri = m_map.get(sym, "")
+
+    if (not uri) or (not uri.startswith("gs://")):
+        return ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+
+    now = time.time()
+    c = _model_cache.get(uri)
+    if c and (now - float(c.get("ts", 0))) <= MODEL_CACHE_TTL_SEC:
+        return c.get("model"), str(c.get("version", "")), str(c.get("source", "gcs"))
+
+    tmp_path = _safe_tmp_path_for_uri(uri)
+    ok_dl = _gcs_download_to(uri, tmp_path)
+    if not ok_dl or (not os.path.exists(tmp_path)):
+        return ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+
+    m = _load_model_from_path(tmp_path)
+    if m is None:
+        return ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+
+    ver = v_map.get(sym, "")
+    _model_cache[uri] = {"model": m, "ts": now, "version": ver, "source": "gcs"}
+    print(f"[AI] Multi-model loaded sym={sym} uri={uri} ver={ver}")
+    return m, ver, "gcs"
+
+reload_default_model()
 
 # ==========================================
 # ★起動時に「必要シート/ヘッダー」を自己修復
@@ -1163,7 +1299,18 @@ def logic_main(force: bool = False):
             ai_score = None
             ai_pass = True if ai_model is None else False
 
-            if ai_model is not None:
+            # 動的AI_TH（デフォルトOFF）
+            ai_th_used = AI_TH
+            if DYNAMIC_AI_TH:
+                ai_th_used = compute_dynamic_ai_th(AI_TH, btc_mode, median_sigma, btc_ok, BTC_CALM)
+
+            # 銘柄別モデル（デフォルトOFF）
+            model_for_sym = ai_model
+            sym_code = symbol.replace("/USDT", "")
+            if ENABLE_MULTI_MODEL:
+                model_for_sym, _ver, _src = get_ai_model_for_symbol(sym_code)
+
+            if model_for_sym is not None:
                 feats = pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
@@ -1175,26 +1322,22 @@ def logic_main(force: bool = False):
                     "BTC_Ret": float(btc_ret),
                     "BTC_Vol": float(btc_vol),
                 }])
-                proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
-                
-                # bypassed=True のときは「モデル無し」と同等に扱って AIゲートは通す（機会損失を防ぐ）
+
+                proba, bypassed, dbg = safe_predict_proba(model_for_sym, feats)
+
                 if bypassed:
                     ai_score = None
                     ai_pass = True
-                    print(f"[AI] bypassed in logic_main: {dbg}")
+                    print(f"[AI] bypassed in logic_main sym={sym_code}: {dbg}")
                 else:
                     ai_score = float(proba[0][1])
 
-                    # 念のため：NaN/inf を検知したら bypass 扱い（500回避＋機会損失も抑える）
                     if not np.isfinite(ai_score):
                         ai_score = None
                         ai_pass = True
-                        print(f"[AI] bypassed (non-finite score) in logic_main: {dbg}")
+                        print(f"[AI] bypassed (non-finite score) in logic_main sym={sym_code}: {dbg}")
                     else:
-                        ai_pass = (ai_score >= AI_TH)
-
-
-
+                        ai_pass = (ai_score >= float(ai_th_used))
 
             item = {
                 "symbol": symbol.replace("/USDT", ""),
@@ -1284,11 +1427,16 @@ def logic_main(force: bool = False):
     if candidate_rows:
         append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, EXPECTED_HEADERS_LEARN)
 
-    filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)[:3]
+    # いったんスコア順に並べる（ここではまだ上位制限しない）
+    filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
+
     count = 0
     alert_rows: List[List[Any]] = []
 
     for item in filtered:
+        if count >= 3:
+            break
+
         sym = item["symbol"]
         ts_ms = item["time"]
 
@@ -1307,6 +1455,17 @@ def logic_main(force: bool = False):
         last_alert_records[sym] = ts_ms
 
         tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
+
+        # --- Expected value filter (SAFE DEFAULT: OFF) ---
+        if ENABLE_E_FILTER:
+            # p_win は AI score があればそれ、無ければ 0.5（最小安全実装）
+            p_win = 0.5 if (item.get("ai_score", None) is None) else float(item["ai_score"])
+            exp_ret = (p_win * float(tp_pct)) - ((1.0 - p_win) * float(sl_pct))
+
+            if exp_ret < float(E_TH):
+                print(f"[EV] filtered sym={sym} exp_ret={exp_ret:.4f} < E_TH={E_TH}")
+                continue
+
         cp = float(item["close"])
         lev = DEFAULT_LEV
 
@@ -1683,8 +1842,11 @@ def ai_health():
         "ok": True,
         "model_loaded": loaded,
         "model_type": (str(type(ai_model)) if loaded else None),
-        "model_version": os.environ.get("MODEL_VERSION", ""),
-        "source": ("local" if os.path.exists("trade_ai_model.pkl") else "unknown"),
+        "model_version": str(AI_MODEL_VERSION_RUNTIME),
+        "source": str(AI_MODEL_SOURCE_RUNTIME),
+        "multi_model_enabled": bool(ENABLE_MULTI_MODEL),
+        "dynamic_ai_th_enabled": bool(DYNAMIC_AI_TH),
+        "e_filter_enabled": bool(ENABLE_E_FILTER),
     }), 200
 
 
@@ -1715,6 +1877,16 @@ def ai_smoke():
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
 
+@app.route("/reload_model", methods=["POST", "GET"])
+def reload_model():
+    ok = reload_default_model()
+    return jsonify({
+        "ok": True,
+        "reloaded": bool(ok),
+        "model_loaded": (ai_model is not None),
+        "model_version": str(AI_MODEL_VERSION_RUNTIME),
+        "source": str(AI_MODEL_SOURCE_RUNTIME),
+    }), 200
 
 
 @app.route("/run", methods=["GET", "POST"])
@@ -1780,4 +1952,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
