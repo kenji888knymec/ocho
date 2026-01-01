@@ -2374,25 +2374,31 @@ def reload_model():
     }), 200
 
 @app.route("/train", methods=["GET", "POST"])
-def train():
+def train_process():
     """
-    learn_log から学習してモデルを作る。
-    - hot_reload=1: 学習したモデルをこのインスタンスで即時有効化（ai_modelを差し替え）
-    - upload=1: GCSへアップロード（権限が無いと失敗するので結果に出す）
-    - lookback=2500: learn_logの末尾から何行見るか
-    - min_samples=60: Win/Lose が埋まっている行が最低いくつ必要か
-    - version=任意: モデルバージョン名（無ければ自動生成）
+    learn_log から学習してモデルを作る（Cloud Scheduler から GET で叩ける）。
+
+    URL例:
+      /train?lookback=2500&min_samples=60&hot_reload=1&upload=1
+
+    パラメータ:
+      - lookback: learn_log の末尾から読む行数
+      - min_samples: Win/Lose が埋まっている行の最低数
+      - hot_reload: 1 なら、このインスタンスだけ即時有効化（環境変数は変わらない）
+      - upload: 1 なら GCSへアップロード
+      - version: 任意のモデルバージョン名（未指定なら vYYYYMMDD_HHMMSS）
     """
     global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
 
+    # 同時実行ガード（run/judge/train）
     if not _run_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "Busy (run/judge already in progress)."}), 200
+        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress)."}), 200
 
     mutex_token = ""
     try:
         ok, msg = preflight_check()
         if not ok:
-            return jsonify({"ok": False, "error": f"Preflight NG: {msg}"}), 500
+            return jsonify({"ok": False, "error": f"Preflight NG: {msg}", "version": VERSION}), 500
 
         okm, token = acquire_run_mutex()
         if not okm:
@@ -2408,28 +2414,30 @@ def train():
         if not ver:
             ver = datetime.now(JST).strftime("v%Y%m%d_%H%M%S")
 
-        # どこに保存するか（必要ならENVで差し替え可能）
+        # 保存先（ENVで差し替え可能）
         gcs_prefix = os.environ.get("TRAIN_GCS_PREFIX", "gs://crypto-alert-models-8888/models").rstrip("/")
         gcs_uri = f"{gcs_prefix}/{ver}/trade_ai_model.pkl"
 
         t0 = time.time()
+
+        # 学習
         model, metrics = _train_model_from_learn_log(lookback_rows=lookback, min_samples=min_samples)
 
         # ローカル保存（/tmp）
         tmp_path = f"/tmp/trade_ai_model_{ver}.pkl"
         joblib.dump(model, tmp_path)
 
+        # GCSアップロード（任意）
         upload_ok = False
         upload_msg = ""
         if upload:
             upload_ok, upload_msg = _gcs_upload_from(tmp_path, gcs_uri)
 
+        # hot reload（任意）
         if hot_reload:
-            # このリビジョン上で即時有効化（envは変えられないので “今の実行” に効かせる）
             ai_model = model
             AI_MODEL_VERSION_RUNTIME = ver
             AI_MODEL_SOURCE_RUNTIME = "trained_local"
-            # 次回 reload_default_model 用に、既定パスにも置く（同一インスタンス内の事故低減）
             try:
                 joblib.dump(model, MODEL_LOCAL_PATH)
             except Exception as e:
@@ -2465,46 +2473,6 @@ def train():
     finally:
         release_run_mutex(mutex_token)
         _run_lock.release()
-
-
-
-@app.route("/train", methods=["GET", "POST"])
-def train_process():
-    """
-    learn_log を使って学習し、GCSへモデルを保存する。
-    Cloud Shell 不要。Cloud Run の「テスト」から叩ける。
-
-    パラメータ:
-      - lookback: learn_log の末尾から読む行数（default TRAIN_LOOKBACK_ROWS）
-      - version: 出力モデルのバージョン名（未指定なら vYYYY-MM-DD_HHMMSS）
-      - hot_reload: 1 なら、このインスタンスだけ即時ロード（次回起動では環境変数に戻る）
-    """
-    if not _run_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress)."}), 200
-
-    mutex_token = ""
-    try:
-        ok, msg = preflight_check()
-        if not ok:
-            return jsonify({"ok": False, "error": f"Preflight NG: {msg}"}), 500
-
-        okm, token = acquire_run_mutex()
-        if not okm:
-            return jsonify({"ok": False, "error": "Busy (distributed mutex)."}), 200
-        mutex_token = token
-
-        lookback = int(float(request.args.get("lookback", TRAIN_LOOKBACK_ROWS)))
-        ver = str(request.args.get("version", "")).strip()
-        hot_reload = str(request.args.get("hot_reload", "0")).strip() == "1"
-
-        result = train_and_export_model(lookback_rows=lookback, out_version=ver, hot_reload=hot_reload)
-        code = 200 if bool(result.get("ok")) else 500
-        return jsonify(result), code
-
-    finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
-
 
 @app.route("/run", methods=["GET", "POST"])
 def run_process():
@@ -2570,6 +2538,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
