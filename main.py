@@ -1354,6 +1354,28 @@ def _gcs_download_to(uri: str, dst_path: str) -> bool:
         print(f"[AI] GCS Download failed: {e}")
         return False
 
+def _gcs_upload_from(src_path: str, uri: str) -> Tuple[bool, str]:
+    """
+    src_path のファイルを gs://... にアップロードする。
+    戻り値: (ok, message)
+    """
+    if (not uri) or (not uri.startswith("gs://")):
+        return False, "uri is empty or not gs://"
+    if (not src_path) or (not os.path.exists(src_path)):
+        return False, f"src not found: {src_path}"
+
+    try:
+        parts = uri.replace("gs://", "").split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1]
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(src_path)
+        return True, "uploaded"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 def _load_model_from_path(path: str):
     try:
         return joblib.load(path)
@@ -1387,6 +1409,144 @@ def reload_default_model() -> bool:
     AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
     AI_MODEL_SOURCE_RUNTIME = "none"
     return False
+
+def _build_training_dataset_from_learn_log(lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    """
+    learn_log から学習用 X,y を作る（UIだけで回すため、learn_logの列だけで作る）
+    - y: Win=1, Lose=0
+    - X: 推論側の feature 名に揃える（無いものは0や簡易派生）
+    """
+    info: Dict[str, Any] = {"rows_scanned": 0, "rows_used": 0, "class_balance": {}}
+
+    ok, msg = self_heal_prerequisites()
+    if not ok:
+        raise RuntimeError(f"self_heal_prerequisites failed: {msg}")
+
+    headers = read_header_row(LEARN_SHEET_NAME)
+    hm = _build_headers_map(headers)
+
+    col_side = _resolve_col_idx(hm, "Side")
+    col_score = _resolve_col_idx(hm, "ScoreSigma")
+    col_sigma = _resolve_col_idx(hm, "VolSigma")
+    col_btc1h = _resolve_col_idx(hm, "BTC_1h_Change")
+    col_rsi = _resolve_col_idx(hm, "RSI")
+    col_winlose = _resolve_col_idx(hm, "Win/Lose")
+
+    if any(x == -1 for x in [col_side, col_score, col_sigma, col_btc1h, col_rsi, col_winlose]):
+        raise RuntimeError(f"learn_log required columns missing. headers={headers[:40]}")
+
+    last_row = _get_row_count_cached(LEARN_SHEET_NAME)
+    if last_row < 2:
+        raise RuntimeError("learn_log is empty")
+
+    start_row = max(2, last_row - int(lookback_rows) + 1)
+
+    service = get_sheet_service()
+    res = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{LEARN_SHEET_NAME}!A{start_row}:{HEADER_COL_END}{last_row}",
+    ).execute()
+    rows = res.get("values", []) or []
+
+    X_rows: List[Dict[str, float]] = []
+    y_rows: List[int] = []
+
+    for r in rows:
+        info["rows_scanned"] += 1
+
+        def cell(idx: int) -> str:
+            return "" if idx < 0 or idx >= len(r) else str(r[idx]).strip()
+
+        wl = cell(col_winlose).strip().lower()
+        if wl not in {"win", "lose"}:
+            continue
+
+        y = 1 if wl == "win" else 0
+
+        side = cell(col_side).upper()
+        score = to_float(cell(col_score), default=None)
+        sig = to_float(cell(col_sigma), default=None)
+        btc1h = to_float(cell(col_btc1h), default=0.0)
+        rsi = to_float(cell(col_rsi), default=50.0)
+
+        if score is None or sig is None:
+            continue
+
+        # 推論側feature名に合わせる（足りないものは0 / 簡易派生）
+        rise_score = float(score) if "LONG" in side else 0.0
+        drop_score = float(score) if "SHORT" in side else 0.0
+
+        X_rows.append({
+            "Sigma": float(sig),
+            "BandWidth": 0.0,
+            "BW_Change": 0.0,
+            "RSI": float(rsi if rsi is not None else 50.0),
+            "Vol_Change": 0.0,
+            "Rise_Score": float(rise_score),
+            "Drop_Score": float(drop_score),
+            "BTC_Ret": 0.0,
+            "BTC_Vol": float(abs(btc1h) / 4.0),
+        })
+        y_rows.append(int(y))
+        info["rows_used"] += 1
+
+    if not X_rows:
+        raise RuntimeError("No trainable rows found (need Win/Lose filled rows).")
+
+    X = pd.DataFrame(X_rows).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_arr = np.asarray(y_rows, dtype=int)
+
+    # クラス比
+    uniq, cnt = np.unique(y_arr, return_counts=True)
+    info["class_balance"] = {str(int(k)): int(v) for k, v in zip(uniq, cnt)}
+
+    return X, y_arr, info
+
+def _train_model_from_learn_log(lookback_rows: int, min_samples: int) -> Tuple[Any, Dict[str, Any]]:
+    """
+    learn_log からモデルを学習して返す
+    """
+    X, y, info = _build_training_dataset_from_learn_log(lookback_rows=lookback_rows)
+    if int(len(y)) < int(min_samples):
+        raise RuntimeError(f"not enough samples: {len(y)} < {min_samples}")
+
+    # sklearn は環境に入っている前提（既存モデルがjoblibでロードできているため）
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, roc_auc_score
+    except Exception as e:
+        raise RuntimeError(f"sklearn import failed: {type(e).__name__}: {e}")
+
+    metrics: Dict[str, Any] = {"ok": True}
+    strat = y if (len(np.unique(y)) >= 2) else None
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=strat
+    )
+
+    clf = LogisticRegression(
+        max_iter=800,
+        class_weight="balanced",
+        solver="liblinear",
+    )
+    clf.fit(X_train, y_train)
+
+    pred = clf.predict(X_test)
+    proba = clf.predict_proba(X_test)[:, 1] if len(np.unique(y_test)) >= 2 else None
+
+    metrics["rows_used"] = int(info.get("rows_used", 0))
+    metrics["rows_scanned"] = int(info.get("rows_scanned", 0))
+    metrics["class_balance"] = info.get("class_balance", {})
+    metrics["acc"] = float(accuracy_score(y_test, pred)) if len(y_test) > 0 else None
+    if proba is not None:
+        metrics["auc"] = float(roc_auc_score(y_test, proba))
+    else:
+        metrics["auc"] = None
+
+    # feature_names を保持させる（DataFrame入力で feature_names_in_ が入る）
+    return clf, metrics
+
 
 def _safe_tmp_path_for_uri(uri: str) -> str:
     h = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:16]
@@ -2213,6 +2373,100 @@ def reload_model():
         "source": str(AI_MODEL_SOURCE_RUNTIME),
     }), 200
 
+@app.route("/train", methods=["GET", "POST"])
+def train():
+    """
+    learn_log から学習してモデルを作る。
+    - hot_reload=1: 学習したモデルをこのインスタンスで即時有効化（ai_modelを差し替え）
+    - upload=1: GCSへアップロード（権限が無いと失敗するので結果に出す）
+    - lookback=2500: learn_logの末尾から何行見るか
+    - min_samples=60: Win/Lose が埋まっている行が最低いくつ必要か
+    - version=任意: モデルバージョン名（無ければ自動生成）
+    """
+    global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Busy (run/judge already in progress)."}), 200
+
+    mutex_token = ""
+    try:
+        ok, msg = preflight_check()
+        if not ok:
+            return jsonify({"ok": False, "error": f"Preflight NG: {msg}"}), 500
+
+        okm, token = acquire_run_mutex()
+        if not okm:
+            return jsonify({"ok": False, "error": "Busy (distributed mutex)."}), 200
+        mutex_token = token
+
+        lookback = int(float(request.args.get("lookback", "2500")))
+        min_samples = int(float(request.args.get("min_samples", "60")))
+        hot_reload = str(request.args.get("hot_reload", "1")).strip() == "1"
+        upload = str(request.args.get("upload", "1")).strip() == "1"
+
+        ver = str(request.args.get("version", "")).strip()
+        if not ver:
+            ver = datetime.now(JST).strftime("v%Y%m%d_%H%M%S")
+
+        # どこに保存するか（必要ならENVで差し替え可能）
+        gcs_prefix = os.environ.get("TRAIN_GCS_PREFIX", "gs://crypto-alert-models-8888/models").rstrip("/")
+        gcs_uri = f"{gcs_prefix}/{ver}/trade_ai_model.pkl"
+
+        t0 = time.time()
+        model, metrics = _train_model_from_learn_log(lookback_rows=lookback, min_samples=min_samples)
+
+        # ローカル保存（/tmp）
+        tmp_path = f"/tmp/trade_ai_model_{ver}.pkl"
+        joblib.dump(model, tmp_path)
+
+        upload_ok = False
+        upload_msg = ""
+        if upload:
+            upload_ok, upload_msg = _gcs_upload_from(tmp_path, gcs_uri)
+
+        if hot_reload:
+            # このリビジョン上で即時有効化（envは変えられないので “今の実行” に効かせる）
+            ai_model = model
+            AI_MODEL_VERSION_RUNTIME = ver
+            AI_MODEL_SOURCE_RUNTIME = "trained_local"
+            # 次回 reload_default_model 用に、既定パスにも置く（同一インスタンス内の事故低減）
+            try:
+                joblib.dump(model, MODEL_LOCAL_PATH)
+            except Exception as e:
+                print(f"[TRAIN] dump to MODEL_LOCAL_PATH failed: {e}")
+
+        elapsed = time.time() - t0
+
+        return jsonify({
+            "ok": True,
+            "version": VERSION,
+            "trained_model_version": ver,
+            "hot_reload": bool(hot_reload),
+            "model_loaded_now": (ai_model is not None),
+            "runtime_model_version": str(AI_MODEL_VERSION_RUNTIME),
+            "runtime_model_source": str(AI_MODEL_SOURCE_RUNTIME),
+            "gcs": {
+                "upload_requested": bool(upload),
+                "uri": gcs_uri,
+                "upload_ok": bool(upload_ok),
+                "upload_msg": str(upload_msg),
+            },
+            "metrics": metrics,
+            "elapsed_sec": float(elapsed),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "version": VERSION,
+        }), 500
+
+    finally:
+        release_run_mutex(mutex_token)
+        _run_lock.release()
+
+
 
 @app.route("/train", methods=["GET", "POST"])
 def train_process():
@@ -2316,5 +2570,6 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
