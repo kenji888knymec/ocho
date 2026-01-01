@@ -16,6 +16,24 @@ from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
 
+# ==============================
+# 学習用（scikit-learn）
+# 環境に無い場合でも /run が落ちないように try にする
+# ==============================
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score, accuracy_score
+    SKLEARN_OK = True
+except Exception as _e:
+    LogisticRegression = None
+    train_test_split = None
+    roc_auc_score = None
+    accuracy_score = None
+    SKLEARN_OK = False
+    print(f"[WARN] scikit-learn import failed (train disabled): {_e}")
+
+
 # ==========================================
 # Flask設定（Buildpacks標準：main.py の app を起動）
 # ==========================================
@@ -1045,6 +1063,261 @@ AI_MODEL_SOURCE_RUNTIME = "none"
 
 _model_cache: Dict[str, Dict[str, Any]] = {}  # key: uri -> {model, ts, version, source}
 
+# ==========================================
+# /train（学習→GCS保存）用 設定
+# ==========================================
+TRAIN_ENABLED = os.environ.get("TRAIN_ENABLED", "1") == "1"
+TRAIN_LOOKBACK_ROWS = int(float(os.environ.get("TRAIN_LOOKBACK_ROWS", "2500")))  # learn_logから読む最大行数
+TRAIN_MIN_SAMPLES = int(float(os.environ.get("TRAIN_MIN_SAMPLES", "120")))       # Win/Lose がこれ未満なら学習しない
+TRAIN_TEST_SIZE = float(os.environ.get("TRAIN_TEST_SIZE", "0.2"))
+TRAIN_RANDOM_STATE = int(float(os.environ.get("TRAIN_RANDOM_STATE", "42")))
+
+# 出力先（未指定なら MODEL_GCS_URI から bucket を推定）
+TRAIN_GCS_BUCKET = os.environ.get("TRAIN_GCS_BUCKET", "")
+TRAIN_GCS_PREFIX = os.environ.get("TRAIN_GCS_PREFIX", "models")  # 例: models/<ver>/trade_ai_model.pkl
+
+def _parse_gs_uri(uri: str) -> Tuple[str, str]:
+    # "gs://bucket/path/to.obj" -> ("bucket", "path/to.obj")
+    u = ("" if uri is None else str(uri)).strip()
+    if not u.startswith("gs://"):
+        return "", ""
+    parts = u.replace("gs://", "").split("/", 1)
+    bucket = parts[0].strip()
+    obj = parts[1].strip() if len(parts) > 1 else ""
+    return bucket, obj
+
+def _default_train_bucket() -> str:
+    # TRAIN_GCS_BUCKET が無ければ MODEL_GCS_URI の bucket を使う
+    if TRAIN_GCS_BUCKET:
+        return str(TRAIN_GCS_BUCKET).strip()
+    b, _ = _parse_gs_uri(MODEL_GCS_URI)
+    return b
+
+def _build_train_output_uri(version: str) -> str:
+    bucket = _default_train_bucket()
+    if not bucket:
+        return ""
+    v = ("" if version is None else str(version)).strip()
+    if not v:
+        v = datetime.now(JST).strftime("v%Y-%m-%d_%H%M%S")
+    obj = f"{TRAIN_GCS_PREFIX}/{v}/trade_ai_model.pkl"
+    return f"gs://{bucket}/{obj}"
+
+def _sheet_rows_as_df(sheet_name: str, lookback_rows: int) -> pd.DataFrame:
+    """
+    指定シートの末尾 lookback_rows を DataFrame 化（ヘッダーはA1）
+    """
+    service = get_sheet_service()
+
+    headers, _, okh = get_headers_and_len(sheet_name)
+    if STRICT_HEADER_CHECK and not okh:
+        raise RuntimeError(f"header_check_failed: sheet={sheet_name}")
+
+    last_row = _get_row_count_cached(sheet_name)
+    if last_row < 2:
+        return pd.DataFrame(columns=headers)
+
+    start_row = max(2, last_row - int(lookback_rows) + 1)
+    rng = f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}"
+    res = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=rng,
+    ).execute()
+
+    rows = res.get("values", []) or []
+    if not rows:
+        return pd.DataFrame(columns=headers)
+
+    # 行の長さをヘッダーに合わせる
+    padded = []
+    ncol = len(headers)
+    for r in rows:
+        rr = list(r)
+        if len(rr) < ncol:
+            rr = rr + ([""] * (ncol - len(rr)))
+        else:
+            rr = rr[:ncol]
+        padded.append(rr)
+
+    df = pd.DataFrame(padded, columns=headers)
+    return df
+
+def _normalize_winlose(x: Any) -> str:
+    s = ("" if x is None else str(x)).strip().lower()
+    if s in {"win", "w", "1", "true"}:
+        return "Win"
+    if s in {"lose", "l", "0", "false"}:
+        return "Lose"
+    return ""
+
+def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    """
+    learn_log から学習データを作る（最小構成）
+    - y: Win=1 / Lose=0
+    - X: learn_log に実在する列だけで作る（数値＋カテゴリをダミー化）
+    """
+    info: Dict[str, Any] = {"used_num_cols": [], "used_cat_cols": [], "dummies_cols": []}
+
+    if df is None or df.empty:
+        return pd.DataFrame(), np.array([], dtype=int), info
+
+    # Win/Lose を正規化して、Win/Lose がある行だけ使う
+    if "Win/Lose" not in df.columns:
+        return pd.DataFrame(), np.array([], dtype=int), info
+
+    df2 = df.copy()
+    df2["__winlose__"] = df2["Win/Lose"].apply(_normalize_winlose)
+    df2 = df2[df2["__winlose__"].isin(["Win", "Lose"])].copy()
+    if df2.empty:
+        return pd.DataFrame(), np.array([], dtype=int), info
+
+    y = (df2["__winlose__"] == "Win").astype(int).to_numpy()
+
+    # 使う列（learn_log に存在するものだけ採用）
+    num_candidates = [
+        "ScoreSigma", "VolSigma", "BTC_1h_Change", "RSI", "EntryPrice", "TP_Pct", "SL_Pct"
+    ]
+    cat_candidates = [
+        "Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "BTC_Calm", "AI_Pass"
+    ]
+
+    num_cols = [c for c in num_candidates if c in df2.columns]
+    cat_cols = [c for c in cat_candidates if c in df2.columns]
+
+    info["used_num_cols"] = list(num_cols)
+    info["used_cat_cols"] = list(cat_cols)
+
+    X = pd.DataFrame(index=df2.index)
+
+    # 数値
+    for c in num_cols:
+        X[c] = pd.to_numeric(df2[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # カテゴリ（boolっぽい列も文字列化 → dummy）
+    for c in cat_cols:
+        X[c] = df2[c].astype(str).fillna("")
+
+    # ダミー化
+    if cat_cols:
+        X = pd.get_dummies(X, columns=cat_cols, dummy_na=True)
+
+    info["dummies_cols"] = list(X.columns)
+    return X, y, info
+
+def _gcs_upload_from(local_path: str, dst_gs_uri: str) -> bool:
+    b, obj = _parse_gs_uri(dst_gs_uri)
+    if (not b) or (not obj):
+        return False
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(b)
+        blob = bucket.blob(obj)
+        blob.upload_from_filename(local_path)
+        return True
+    except Exception as e:
+        print(f"[TRAIN] GCS upload failed: {e}")
+        return False
+
+def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: bool) -> Dict[str, Any]:
+    """
+    learn_log -> train -> gs://... に保存
+    戻り値は /train のJSONレスポンス用
+    """
+    if not TRAIN_ENABLED:
+        return {"ok": False, "error": "TRAIN_ENABLED=0 (train disabled)", "version": VERSION}
+
+    if not SKLEARN_OK:
+        return {"ok": False, "error": "scikit-learn not available (install scikit-learn).", "version": VERSION}
+
+    df = _sheet_rows_as_df(LEARN_SHEET_NAME, lookback_rows=lookback_rows)
+    X, y, info = _build_training_matrix_from_learn_log(df)
+
+    n = int(len(y))
+    if n < TRAIN_MIN_SAMPLES:
+        return {
+            "ok": False,
+            "error": f"not enough labeled samples: {n} < TRAIN_MIN_SAMPLES={TRAIN_MIN_SAMPLES}",
+            "version": VERSION,
+            "samples": n,
+            "info": info,
+        }
+
+    # 分割（クラスが片寄っている場合は stratify が落ちるので保険）
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=TRAIN_TEST_SIZE, random_state=TRAIN_RANDOM_STATE, stratify=y
+        )
+    except Exception:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=TRAIN_TEST_SIZE, random_state=TRAIN_RANDOM_STATE
+        )
+
+    model = LogisticRegression(max_iter=2000, class_weight="balanced", solver="liblinear")
+    model.fit(X_tr, y_tr)
+
+    # 評価
+    y_pred = model.predict(X_te)
+    acc = float(accuracy_score(y_te, y_pred)) if accuracy_score is not None else None
+
+    # AUC（2クラスになっていないと落ちるので保険）
+    auc = None
+    try:
+        proba = model.predict_proba(X_te)[:, 1]
+        auc = float(roc_auc_score(y_te, proba)) if roc_auc_score is not None else None
+    except Exception:
+        auc = None
+
+    # 保存→GCS
+    ts_ver = out_version.strip() if out_version else datetime.now(JST).strftime("v%Y-%m-%d_%H%M%S")
+    out_uri = _build_train_output_uri(ts_ver)
+    if not out_uri:
+        return {"ok": False, "error": "cannot determine GCS output uri (set TRAIN_GCS_BUCKET or MODEL_GCS_URI)", "version": VERSION}
+
+    tmp_local = f"/tmp/trade_ai_model_{ts_ver}.pkl"
+    try:
+        joblib.dump(model, tmp_local)
+    except Exception as e:
+        return {"ok": False, "error": f"joblib.dump failed: {e}", "version": VERSION}
+
+    ok_up = _gcs_upload_from(tmp_local, out_uri)
+    if not ok_up:
+        return {"ok": False, "error": f"GCS upload failed: {out_uri}", "version": VERSION}
+
+    # 任意：この実行中インスタンスだけ即時反映（次の起動では環境変数に戻る点に注意）
+    reloaded = False
+    if hot_reload:
+        try:
+            ok_dl = _gcs_download_to(out_uri, MODEL_LOCAL_PATH)
+            if ok_dl:
+                m = _load_model_from_path(MODEL_LOCAL_PATH)
+                if m is not None:
+                    global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+                    ai_model = m
+                    AI_MODEL_VERSION_RUNTIME = ts_ver
+                    AI_MODEL_SOURCE_RUNTIME = "gcs(local)"
+                    reloaded = True
+        except Exception as e:
+            print(f"[TRAIN] hot_reload failed: {e}")
+            reloaded = False
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "trained_samples": n,
+        "metrics": {"accuracy": acc, "auc": auc},
+        "info": info,
+        "new_model": {
+            "model_version_suggest": ts_ver,
+            "model_gcs_uri": out_uri,
+            "hot_reloaded_in_this_instance": bool(reloaded),
+        },
+        "next_env_vars": {
+            "MODEL_VERSION": ts_ver,
+            "MODEL_GCS_URI": out_uri,
+        },
+    }
+
+
 def _parse_kv_map(s: str) -> Dict[str, str]:
     """
     "BTC=gs://...;ETH=gs://..." -> {"BTC":"gs://...","ETH":"gs://..."}
@@ -1941,6 +2214,44 @@ def reload_model():
     }), 200
 
 
+@app.route("/train", methods=["GET", "POST"])
+def train_process():
+    """
+    learn_log を使って学習し、GCSへモデルを保存する。
+    Cloud Shell 不要。Cloud Run の「テスト」から叩ける。
+
+    パラメータ:
+      - lookback: learn_log の末尾から読む行数（default TRAIN_LOOKBACK_ROWS）
+      - version: 出力モデルのバージョン名（未指定なら vYYYY-MM-DD_HHMMSS）
+      - hot_reload: 1 なら、このインスタンスだけ即時ロード（次回起動では環境変数に戻る）
+    """
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress)."}), 200
+
+    mutex_token = ""
+    try:
+        ok, msg = preflight_check()
+        if not ok:
+            return jsonify({"ok": False, "error": f"Preflight NG: {msg}"}), 500
+
+        okm, token = acquire_run_mutex()
+        if not okm:
+            return jsonify({"ok": False, "error": "Busy (distributed mutex)."}), 200
+        mutex_token = token
+
+        lookback = int(float(request.args.get("lookback", TRAIN_LOOKBACK_ROWS)))
+        ver = str(request.args.get("version", "")).strip()
+        hot_reload = str(request.args.get("hot_reload", "0")).strip() == "1"
+
+        result = train_and_export_model(lookback_rows=lookback, out_version=ver, hot_reload=hot_reload)
+        code = 200 if bool(result.get("ok")) else 500
+        return jsonify(result), code
+
+    finally:
+        release_run_mutex(mutex_token)
+        _run_lock.release()
+
+
 @app.route("/run", methods=["GET", "POST"])
 def run_process():
     if not _run_lock.acquire(blocking=False):
@@ -1971,6 +2282,7 @@ def run_process():
     finally:
         release_run_mutex(mutex_token)
         _run_lock.release()
+
 
 
 @app.route("/judge", methods=["GET", "POST"])
@@ -2004,4 +2316,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
