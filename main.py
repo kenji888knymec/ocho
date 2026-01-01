@@ -1759,18 +1759,22 @@ def logic_main(force: bool = False):
                 proba, bypassed, dbg = safe_predict_proba(model_for_sym, feats)
 
                 if bypassed:
+                    # feature mismatch / 例外などで安全動作に入った場合は
+                    # 500は防ぐが、誤アラートを防ぐため「AI不合格」に倒す
                     ai_score = None
-                    ai_pass = True
-                    print(f"[AI] bypassed in logic_main sym={sym_code}: {dbg}")
+                    ai_pass = False
+                    print(f"[AI] bypassed -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
                 else:
                     ai_score = float(proba[0][1])
 
                     if not np.isfinite(ai_score):
+                        # スコアが NaN/inf なら安全側に倒して「AI不合格」
                         ai_score = None
-                        ai_pass = True
-                        print(f"[AI] bypassed (non-finite score) in logic_main sym={sym_code}: {dbg}")
+                        ai_pass = False
+                        print(f"[AI] non-finite score -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
                     else:
                         ai_pass = (ai_score >= float(ai_th_used))
+
 
             item = {
                 "symbol": symbol.replace("/USDT", ""),
@@ -2538,3 +2542,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
