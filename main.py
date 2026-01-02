@@ -3,6 +3,7 @@ import time
 import threading
 import hashlib
 import subprocess
+import re
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -50,7 +51,7 @@ SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1XwWkzijIwRlafg2zDgPHQ4tgjYMo
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "table")
 LEARN_SHEET_NAME = os.environ.get("LEARN_SHEET_NAME", "learn_log")
 
-VERSION = "Ver7.1 HeaderPreserve+DefaultCols (Code v3.4.9 Fixed)"
+VERSION = "Ver7.7 ModelReloadFix (Code v3.5.5)"
 
 # --- Thresholds (env configurable) ---
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
@@ -77,6 +78,7 @@ MODEL_CACHE_TTL_SEC = int(float(os.environ.get("MODEL_CACHE_TTL_SEC", "3600")))
 
 ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
 AUTO_JUDGE_AFTER_RUN = os.environ.get("AUTO_JUDGE_AFTER_RUN", "0") == "1"
+FAIL_CLOSED_ON_AI_BYPASS = os.environ.get("FAIL_CLOSED_ON_AI_BYPASS", "1") == "1"
 
 # 60本取れないケースを安定運用で捌くための最低本数（rolling20 + 参照(-6) を考慮）
 MIN_BARS = int(float(os.environ.get("MIN_BARS", "30")))
@@ -136,6 +138,7 @@ print(
     "[CFG] "
     f"CAND_SIGMA={CAND_SIGMA} ALERT_SIGMA={ALERT_SIGMA} AI_TH={AI_TH} DEFAULT_LEV={DEFAULT_LEV} "
     f"ENABLE_JUDGE={ENABLE_JUDGE} AUTO_JUDGE_AFTER_RUN={AUTO_JUDGE_AFTER_RUN} MIN_BARS={MIN_BARS} "
+    f"FAIL_CLOSED_ON_AI_BYPASS={FAIL_CLOSED_ON_AI_BYPASS} "
     f"HEADER_COL_END={HEADER_COL_END} HEADER_LEN_TABLE={HEADER_LEN_TABLE} HEADER_LEN_LEARN={HEADER_LEN_LEARN} "
     f"AUTO_FIX_HEADERS={AUTO_FIX_HEADERS} AUTO_CREATE_SHEETS={AUTO_CREATE_SHEETS} STRICT_HEADER_CHECK={STRICT_HEADER_CHECK} "
     f"DEDUP_LOOKBACK_ROWS={DEDUP_LOOKBACK_ROWS} JUDGE_LOOKBACK_ROWS={JUDGE_LOOKBACK_ROWS} EXCHANGE_TTL_SEC={EXCHANGE_TTL_SEC} "
@@ -1205,23 +1208,57 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     info["dummies_cols"] = list(X.columns)
     return X, y, info
 
-def _gcs_upload_from(local_path: str, dst_gs_uri: str) -> bool:
-    b, obj = _parse_gs_uri(dst_gs_uri)
-    if (not b) or (not obj):
-        return False
-    try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(b)
-        blob = bucket.blob(obj)
-        blob.upload_from_filename(local_path)
-        return True
-    except Exception as e:
-        print(f"[TRAIN] GCS upload failed: {e}")
-        return False
-
-def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: bool) -> Dict[str, Any]:
+# ==========================================
+# GCS Upload (Unified Tuple Return)
+# ==========================================
+def _gcs_upload_from(src_path: str, uri: str) -> Tuple[bool, str]:
     """
-    learn_log -> train -> gs://... に保存
+    src_path のファイルを gs://bucket/path/to.obj にアップロードする。
+    戻り値: (ok, message)
+    """
+    if (not uri) or (not uri.startswith("gs://")):
+        return False, "uri is empty or not gs://"
+    if (not src_path) or (not os.path.exists(src_path)):
+        return False, f"src not found: {src_path}"
+
+    try:
+        parts = uri.replace("gs://", "").split("/", 1)
+        bucket_name = (parts[0] if len(parts) >= 1 else "").strip()
+        blob_name = (parts[1] if len(parts) >= 2 else "").strip()
+
+        if not bucket_name:
+            return False, f"invalid gs uri (bucket missing): {uri}"
+        if not blob_name:
+            return False, f"invalid gs uri (object path missing): {uri}"
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(src_path)
+        return True, "uploaded"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _sanitize_version_tag(tag: str) -> str:
+    """
+    version文字列をファイルパスやGCSパスに安全な形へ整形する。
+    """
+    t = ("" if tag is None else str(tag)).strip()
+    if not t:
+        return ""
+    t = re.sub(r"[^0-9A-Za-z._-]+", "_", t).strip("_")
+    return t[:64] if t else ""
+
+def train_and_export_model(
+    lookback_rows: int,
+    out_version: str,
+    hot_reload: bool,
+    min_samples: int,
+    upload: bool,
+) -> Dict[str, Any]:
+    """
+    learn_log -> train -> (upload=1なら) gs://... に保存
     戻り値は /train のJSONレスポンス用
     """
     if not TRAIN_ENABLED:
@@ -1234,16 +1271,28 @@ def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: boo
     X, y, info = _build_training_matrix_from_learn_log(df)
 
     n = int(len(y))
-    if n < TRAIN_MIN_SAMPLES:
+    need = int(min_samples) if int(min_samples) > 0 else int(TRAIN_MIN_SAMPLES)
+    if n < need:
         return {
             "ok": False,
-            "error": f"not enough labeled samples: {n} < TRAIN_MIN_SAMPLES={TRAIN_MIN_SAMPLES}",
+            "error": f"not enough labeled samples: {n} < min_samples={need}",
             "version": VERSION,
             "samples": n,
             "info": info,
         }
 
-    # 分割（クラスが片寄っている場合は stratify が落ちるので保険）
+    # 1クラスしか無いと学習が必ず落ちるので事前に弾く
+    uniq = np.unique(y)
+    if int(len(uniq)) < 2:
+        return {
+            "ok": False,
+            "error": f"need at least 2 classes in Win/Lose. got classes={uniq.tolist()}",
+            "version": VERSION,
+            "samples": n,
+            "info": info,
+        }
+
+    # 分割（stratifyが落ちる場合は保険）
     try:
         X_tr, X_te, y_tr, y_te = train_test_split(
             X, y, test_size=TRAIN_TEST_SIZE, random_state=TRAIN_RANDOM_STATE, stratify=y
@@ -1260,7 +1309,6 @@ def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: boo
     y_pred = model.predict(X_te)
     acc = float(accuracy_score(y_te, y_pred)) if accuracy_score is not None else None
 
-    # AUC（2クラスになっていないと落ちるので保険）
     auc = None
     try:
         proba = model.predict_proba(X_te)[:, 1]
@@ -1268,40 +1316,41 @@ def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: boo
     except Exception:
         auc = None
 
-    # 保存→GCS
-    ts_ver = out_version.strip() if out_version else datetime.now(JST).strftime("v%Y-%m-%d_%H%M%S")
-    out_uri = _build_train_output_uri(ts_ver)
-    if not out_uri:
-        return {"ok": False, "error": "cannot determine GCS output uri (set TRAIN_GCS_BUCKET or MODEL_GCS_URI)", "version": VERSION}
+    # version名を安全化
+    ts_ver_raw = out_version if out_version else datetime.now(JST).strftime("v%Y%m%d_%H%M%S")
+    ts_ver = _sanitize_version_tag(ts_ver_raw) or datetime.now(JST).strftime("v%Y%m%d_%H%M%S")
 
+    # まずローカルに保存（upload=0でも hot_reload=1の時に使える）
     tmp_local = f"/tmp/trade_ai_model_{ts_ver}.pkl"
     try:
         joblib.dump(model, tmp_local)
     except Exception as e:
         return {"ok": False, "error": f"joblib.dump failed: {e}", "version": VERSION}
 
-    ok_up = _gcs_upload_from(tmp_local, out_uri)
-    if not ok_up:
-        return {"ok": False, "error": f"GCS upload failed: {out_uri}", "version": VERSION}
+    out_uri = ""
+    if upload:
+        out_uri = _build_train_output_uri(ts_ver)
+        if not out_uri:
+            return {"ok": False, "error": "cannot determine GCS output uri (set TRAIN_GCS_BUCKET or MODEL_GCS_URI)", "version": VERSION}
 
-    # 任意：この実行中インスタンスだけ即時反映（次の起動では環境変数に戻る点に注意）
+        ok_up, up_msg = _gcs_upload_from(tmp_local, out_uri)
+        if not ok_up:
+            return {"ok": False, "error": f"GCS upload failed: {out_uri} ({up_msg})", "version": VERSION}
+
+    # 任意：この実行中インスタンスだけ即時反映
     reloaded = False
     if hot_reload:
         try:
-            ok_dl = _gcs_download_to(out_uri, MODEL_LOCAL_PATH)
-            if ok_dl:
-                m = _load_model_from_path(MODEL_LOCAL_PATH)
-                if m is not None:
-                    global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
-                    ai_model = m
-                    AI_MODEL_VERSION_RUNTIME = ts_ver
-                    AI_MODEL_SOURCE_RUNTIME = "gcs(local)"
-                    reloaded = True
+            global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+            ai_model = model
+            AI_MODEL_VERSION_RUNTIME = ts_ver
+            AI_MODEL_SOURCE_RUNTIME = "trained" if upload else "trained(no-upload)"
+            reloaded = True
         except Exception as e:
             print(f"[TRAIN] hot_reload failed: {e}")
             reloaded = False
 
-    return {
+    resp = {
         "ok": True,
         "version": VERSION,
         "trained_samples": n,
@@ -1310,13 +1359,12 @@ def train_and_export_model(lookback_rows: int, out_version: str, hot_reload: boo
         "new_model": {
             "model_version_suggest": ts_ver,
             "model_gcs_uri": out_uri,
+            "uploaded": bool(upload),
             "hot_reloaded_in_this_instance": bool(reloaded),
         },
-        "next_env_vars": {
-            "MODEL_VERSION": ts_ver,
-            "MODEL_GCS_URI": out_uri,
-        },
+        "next_env_vars": ({"MODEL_VERSION": ts_ver, "MODEL_GCS_URI": out_uri} if upload else {}),
     }
+    return resp
 
 
 def _parse_kv_map(s: str) -> Dict[str, str]:
@@ -1340,11 +1388,17 @@ def _parse_kv_map(s: str) -> Dict[str, str]:
 def _gcs_download_to(uri: str, dst_path: str) -> bool:
     if (not uri) or (not uri.startswith("gs://")):
         return False
+
     try:
-        print(f"[AI] Downloading model from {uri} -> {dst_path}")
         parts = uri.replace("gs://", "").split("/", 1)
-        bucket_name = parts[0]
-        blob_name = parts[1]
+        bucket_name = (parts[0] if len(parts) >= 1 else "").strip()
+        blob_name = (parts[1] if len(parts) >= 2 else "").strip()
+
+        if not bucket_name or not blob_name:
+            print(f"[AI] invalid gs uri (need gs://bucket/object): {uri}")
+            return False
+
+        print(f"[AI] Downloading model from {uri} -> {dst_path}")
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
@@ -1355,27 +1409,6 @@ def _gcs_download_to(uri: str, dst_path: str) -> bool:
         print(f"[AI] GCS Download failed: {e}")
         return False
 
-def _gcs_upload_from(src_path: str, uri: str) -> Tuple[bool, str]:
-    """
-    src_path のファイルを gs://... にアップロードする。
-    戻り値: (ok, message)
-    """
-    if (not uri) or (not uri.startswith("gs://")):
-        return False, "uri is empty or not gs://"
-    if (not src_path) or (not os.path.exists(src_path)):
-        return False, f"src not found: {src_path}"
-
-    try:
-        parts = uri.replace("gs://", "").split("/", 1)
-        bucket_name = parts[0]
-        blob_name = parts[1]
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.upload_from_filename(src_path)
-        return True, "uploaded"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
 
 def _load_model_from_path(path: str):
     try:
@@ -1386,16 +1419,32 @@ def _load_model_from_path(path: str):
 
 def reload_default_model() -> bool:
     """
-    既定モデル(ai_model)を MODEL_GCS_URI / trade_ai_model.pkl から再ロードする。
-    失敗しても例外で落とさず、ai_model=None にして bypass させる。
+    既定モデル(ai_model)を再ロードする。
+    優先順位:
+      1) MODEL_GCS_URI(gs://...) があれば毎回それを優先してダウンロード→ロード
+      2) だめならローカル MODEL_LOCAL_PATH をロード
+      3) だめなら ai_model=None として bypass（safe_predict_proba で 500 回避）
     """
     global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME, _model_cache
 
+    # 銘柄別モデルキャッシュはリロード時にクリア
     _model_cache = {}
 
-    if (not os.path.exists(MODEL_LOCAL_PATH)) and MODEL_GCS_URI.startswith("gs://"):
-        _gcs_download_to(MODEL_GCS_URI, MODEL_LOCAL_PATH)
+    # 1) GCS から（URIが変わったときに確実に反映されるよう、URIごとの tmp パスに保存）
+    if MODEL_GCS_URI.startswith("gs://"):
+        tmp_path = _safe_tmp_path_for_uri(MODEL_GCS_URI)
+        ok_dl = _gcs_download_to(MODEL_GCS_URI, tmp_path)
 
+        if ok_dl and os.path.exists(tmp_path):
+            m = _load_model_from_path(tmp_path)
+            if m is not None:
+                ai_model = m
+                AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
+                AI_MODEL_SOURCE_RUNTIME = "gcs"
+                print(f"[AI] Model Loaded Successfully uri={MODEL_GCS_URI} path={tmp_path} ver={AI_MODEL_VERSION_RUNTIME}")
+                return True
+
+    # 2) ローカル fallback
     if os.path.exists(MODEL_LOCAL_PATH):
         m = _load_model_from_path(MODEL_LOCAL_PATH)
         if m is not None:
@@ -1405,7 +1454,8 @@ def reload_default_model() -> bool:
             print(f"[AI] Model Loaded Successfully path={MODEL_LOCAL_PATH} ver={AI_MODEL_VERSION_RUNTIME}")
             return True
 
-    print("[AI] trade_ai_model.pkl not found or load failed -> AI gate is bypassed (ai_pass=True).")
+    # 3) 失敗 → AI ゲートは bypass（ただし FAIL_CLOSED_ON_AI_BYPASS によって挙動は変わる）
+    print("[AI] model load failed -> AI gate is bypassed (ai_model=None).")
     ai_model = None
     AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
     AI_MODEL_SOURCE_RUNTIME = "none"
@@ -1593,7 +1643,6 @@ def get_ai_model_for_symbol(symbol_code: str):
     print(f"[AI] Multi-model loaded sym={sym} uri={uri} ver={ver}")
     return m, ver, "gcs"
 
-reload_default_model()
 
 # ==========================================
 # ★起動時に「必要シート/ヘッダー」を自己修復
@@ -1731,7 +1780,6 @@ def logic_main(force: bool = False):
                 continue
 
             ai_score = None
-            ai_pass = True if ai_model is None else False
 
             # 動的AI_TH（デフォルトOFF）
             ai_th_used = AI_TH
@@ -1744,37 +1792,44 @@ def logic_main(force: bool = False):
             if ENABLE_MULTI_MODEL:
                 model_for_sym, _ver, _src = get_ai_model_for_symbol(sym_code)
 
-            if model_for_sym is not None:
-                feats = pd.DataFrame([{
-                    "Sigma": float(row["Dynamic_Sigma"]),
-                    "BandWidth": float(row["BandWidth"]),
-                    "BW_Change": float(row["BW_Change"]),
-                    "RSI": float(row["RSI"]),
-                    "Vol_Change": float(row["Vol_Change"]),
-                    "Rise_Score": float(row["Rise_Score"]),
-                    "Drop_Score": float(row["Drop_Score"]),
-                    "BTC_Ret": float(btc_ret),
-                    "BTC_Vol": float(btc_vol),
-                }])
+            # ★モデルが None の場合も safe_predict_proba に通して bypass 判定させる
+            feats = pd.DataFrame([{
+                "Sigma": float(row["Dynamic_Sigma"]),
+                "BandWidth": float(row["BandWidth"]),
+                "BW_Change": float(row["BW_Change"]),
+                "RSI": float(row["RSI"]),
+                "Vol_Change": float(row["Vol_Change"]),
+                "Rise_Score": float(row["Rise_Score"]),
+                "Drop_Score": float(row["Drop_Score"]),
+                "BTC_Ret": float(btc_ret),
+                "BTC_Vol": float(btc_vol),
+            }])
 
-                proba, bypassed, dbg = safe_predict_proba(model_for_sym, feats)
+            proba, bypassed, dbg = safe_predict_proba(model_for_sym, feats)
 
-                if bypassed:
-                    # feature mismatch / 例外などで安全動作に入った場合は
-                    # 500は防ぐが、誤アラートを防ぐため「AI不合格」に倒す
-                    ai_score = None
+            if bypassed:
+                # model None / feature mismatch / 例外でも 500 を防ぐ
+                ai_score = None
+                if FAIL_CLOSED_ON_AI_BYPASS:
                     ai_pass = False
                     print(f"[AI] bypassed -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
                 else:
-                    ai_score = float(proba[0][1])
+                    ai_pass = True
+                    print(f"[AI] bypassed -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
+            else:
+                ai_score = float(proba[0][1])
 
-                    if not np.isfinite(ai_score):
-                        # スコアが NaN/inf なら安全側に倒して「AI不合格」
-                        ai_score = None
+                if not np.isfinite(ai_score):
+                    ai_score = None
+                    if FAIL_CLOSED_ON_AI_BYPASS:
                         ai_pass = False
                         print(f"[AI] non-finite score -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
                     else:
-                        ai_pass = (ai_score >= float(ai_th_used))
+                        ai_pass = True
+                        print(f"[AI] non-finite score -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
+                else:
+                    ai_pass = (ai_score >= float(ai_th_used))
+
 
 
             item = {
@@ -2200,6 +2255,7 @@ def judge_main():
 # /preflight（4点のうち「権限不足」を即判定して返す）
 # ==========================================
 def preflight_check() -> Tuple[bool, str]:
+    global ai_model
     try:
         # metadata read
         _ = _get_sheets_meta()
@@ -2209,6 +2265,10 @@ def preflight_check() -> Tuple[bool, str]:
         if not ok:
             return False, f"self_heal_ng: {msg}"
 
+        # lazy model load (avoid heavy cold start)
+        if ai_model is None:
+            reload_default_model()
+
         # write test to lock cell (and revert)
         if RUN_MUTEX_ENABLED:
             cur = _mutex_read()
@@ -2216,12 +2276,13 @@ def preflight_check() -> Tuple[bool, str]:
             time.sleep(0.1)
             _mutex_write(cur)
 
-        return True, "ok"
+        return True, f"ok model_loaded={ai_model is not None} source={AI_MODEL_SOURCE_RUNTIME}"
     except HttpError as e:
         # ここで 403 が出るなら共有権限不足
         return False, f"google_api_http_error: {str(e)}"
     except Exception as e:
         return False, f"preflight_error: {e}"
+
 
 # ==========================================
 # ルーティング
@@ -2412,21 +2473,25 @@ def train_process():
 
     # 同時実行ガード（run/judge/train）
     if not _run_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress)."}), 200
+        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress).", "version": VERSION}), 200
 
     mutex_token = ""
     try:
         ok, msg = preflight_check()
         if not ok:
-            return jsonify({"ok": False, "error": f"Preflight NG: {msg}", "version": VERSION}), 500
+            err = f"Preflight NG: {msg}"
+            print(f"[WARN] /train {err}")
+            send_discord_message(f"[WARN] /train {err}")
+            # Scheduler を失敗扱いにしないため 200
+            return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
         okm, token = acquire_run_mutex()
         if not okm:
-            return jsonify({"ok": False, "error": "Busy (distributed mutex)."}), 200
+            return jsonify({"ok": False, "error": "Busy (distributed mutex).", "version": VERSION}), 200
         mutex_token = token
 
         lookback = int(float(request.args.get("lookback", "2500")))
-        min_samples = int(float(request.args.get("min_samples", "60")))
+        min_samples = int(float(request.args.get("min_samples", str(TRAIN_MIN_SAMPLES))))
         hot_reload = str(request.args.get("hot_reload", "1")).strip() == "1"
         upload = str(request.args.get("upload", "1")).strip() == "1"
 
@@ -2434,61 +2499,29 @@ def train_process():
         if not ver:
             ver = datetime.now(JST).strftime("v%Y%m%d_%H%M%S")
 
-        # 保存先（ENVで差し替え可能）
-        gcs_prefix = os.environ.get("TRAIN_GCS_PREFIX", "gs://crypto-alert-models-8888/models").rstrip("/")
-        gcs_uri = f"{gcs_prefix}/{ver}/trade_ai_model.pkl"
-
         t0 = time.time()
 
-        # 学習
-        model, metrics = _train_model_from_learn_log(lookback_rows=lookback, min_samples=min_samples)
-
-        # ローカル保存（/tmp）
-        tmp_path = f"/tmp/trade_ai_model_{ver}.pkl"
-        joblib.dump(model, tmp_path)
-
-        # GCSアップロード（任意）
-        upload_ok = False
-        upload_msg = ""
-        if upload:
-            upload_ok, upload_msg = _gcs_upload_from(tmp_path, gcs_uri)
-
-        # hot reload（任意）
-        if hot_reload:
-            ai_model = model
-            AI_MODEL_VERSION_RUNTIME = ver
-            AI_MODEL_SOURCE_RUNTIME = "trained_local"
-            try:
-                joblib.dump(model, MODEL_LOCAL_PATH)
-            except Exception as e:
-                print(f"[TRAIN] dump to MODEL_LOCAL_PATH failed: {e}")
+        # 学習→（必要なら）GCS保存→（必要なら）このインスタンスに即反映
+        result = train_and_export_model(
+            lookback_rows=lookback,
+            out_version=ver,
+            hot_reload=hot_reload,
+            min_samples=min_samples,
+            upload=upload,
+        )
 
         elapsed = time.time() - t0
 
-        return jsonify({
-            "ok": True,
-            "version": VERSION,
-            "trained_model_version": ver,
-            "hot_reload": bool(hot_reload),
-            "model_loaded_now": (ai_model is not None),
-            "runtime_model_version": str(AI_MODEL_VERSION_RUNTIME),
-            "runtime_model_source": str(AI_MODEL_SOURCE_RUNTIME),
-            "gcs": {
-                "upload_requested": bool(upload),
-                "uri": gcs_uri,
-                "upload_ok": bool(upload_ok),
-                "upload_msg": str(upload_msg),
-            },
-            "metrics": metrics,
-            "elapsed_sec": float(elapsed),
-        }), 200
+        result["elapsed_sec"] = float(elapsed)
+        result["upload_requested"] = bool(upload)
+        return jsonify(result), 200
 
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "version": VERSION,
-        }), 500
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /train exception: {err}")
+        send_discord_message(f"[ERR] /train crashed: {err}")
+        # Scheduler を失敗扱いにしないため 200
+        return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
     finally:
         release_run_mutex(mutex_token)
@@ -2503,7 +2536,11 @@ def run_process():
     try:
         ok, msg = preflight_check()
         if not ok:
-            return f"Preflight NG: {msg}", 500
+            err = f"Preflight NG: {msg}"
+            print(f"[WARN] /run {err}")
+            send_discord_message(f"[WARN] /run {err}")
+            # Scheduler を失敗扱いにしないため 200
+            return f"NG: {err}", 200
 
         okm, token = acquire_run_mutex()
         if not okm:
@@ -2511,12 +2548,25 @@ def run_process():
         mutex_token = token
 
         force = str(request.args.get("force", "0")).strip() == "1"
-        res_run = str(logic_main(force=force))
+
+        try:
+            res_run = str(logic_main(force=force))
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"[ERR] /run crashed: {err}")
+            send_discord_message(f"[ERR] /run crashed: {err}")
+            return f"ERR: {err}", 200
 
         if AUTO_JUDGE_AFTER_RUN:
             if not ENABLE_JUDGE:
                 return res_run + " / Judge disabled", 200
-            res_j = str(judge_main())
+            try:
+                res_j = str(judge_main())
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                print(f"[ERR] auto-judge crashed: {err}")
+                send_discord_message(f"[ERR] auto-judge crashed: {err}")
+                return res_run + f" / Judge ERR: {err}", 200
             return res_run + " / " + res_j, 200
 
         return res_run, 200
@@ -2539,14 +2589,24 @@ def judge_process():
     try:
         ok, msg = preflight_check()
         if not ok:
-            return f"Preflight NG: {msg}", 500
+            err = f"Preflight NG: {msg}"
+            print(f"[WARN] /judge {err}")
+            send_discord_message(f"[WARN] /judge {err}")
+            # Scheduler を失敗扱いにしないため 200
+            return f"NG: {err}", 200
 
         okm, token = acquire_run_mutex()
         if not okm:
             return "Busy (distributed mutex).", 200
         mutex_token = token
 
-        return str(judge_main()), 200
+        try:
+            return str(judge_main()), 200
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"[ERR] /judge crashed: {err}")
+            send_discord_message(f"[ERR] /judge crashed: {err}")
+            return f"ERR: {err}", 200
 
     finally:
         release_run_mutex(mutex_token)
