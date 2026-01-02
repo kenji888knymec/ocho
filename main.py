@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import hashlib
+import subprocess
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -38,6 +39,78 @@ except Exception as _e:
 # Flask設定（Buildpacks標準：main.py の app を起動）
 # ==========================================
 app = Flask(__name__)
+# ==========================================
+# 追加: 現在のルート一覧（確認を1回で終わらせる）
+# ==========================================
+@app.route("/routes", methods=["GET"])
+def routes():
+    items = []
+    for rule in app.url_map.iter_rules():
+        methods = sorted([m for m in rule.methods if m in {"GET", "POST", "PUT", "DELETE", "PATCH"}])
+        items.append({"path": rule.rule, "methods": methods, "endpoint": rule.endpoint})
+    items.sort(key=lambda x: x["path"])
+    return jsonify({"ok": True, "routes": items})
+
+# ==========================================
+# 追加: /train（Schedulerが叩く学習URL）
+# ==========================================
+@app.route("/train", methods=["GET"])
+def train():
+    lookback = int(request.args.get("lookback", "2500"))
+    min_samples = int(request.args.get("min_samples", "60"))
+    hot_reload = int(request.args.get("hot_reload", "0"))
+    upload = int(request.args.get("upload", "1"))
+
+    cmd = [
+        "python", "-u", "train_ai_model.py",
+        f"--lookback={lookback}",
+        f"--min_samples={min_samples}",
+        f"--hot_reload={hot_reload}",
+        f"--upload={upload}",
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1100
+        )
+    except FileNotFoundError:
+        return jsonify({
+            "ok": False,
+            "error": "train_ai_model.py not found in container. Put it in the repo or change cmd to correct script name."
+        }), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "ok": False,
+            "error": "training timed out (subprocess timeout)."
+        }), 504
+
+    stdout_tail = (proc.stdout or "")[-4000:]
+    stderr_tail = (proc.stderr or "")[-4000:]
+
+    if proc.returncode != 0:
+        return jsonify({
+            "ok": False,
+            "returncode": proc.returncode,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        }), 500
+
+    return jsonify({
+        "ok": True,
+        "returncode": proc.returncode,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "params": {
+            "lookback": lookback,
+            "min_samples": min_samples,
+            "hot_reload": hot_reload,
+            "upload": upload,
+        }
+    })
+
 
 # ==========================================
 # 設定エリア（環境変数）
@@ -2557,5 +2630,6 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
