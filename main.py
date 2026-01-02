@@ -2225,9 +2225,24 @@ def preflight_check() -> Tuple[bool, str]:
 # ==========================================
 # ルーティング
 # ==========================================
+@app.route("/routes", methods=["GET"])
+def routes():
+    # 今このインスタンスに登録されているルートを一覧で返す（原因切り分け用）
+    rules = []
+    for r in app.url_map.iter_rules():
+        rules.append({
+            "rule": str(r),
+            "methods": sorted([m for m in r.methods if m not in {"HEAD", "OPTIONS"}]),
+            "endpoint": str(r.endpoint),
+        })
+    rules = sorted(rules, key=lambda x: x["rule"])
+    return jsonify({"ok": True, "version": VERSION, "routes": rules}), 200
+
+
 @app.route("/", methods=["GET"])
 def home():
     return f"{VERSION} is Active", 200
+
 
 
 @app.route("/healthz", methods=["GET"])
@@ -2542,4 +2557,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
