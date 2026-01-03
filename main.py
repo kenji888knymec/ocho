@@ -80,10 +80,18 @@ if not _route_exists("/train_ping", "GET"):
 # （変更箇所：ここに以前あった train_endpoint は削除しました）
 
 # ==========================================
+# ==========================================
 # 設定エリア（環境変数）
 # ==========================================
 discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
 print(f"[CFG] DISCORD_WEBHOOK_URL_LEN={len(discord_webhook_url)}")
+
+# Hyperliquid: 最大5倍銘柄（この銘柄だけ HL 表示を x5 にする）
+HL_MAX5_SYMBOLS = {"STX", "XLM", "FET", "HBAR", "POL"}
+
+# Hyperliquid: 通常銘柄の表示レバ（基本10倍）
+HL_DEFAULT_LEVERAGE = 10.0
+
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1XwWkzijIwRlafg2zDgPHQ4tgjYModapFI3T_wbYS9_8")
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "table")
@@ -2039,6 +2047,16 @@ def logic_main(force: bool = False):
 
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
 
+        # --- Hyperliquid入力用の%（レバ反映）を計算 ---
+        # sym が "STX/USDT" や "STX-USDT" のようでも判定できるようにベース銘柄に正規化
+        sym_base = str(sym).split("/")[0].split("-")[0].strip().upper()
+
+        hl_lev = 5.0 if sym_base in HL_MAX5_SYMBOLS else float(HL_DEFAULT_LEVERAGE)
+
+        # tp_pct / sl_pct は「0.58」のように“%表記の数値”前提（あなたの既存表示に合わせる）
+        hl_tp_pct = float(tp_pct) * hl_lev
+        hl_sl_pct = float(sl_pct) * hl_lev
+
         msg = (
             f"{icon} **{d_str}** {icon}\n"
             f"{VERSION}\n"
@@ -2046,9 +2064,10 @@ def logic_main(force: bool = False):
             f"📈 Score:{item['score']:.2f}σ  AI:{ai_disp}\n"
             f"🟦 BTC:{btc_mode} 1h:{btc_1h_change:.2%}  Calm:{BTC_CALM}  BTC_OK:{btc_ok}\n"
             f"💰 {cp:.4f}\n"
-            f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%)\n"
-            f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%)"
+            f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%) HL:{hl_tp_pct:.1f}%\n"
+            f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%"
         )
+
         send_discord_message(msg)
         count += 1
 
@@ -2686,4 +2705,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
