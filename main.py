@@ -1194,57 +1194,87 @@ def _normalize_winlose(x: Any) -> str:
 
 def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
-    learn_log から学習データを作る（最小構成）
+    learn_log から学習データを作る（推論側の9特徴量に揃える版）
     - y: Win=1 / Lose=0
-    - X: learn_log に実在する列だけで作る（数値＋カテゴリをダミー化）
+    - X columns (logic_main と同一):
+        Sigma, BandWidth, BW_Change, RSI, Vol_Change, Rise_Score, Drop_Score, BTC_Ret, BTC_Vol
+
+    注意:
+    - learn_log に BandWidth/BW_Change/Vol_Change/BTC_Ret の元データが無いので、現時点では 0.0 固定（暫定）
+    - Side と ScoreSigma から Rise_Score/Drop_Score を作る
+    - BTC_1h_Change から BTC_Vol を作る（既存の簡易実装と整合）
     """
-    info: Dict[str, Any] = {"used_num_cols": [], "used_cat_cols": [], "dummies_cols": []}
+    info: Dict[str, Any] = {
+        "mode": "aligned_to_inference_9_features",
+        "required_cols": ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"],
+        "missing_cols": [],
+        "rows_total": 0,
+        "rows_labeled": 0,
+        "rows_used": 0,
+        "feature_columns": ["Sigma", "BandWidth", "BW_Change", "RSI", "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol"],
+        "notes": [
+            "BandWidth/BW_Change/Vol_Change/BTC_Ret are set to 0.0 (learn_log has no raw inputs).",
+            "Rise_Score/Drop_Score derived from ScoreSigma + Side.",
+            "BTC_Vol derived from abs(BTC_1h_Change)/4.0.",
+        ],
+    }
 
     if df is None or df.empty:
-        return pd.DataFrame(), np.array([], dtype=int), info
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
-    # Win/Lose を正規化して、Win/Lose がある行だけ使う
-    if "Win/Lose" not in df.columns:
-        return pd.DataFrame(), np.array([], dtype=int), info
+    info["rows_total"] = int(len(df))
+
+    # 必須列チェック
+    needed = ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
+    missing = [c for c in needed if c not in df.columns]
+    info["missing_cols"] = list(missing)
+    if missing:
+        # ここで空を返すことで /train 側が not enough labeled samples などで安全に落ちる
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
     df2 = df.copy()
+
+    # Win/Lose を正規化してラベル行だけ残す
     df2["__winlose__"] = df2["Win/Lose"].apply(_normalize_winlose)
     df2 = df2[df2["__winlose__"].isin(["Win", "Lose"])].copy()
+    info["rows_labeled"] = int(len(df2))
     if df2.empty:
-        return pd.DataFrame(), np.array([], dtype=int), info
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
     y = (df2["__winlose__"] == "Win").astype(int).to_numpy()
 
-    # 使う列（learn_log に存在するものだけ採用）
-    num_candidates = [
-        "ScoreSigma", "VolSigma", "BTC_1h_Change", "RSI", "EntryPrice", "TP_Pct", "SL_Pct"
-    ]
-    cat_candidates = [
-        "Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "BTC_Calm", "AI_Pass"
-    ]
+    # 数値化
+    score = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    sigma = pd.to_numeric(df2["VolSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    rsi = pd.to_numeric(df2["RSI"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(50.0)
+    btc1h = pd.to_numeric(df2["BTC_1h_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    num_cols = [c for c in num_candidates if c in df2.columns]
-    cat_cols = [c for c in cat_candidates if c in df2.columns]
+    side = df2["Side"].astype(str).fillna("").str.upper()
+    
+    # Rise/Drop は Side で振り分け（LONG/SHORT だけでなく BUY/SELL も吸収）
+    is_long = side.str.contains("LONG") | side.str.contains("BUY")
+    is_short = side.str.contains("SHORT") | side.str.contains("SELL")
+    
+    rise_score = np.where(is_long, score, 0.0)
+    drop_score = np.where(is_short, score, 0.0)
 
-    info["used_num_cols"] = list(num_cols)
-    info["used_cat_cols"] = list(cat_cols)
 
-    X = pd.DataFrame(index=df2.index)
+    # 推論側の9特徴量へ揃える（learn_log に無いものは暫定0）
+    X = pd.DataFrame({
+        "Sigma": sigma.astype(float),
+        "BandWidth": 0.0,
+        "BW_Change": 0.0,
+        "RSI": rsi.astype(float),
+        "Vol_Change": 0.0,
+        "Rise_Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
+        "Drop_Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
+        "BTC_Ret": 0.0,
+        "BTC_Vol": (btc1h.abs() / 4.0).astype(float),
+    }, index=df2.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # 数値
-    for c in num_cols:
-        X[c] = pd.to_numeric(df2[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # カテゴリ（boolっぽい列も文字列化 → dummy）
-    for c in cat_cols:
-        X[c] = df2[c].astype(str).fillna("")
-
-    # ダミー化
-    if cat_cols:
-        X = pd.get_dummies(X, columns=cat_cols, dummy_na=True)
-
-    info["dummies_cols"] = list(X.columns)
+    info["rows_used"] = int(len(X))
     return X, y, info
+
 
 # ==========================================
 # GCS Upload (Unified Tuple Return)
@@ -2656,3 +2686,4 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
