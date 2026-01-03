@@ -42,56 +42,42 @@ except Exception as _e:
 app = Flask(__name__)
 app.url_map.strict_slashes = False  # /train と /train/ を両方受ける
 
-# ==========================================
-# /train（手動学習トリガー）
-# - まず 404 を潰すためのエンドポイントを用意
-# - 学習処理（実処理）は後でこの中に足していけます
-# ==========================================
-TRAIN_LOCK = threading.Lock()
+# --- ここから追記（診断用：必ず app 定義の直後） ---
+def _route_exists(path: str, method: str = "GET") -> bool:
+    m = method.upper()
+    for rule in app.url_map.iter_rules():
+        if rule.rule == path and m in (rule.methods or set()):
+            return True
+    return False
 
-@app.route("/train", methods=["GET"])
-def train_endpoint():
-    """
-    例:
-      /train?lookback=2500&min_samples=60&hot_reload=0&upload=1
-    """
-    # クエリ取得（型変換は安全に）
-    def _to_int(name: str, default: int) -> int:
-        v = request.args.get(name, str(default))
-        try:
-            return int(v)
-        except Exception:
-            return default
+# 現在このリビジョンで生きているルート一覧（診断用）
+if not _route_exists("/__routes", "GET"):
+    @app.get("/__routes")
+    def __routes():
+        rules = []
+        for r in app.url_map.iter_rules():
+            methods = sorted([m for m in (r.methods or set()) if m not in ("HEAD", "OPTIONS")])
+            rules.append({"rule": r.rule, "methods": methods, "endpoint": r.endpoint})
+        rules.sort(key=lambda x: x["rule"])
+        return jsonify({
+            "k_service": os.environ.get("K_SERVICE", ""),
+            "k_revision": os.environ.get("K_REVISION", ""),
+            "routes": rules,
+        })
 
-    lookback = _to_int("lookback", 2500)
-    min_samples = _to_int("min_samples", 60)
-    hot_reload = _to_int("hot_reload", 0)
-    upload = _to_int("upload", 0)
+# 診断用：/train の代わりに /train_ping を用意（/train と衝突させない）
+if not _route_exists("/train_ping", "GET"):
+    @app.get("/train_ping")
+    def train_ping():
+        return jsonify({
+            "ok": True,
+            "msg": "/train_ping is alive",
+            "k_service": os.environ.get("K_SERVICE", ""),
+            "k_revision": os.environ.get("K_REVISION", ""),
+        }), 200
+# --- ここまで追記 ---
 
-    # 多重実行防止（学習が重い想定）
-    if not TRAIN_LOCK.acquire(blocking=False):
-        return jsonify(ok=False, error="train is already running"), 429
-
-    started = time.time()
-    try:
-        # ここで「学習処理」を呼び出す設計にしていく
-        # いまは 404 解消のため、生存確認レスポンスを返す（= Scheduler を赤くしない）
-        # 学習関数が既にある場合は、名前を合わせてここで呼べます。
-        return jsonify(
-            ok=True,
-            msg="/train endpoint is alive (no training logic wired yet)",
-            params={
-                "lookback": lookback,
-                "min_samples": min_samples,
-                "hot_reload": hot_reload,
-                "upload": upload,
-            },
-            elapsed_sec=round(time.time() - started, 3),
-            revision=os.environ.get("K_REVISION", ""),
-            version=os.environ.get("MODEL_VERSION", os.environ.get("VERSION", "")),
-        ), 200
-    finally:
-        TRAIN_LOCK.release()
+# （変更箇所：ここに以前あった train_endpoint は削除しました）
 
 # ==========================================
 # 設定エリア（環境変数）
@@ -2670,4 +2656,3 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
