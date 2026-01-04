@@ -105,9 +105,17 @@ ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
 
+# "5倍までしか掛けられない銘柄" を環境変数で指定（例: "BTC,ETH,SOL"）
+MAX_LEV_5X_SYMBOLS = {
+    s.strip().upper()
+    for s in os.environ.get("MAX_LEV_5X_SYMBOLS", "").split(",")
+    if s.strip()
+}
+
 # --- Advanced toggles (SAFE DEFAULT: OFF) ---
 ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
 E_TH = float(os.environ.get("E_TH", "0.0"))
+
 
 DYNAMIC_AI_TH = os.environ.get("DYNAMIC_AI_TH", "0") == "1"
 AI_TH_MIN = float(os.environ.get("AI_TH_MIN", "0.45"))
@@ -2037,26 +2045,27 @@ def logic_main(force: bool = False):
 
         cp = float(item["close"])
         lev = DEFAULT_LEV
-
+        
         if item["is_buy"]:
             icon = "🚀"
             d_str = "買い(LONG)"
         else:
             icon = "☄️"
             d_str = "売り(SHORT)"
-
+        
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
-
+        
         # --- Hyperliquid入力用の%（レバ反映）を計算 ---
         # sym が "STX/USDT" や "STX-USDT" のようでも判定できるようにベース銘柄に正規化
         sym_base = str(sym).split("/")[0].split("-")[0].strip().upper()
-
-        hl_lev = 5.0 if sym_base in HL_MAX5_SYMBOLS else float(HL_DEFAULT_LEVERAGE)
-
+        
+        # 5倍銘柄は 5、それ以外は DEFAULT_LEV（通常10）
+        hl_lev = 5.0 if sym_base in MAX_LEV_5X_SYMBOLS else float(DEFAULT_LEV)
+        
         # tp_pct / sl_pct は「0.58」のように“%表記の数値”前提（あなたの既存表示に合わせる）
         hl_tp_pct = float(tp_pct) * hl_lev
         hl_sl_pct = float(sl_pct) * hl_lev
-
+        
         msg = (
             f"{icon} **{d_str}** {icon}\n"
             f"{VERSION}\n"
@@ -2067,9 +2076,10 @@ def logic_main(force: bool = False):
             f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%) HL:{hl_tp_pct:.1f}%\n"
             f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%"
         )
-
+        
         send_discord_message(msg)
         count += 1
+
 
         parts = [
             f"{item['type']}",
@@ -2705,5 +2715,6 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
