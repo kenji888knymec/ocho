@@ -1866,76 +1866,90 @@ def logic_main(force: bool = False):
             # ==========================================================
             # AIで「順張り/逆張り（LONG/SHORT）」を選ぶ（最小変更・泥沼回避）
             # - base_side: 現行ロジックが出した side
-            # - flip_side: 反対 side（Rise_Score と Drop_Score を入替えて採点）
+            # - flip_side: 反対 side
             # - 勝てそうな方（Win確率が高い方）を採用
             # - AIがbypassしたら従来通り（fail-open/closedに従う）
             # ==========================================================
             ai_score = None
 
-            # 動的AI_TH（デフォルトOFF）
+            # 動的AI_TH（既存仕様）
             ai_th_used = AI_TH
             if DYNAMIC_AI_TH:
                 ai_th_used = compute_dynamic_ai_th(AI_TH, btc_mode, median_sigma, btc_ok, BTC_CALM)
 
-            # 銘柄別モデル（デフォルトOFF）
+            # 銘柄別モデル（既存仕様）
             model_for_sym = ai_model
             sym_code = symbol.replace("/USDT", "")
             if ENABLE_MULTI_MODEL:
                 model_for_sym, _ver, _src = get_ai_model_for_symbol(sym_code)
 
-            # AIでside選択を有効化（必要なら env でOFFにできる）
+            # AIでside選択を有効化（envでOFF可）
             AI_SIDE_SELECT = (os.environ.get("AI_SIDE_SELECT", "1").strip() == "1")
 
             base_side = "LONG" if is_buy else "SHORT"
-            base_allowed = True  # ここまで来た時点で base は許可済み
             flip_side = "SHORT" if base_side == "LONG" else "LONG"
             flip_allowed = (ALLOW_SHORT if flip_side == "SHORT" else ALLOW_LONG)
 
-            # base側 feature
-            feats_base = pd.DataFrame([{
-                "Sigma": float(row["Dynamic_Sigma"]),
-                "BandWidth": float(row["BandWidth"]),
-                "BW_Change": float(row["BW_Change"]),
-                "RSI": float(row["RSI"]),
-                "Vol_Change": float(row["Vol_Change"]),
-                "Rise_Score": float(row["Rise_Score"]),
-                "Drop_Score": float(row["Drop_Score"]),
-                "BTC_Ret": float(btc_ret),
-                "BTC_Vol": float(btc_vol),
-            }])
+            # 学習側と整合：Sideに応じて Rise/Drop のどちらか一方だけに寄せる
+            sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
-            # flip側 feature（Rise_Score と Drop_Score を入れ替えるだけ）
-            feats_flip = feats_base.copy()
-            try:
-                rs = float(feats_base.at[0, "Rise_Score"])
-                ds = float(feats_base.at[0, "Drop_Score"])
-                feats_flip.at[0, "Rise_Score"] = ds
-                feats_flip.at[0, "Drop_Score"] = rs
-            except Exception:
-                # ここで落ちないように保険（safe_predict_proba が最終ガード）
-                pass
+            def _make_feats(side: str) -> pd.DataFrame:
+                rise = sig_score if side == "LONG" else 0.0
+                drop = sig_score if side == "SHORT" else 0.0
+                return pd.DataFrame([{
+                    "Sigma": float(row["Dynamic_Sigma"]),
+                    "BandWidth": float(row["BandWidth"]),
+                    "BW_Change": float(row["BW_Change"]),
+                    "RSI": float(row["RSI"]),
+                    "Vol_Change": float(row["Vol_Change"]),
+                    "Rise_Score": float(rise),
+                    "Drop_Score": float(drop),
+                    "BTC_Ret": float(btc_ret),
+                    "BTC_Vol": float(btc_vol),
+                }])
 
-            # まず base を採点
-            proba_b, bypass_b, dbg_b = safe_predict_proba(model_for_sym, feats_base)
-            score_b = None if bypass_b else float(proba_b[0][1]) if (proba_b is not None and len(proba_b) > 0) else None
+            def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
+                proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
+                if bypass_x:
+                    return None, True, (dbg_x or {})
+                try:
+                    s = float(proba_x[0][1])
+                except Exception:
+                    return None, True, {"error": "proba_parse_failed"}
+                if not np.isfinite(s):
+                    return None, True, {"error": "non_finite_score"}
+                return float(s), False, (dbg_x or {})
 
-            # flip の採点（許可されている & 有効設定の時だけ）
-            bypass_f = True
-            dbg_f = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
+            # base 採点
+            score_b, bypass_b, dbg_b = _score_side(base_side)
+
+            # flip 採点（許可 & 有効のときだけ）
             score_f = None
-            proba_f = None
-
+            bypass_f = True
+            dbg_f: Dict[str, Any] = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
             if AI_SIDE_SELECT and bool(flip_allowed):
-                proba_f, bypass_f, dbg_f = safe_predict_proba(model_for_sym, feats_flip)
-                score_f = None if bypass_f else float(proba_f[0][1]) if (proba_f is not None and len(proba_f) > 0) else None
+                score_f, bypass_f, dbg_f = _score_side(flip_side)
             else:
-                bypass_f = True
                 dbg_f = {"skipped": True, "reason": ("flip_not_allowed" if (not flip_allowed) else "AI_SIDE_SELECT=0")}
 
-            # どちらを採用するか決定
+            # 採用判定：採点できた方があれば「高い方」。両方bypassなら base 維持
             chosen_side = base_side
             chosen_score = None
-            chosen_dbg = {
+
+            if (not bypass_b) and (score_b is not None):
+                chosen_side = base_side
+                chosen_score = float(score_b)
+
+            if (not bypass_f) and (score_f is not None):
+                if (chosen_score is None) or (float(score_f) > float(chosen_score)):
+                    chosen_side = flip_side
+                    chosen_score = float(score_f)
+
+            flipped = (chosen_side != base_side)
+
+            # dbg は item["ai_debug"] に入れる前提
+            dbg = {
+                "ai_side_select": bool(AI_SIDE_SELECT),
                 "base_side": base_side,
                 "flip_side": flip_side,
                 "flip_allowed": bool(flip_allowed),
@@ -1945,25 +1959,13 @@ def logic_main(force: bool = False):
                 "bypassed_flip": bool(bypass_f),
                 "dbg_base": dbg_b,
                 "dbg_flip": dbg_f,
-                "ai_side_select": bool(AI_SIDE_SELECT),
+                "chosen_side": chosen_side,
+                "flipped": bool(flipped),
+                "chosen_score": chosen_score,
+                "ai_th_used": float(ai_th_used),
             }
 
-            # bypass優先順位：採点できた方があればそちら、両方ダメならbase維持
-            if (not bypass_b) and (score_b is not None) and np.isfinite(score_b):
-                chosen_side = base_side
-                chosen_score = float(score_b)
-            if (not bypass_f) and (score_f is not None) and np.isfinite(score_f):
-                # flipが採点可能なら base と比較して高い方
-                if (chosen_score is None) or (float(score_f) > float(chosen_score)):
-                    chosen_side = flip_side
-                    chosen_score = float(score_f)
-
-            flipped = (chosen_side != base_side)
-            chosen_dbg["chosen_side"] = chosen_side
-            chosen_dbg["flipped"] = bool(flipped)
-            chosen_dbg["chosen_score"] = chosen_score
-
-            # side を確定（TP/SL・Sheet書き込み・Discordがこのsideになる）
+            # side 確定（以降のTP/SL・Sheet・Discordがこのsideになる）
             if flipped:
                 if chosen_side == "LONG":
                     is_buy = True
@@ -1974,19 +1976,15 @@ def logic_main(force: bool = False):
                     is_sell = True
                     signal_type = "SHORT"
 
-            # 最終スコア（ai_score）は採用した side のスコア
-            proba = None
-            bypassed = True
-            dbg = chosen_dbg
-
-            if chosen_score is not None and np.isfinite(chosen_score):
+            # bypassed / ai_score を確定
+            if (chosen_score is not None) and np.isfinite(float(chosen_score)):
                 ai_score = float(chosen_score)
                 bypassed = False
             else:
                 ai_score = None
                 bypassed = True
 
-            # ここから ai_pass 判定（従来通り：bypass時は fail-open/closed）
+            # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
             if bypassed:
                 if FAIL_CLOSED_ON_AI_BYPASS:
                     ai_pass = False
@@ -1995,16 +1993,8 @@ def logic_main(force: bool = False):
                     ai_pass = True
                     print(f"[AI] bypassed -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
             else:
-                if (ai_score is None) or (not np.isfinite(ai_score)):
-                    ai_score = None
-                    if FAIL_CLOSED_ON_AI_BYPASS:
-                        ai_pass = False
-                        print(f"[AI] non-finite score -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
-                    else:
-                        ai_pass = True
-                        print(f"[AI] non-finite score -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
-                else:
-                    ai_pass = (float(ai_score) >= float(ai_th_used))
+                ai_pass = (float(ai_score) >= float(ai_th_used))
+
 
 
 
@@ -2827,6 +2817,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
