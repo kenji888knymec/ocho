@@ -2027,6 +2027,7 @@ def logic_main(force: bool = False):
                 "vol_ratio": vol_ratio_val,
             }
 
+
             pending_candidates.append(item)
 
             if ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
@@ -2826,6 +2827,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
