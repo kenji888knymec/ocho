@@ -1086,6 +1086,50 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
+def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
+    """
+    learn_log の ai_debug に入れる値を決める
+      - DIRECT  : 順張り
+      - REVERSE : 逆張り
+      - RANGE   : レンジ
+      - UNKNOWN : 判定不能（入力が想定外）
+    ルール:
+      BTC_Mode=Up   かつ LONG  -> DIRECT
+      BTC_Mode=Down かつ SHORT -> DIRECT
+      BTC_Mode=Up/Down で逆方向 -> REVERSE
+      BTC_Mode=Range -> RANGE
+    """
+    bm = (btc_mode or "").strip().lower()
+    st = (signal_type or "").strip().upper()
+    sd = (side or "").strip().upper()
+
+    # SignalType が空のときは Side を使う
+    direction = st if st else sd
+
+    # direction を LONG/SHORT に正規化（想定外はそのまま）
+    if direction in ("BUY", "BULL", "UP", "L"):
+        direction = "LONG"
+    if direction in ("SELL", "BEAR", "DOWN", "S"):
+        direction = "SHORT"
+
+    if bm == "range":
+        return "RANGE"
+
+    if bm == "up":
+        if direction == "LONG":
+            return "DIRECT"
+        if direction == "SHORT":
+            return "REVERSE"
+        return "UNKNOWN"
+
+    if bm == "down":
+        if direction == "SHORT":
+            return "DIRECT"
+        if direction == "LONG":
+            return "REVERSE"
+        return "UNKNOWN"
+
+    return "UNKNOWN"
 
 def compute_dynamic_ai_th(base_th: float, btc_mode: str, median_sigma: float, btc_ok: bool, btc_calm: bool) -> float:
     """
@@ -2045,7 +2089,22 @@ def logic_main(force: bool = False):
     learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
     table_keys = _get_recent_dedup_keys(MAIN_SHEET_NAME)
 
+    # learn_log に既存の ai_debug 列がある場合だけ、そこへ DIRECT/REVERSE/RANGE を書く
+    learn_headers, _, _ = get_headers_and_len(LEARN_SHEET_NAME)
+
+    ai_debug_field = ""
+    for h in (learn_headers or []):
+        hs = str(h).strip()
+        if hs.lower() == "ai_debug":
+            ai_debug_field = hs  # 実際の表記（大文字小文字）を保持
+            break
+
+    learn_fields = list(EXPECTED_HEADERS_LEARN)
+    if ai_debug_field:
+        learn_fields.append(ai_debug_field)
+
     candidate_rows: List[List[Any]] = []
+
     for item in pending_candidates:
         sym = item["symbol"]
         ts_ms = item["time"]
@@ -2068,9 +2127,10 @@ def logic_main(force: bool = False):
 
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
 
-                # side選択（順張り/逆張り）の結果が分かるようにNoteへ埋め込む
+        # side選択（順張り/逆張り）の結果が分かるようにNoteへ埋め込む
         base_side = str(item.get("type", ""))  # ここは最終typeが入る（上で確定済み）
         dbg = item.get("ai_debug", None)
+
 
         flip_flag = ""
         chosen_side = ""
@@ -2090,8 +2150,14 @@ def logic_main(force: bool = False):
         )
 
 
-        candidate_rows.append([
-            dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
+        ai_debug_label = derive_ai_debug(
+            btc_mode=btc_mode,
+            signal_type=str(item.get("type", "")),
+            side=("LONG" if item["is_buy"] else "SHORT"),
+        )
+
+        row_out = [
+            dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
             DEFAULT_LEV, 0, 0, bool(item["ai_pass"]), bool(BTC_CALM),
@@ -2099,12 +2165,20 @@ def logic_main(force: bool = False):
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
             "", "", "", "", "", "", ""
-        ])
+        ]
+
+        # ai_debug 列が learn_log に既にある時だけ、そこへ追記（列は増やさない）
+        if ai_debug_field:
+            row_out.append(ai_debug_label)
+
+        candidate_rows.append(row_out)
+
 
         learn_keys.add(k)
 
     if candidate_rows:
-        append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, EXPECTED_HEADERS_LEARN)
+        append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, learn_fields)
+
 
     # いったんスコア順に並べる（ここではまだ上位制限しない）
     filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
@@ -2817,6 +2891,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
