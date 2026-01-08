@@ -1048,10 +1048,32 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
     }
 
     try:
+        # 0) model が None の場合は即バイパス
         if model is None:
             debug["action"] = "model_none_bypass"
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
+        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        if isinstance(model, dict):
+            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
+                if k in model:
+                    model = model[k]
+                    debug["action"] = "unwrapped_dict_model"
+                    break
+
+        if isinstance(model, (tuple, list)) and len(model) >= 1:
+            model = model[0]
+            debug["action"] = "unwrapped_list_model"
+
+        # unwrap した結果でも predict_proba が無いならバイパス
+        if not hasattr(model, "predict_proba"):
+            debug["action"] = "no_predict_proba_bypass"
+            debug["error"] = f"model_type={type(model)} has no predict_proba"
+            print(f"[AI] safe_predict_proba fallback: {debug['error']}")
+            return np.array([[0.5, 0.5]], dtype=float), True, debug
+
+        # 2) feats の整形
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
@@ -1060,6 +1082,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         debug["input_n_features"] = int(feats.shape[1])
 
+        # 3) 特徴量の整合
         expected_cols = _extract_feature_names(model)
         if expected_cols:
             debug["expected_cols"] = list(expected_cols)
@@ -1074,6 +1097,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+        # 4) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1088,6 +1112,8 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
+
+
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
     """
     learn_log の ai_debug に入れる値を決める
@@ -2983,6 +3009,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
