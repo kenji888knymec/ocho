@@ -1820,6 +1820,21 @@ def self_heal_prerequisites() -> Tuple[bool, str]:
     except Exception as e:
         return False, f"self_heal failed: {e}"
 
+def _pad_row_to_fields(row: List[Any], fields: List[str], fill: Any = "") -> List[Any]:
+    """
+    row を fields の長さに合わせる（列ズレ事故の防止）
+    - 足りない: fill で右側を埋める
+    - 多い: 右側を切る
+    """
+    n = len(fields) if fields else 0
+    if n <= 0:
+        return row
+    if len(row) < n:
+        return row + [fill] * (n - len(row))
+    if len(row) > n:
+        return row[:n]
+    return row
+
 # ==========================================
 # ロジック本体 (/run)
 # ==========================================
@@ -2147,21 +2162,28 @@ def logic_main(force: bool = False):
     learn_keys = _get_recent_dedup_keys(LEARN_SHEET_NAME)
     table_keys = _get_recent_dedup_keys(MAIN_SHEET_NAME)
 
-    # learn_log に既存の ai_debug 列がある場合だけ、そこへ DIRECT/REVERSE/RANGE を書く
+    # learn_log に既存の ai_debug 列がある場合だけ、そこへラベルを書き込む
     learn_headers, _, _ = get_headers_and_len(LEARN_SHEET_NAME)
-
+    
+    # 基本は「実シートのヘッダー」に合わせる（列ズレ防止）
+    # もし取得できなければ EXPECTED を使う
+    learn_fields = list(learn_headers) if (learn_headers and len(learn_headers) > 0) else list(EXPECTED_HEADERS_LEARN)
+    
+    # ai_debug 列の存在確認（大文字小文字ゆれ対応）
     ai_debug_field = ""
     for h in (learn_headers or []):
         hs = str(h).strip()
         if hs.lower() == "ai_debug":
             ai_debug_field = hs  # 実際の表記（大文字小文字）を保持
             break
-
-    learn_fields = list(EXPECTED_HEADERS_LEARN)
+    
+    # learn_fields 側に ai_debug が無ければ末尾に追加（重複は絶対に作らない）
     if ai_debug_field:
-        learn_fields.append(ai_debug_field)
-
+        if all(str(x).strip().lower() != "ai_debug" for x in (learn_fields or [])):
+            learn_fields.append(ai_debug_field)
+    
     candidate_rows: List[List[Any]] = []
+
 
     for item in pending_candidates:
         sym = item["symbol"]
@@ -2225,11 +2247,26 @@ def logic_main(force: bool = False):
             "", "", "", "", "", "", ""
         ]
 
-        # ai_debug 列が learn_log に既にある時だけ、そこへ追記（列は増やさない）
+        # ai_debug 列が存在する場合は「末尾append」ではなく、その列位置に代入する（列ズレ防止）
         if ai_debug_field:
-            row_out.append(ai_debug_label)
+            ai_debug_idx = -1
+            for i, h in enumerate(learn_fields):
+                if str(h).strip().lower() == "ai_debug":
+                    ai_debug_idx = i
+                    break
+
+            if ai_debug_idx >= 0:
+                # 先に必要な長さまで伸ばしてから代入（index error回避）
+                if len(row_out) <= ai_debug_idx:
+                    row_out = row_out + [""] * (ai_debug_idx + 1 - len(row_out))
+                row_out[ai_debug_idx] = ai_debug_label
+
+        # ★列ズレ防止：必ずヘッダー長に合わせる
+        row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
         candidate_rows.append(row_out)
+
+        
 
 
         learn_keys.add(k)
@@ -2327,14 +2364,20 @@ def logic_main(force: bool = False):
         ]
         note_compact = " | ".join([p for p in parts if p])
 
-        alert_rows.append([
+        row_tbl = [
             dt_cell, sym, "LONG" if item["is_buy"] else "SHORT",
             float(cp), float(item["score"]), float(item["sigma"]), "AI_PASS",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
             lev, float(tp_pct * lev), float(sl_pct * lev),
             bool(BTC_CALM), True, VERSION, note_compact,
             item["chg_pct"], item["vol_ratio"], "MARKET",
-        ])
+        ]
+        
+        # ★列ズレ防止：TABLE_FIELDS の長さに合わせる（tableが37列でも事故らない）
+        row_tbl = _pad_row_to_fields(row_tbl, TABLE_FIELDS, fill="")
+        
+        alert_rows.append(row_tbl)
+
 
         table_keys.add(k)
 
@@ -2749,7 +2792,10 @@ def ai_health():
 
 @app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
-    # 9本しか無い現状でも、safe_predict_proba が 500 を出さないことを確認する
+    """
+    - safe_predict_proba が bypass / None / 形不正でも 500 を出さない
+    - score は取れれば返す。取れなければ None のまま返す
+    """
     feats = pd.DataFrame([{
         "Sigma": 0.001,
         "BandWidth": 0.01,
@@ -2762,9 +2808,33 @@ def ai_smoke():
         "BTC_Vol": 0.0,
     }])
 
-    proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
-    score = float(proba[0][1])
-    
+    proba = None
+    bypassed = True
+    dbg = {"info": "init"}
+
+    try:
+        proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
+    except Exception as e:
+        # safe_predict_proba 自体が例外でも 200 で返す（落とさない）
+        dbg = {"error": f"{type(e).__name__}: {e}"}
+        proba = None
+        bypassed = True
+
+    score = None
+    try:
+        if proba is not None and len(proba) > 0 and len(proba[0]) > 1:
+            s = float(proba[0][1])
+            if np.isfinite(s):
+                score = s
+            else:
+                bypassed = True
+                if isinstance(dbg, dict):
+                    dbg["score_error"] = "non_finite"
+    except Exception as e:
+        bypassed = True
+        if isinstance(dbg, dict):
+            dbg["score_error"] = f"{type(e).__name__}: {e}"
+
     return jsonify({
         "ok": True,
         "model_loaded": (ai_model is not None),
@@ -2773,6 +2843,7 @@ def ai_smoke():
         "debug": dbg,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
+
 
 @app.route("/reload_model", methods=["POST", "GET"])
 def reload_model():
@@ -3009,6 +3080,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
