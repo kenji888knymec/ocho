@@ -1842,8 +1842,18 @@ def logic_main(force: bool = False):
         print(f"[WARN] BTC fetch failed: {e}")
 
     BTC_CALM = btc_ok and (median_sigma < 0.005)
-    ALLOW_LONG = (btc_mode != "Down")
-    ALLOW_SHORT = (btc_mode != "Up")
+
+    # BTCの地合いで片側を禁止するフィルタ（デフォルトON）
+    # BTC_SIDE_FILTER=0 にすると Up/Down でも両建て（LONG/SHORT）を許可する
+    BTC_SIDE_FILTER = (os.environ.get("BTC_SIDE_FILTER", "1").strip() == "1")
+
+    if BTC_SIDE_FILTER:
+        ALLOW_LONG = (btc_mode != "Down")
+        ALLOW_SHORT = (btc_mode != "Up")
+    else:
+        ALLOW_LONG = True
+        ALLOW_SHORT = True
+
 
     symbols = [
         "BTC/USDT", "DOT/USDT", "BONK/USDT", "DOGE/USDT", "LINK/USDT", "ETH/USDT", "SUI/USDT", "BNB/USDT", "UNI/USDT",
@@ -2891,6 +2901,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
