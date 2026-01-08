@@ -750,65 +750,87 @@ def build_exchange() -> ccxt.Exchange:
     if ex is not None and (now - ts) <= EXCHANGE_TTL_SEC:
         return ex
 
+    # OKX 初期化（defaultType は空や None を避ける）
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 10000,
         "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
     })
 
-    # ---- 確実策：urls['api'] を「文字列」に固定して None + str を根絶 ----
-    # さらに before/after をログに出して「補正が走った」ことを確定させる
+    def _fill_none_recursive(obj, fill_value: str):
+        """dict/list の中にある None を再帰的に fill_value で埋める"""
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if v is None:
+                    obj[k] = fill_value
+                else:
+                    _fill_none_recursive(v, fill_value)
+        elif isinstance(obj, list):
+            for i, v in enumerate(list(obj)):
+                if v is None:
+                    obj[i] = fill_value
+                else:
+                    _fill_none_recursive(v, fill_value)
+
+    # ---- 重要：ccxt が URL を組み立てる際に None + str で落ちるのを根絶 ----
+    # 「どこに None がいるか」をログで確定させる
     try:
         urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
             exchange.urls = {}
             urls = exchange.urls
 
-        api_before = urls.get("api", "<missing>")
+        api_before = urls.get("api")
         print(f"[DBG] okx.urls.api(before)={repr(api_before)}")
 
-        # ccxt 実装差異に強い：最終的に api を必ず文字列に寄せる
-        if api_before is None:
-            urls["api"] = "https://www.okx.com"
-        elif isinstance(api_before, str):
-            if not api_before.strip():
+        api = urls.get("api")
+
+        # api 自体が None / 空なら、まず最低限のベースを置く
+        if api is None:
+            urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
+            api = urls["api"]
+
+        # api が文字列型なら空を避ける
+        if isinstance(api, str):
+            if not api.strip():
                 urls["api"] = "https://www.okx.com"
-        elif isinstance(api_before, dict):
-            # dict を維持したい実装向けに中身も埋める（ただし最終的には文字列も用意）
-            for k in ("rest", "public", "private"):
-                v = api_before.get(k)
-                if v is None or (isinstance(v, str) and not v.strip()):
-                    api_before[k] = "https://www.okx.com"
-            urls["api_dict"] = api_before  # 参照用（害はない）
-            urls["api"] = "https://www.okx.com"
+                api = urls["api"]
+
+        # api が dict 型なら public/private を保証し、さらに配下の None を全部埋める
+        elif isinstance(api, dict):
+            if not isinstance(api.get("public"), str) or not str(api.get("public")).strip():
+                api["public"] = "https://www.okx.com"
+            if not isinstance(api.get("private"), str) or not str(api.get("private")).strip():
+                api["private"] = "https://www.okx.com"
+
+            # ここが本命：public/private のさらに下に None が残っても潰す
+            _fill_none_recursive(api, "https://www.okx.com")
+
+        # 想定外の型は全置換（落ちないこと優先）
         else:
-            urls["api"] = "https://www.okx.com"
+            urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
+            api = urls["api"]
 
         print(f"[DBG] okx.urls.api(after)={repr(urls.get('api'))}")
 
     except Exception as e:
         print(f"[WARN] okx urls harden failed: {e}")
 
-    # ---- 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）----
-    load_ok = True
+    # markets はロードできれば使う（ここで落ちるなら URL 組立がまだ壊れている）
     try:
         exchange.load_markets()
         mk = getattr(exchange, "markets", None) or {}
         print(f"[OKX] load_markets ok: markets={len(mk)}")
     except Exception as e:
-        load_ok = False
         urls = getattr(exchange, "urls", None)
         api = urls.get("api") if isinstance(urls, dict) else None
         print(f"[WARN] okx.load_markets failed: {e} urls.api={repr(api)}")
 
-    if load_ok:
-        _exchange_cache["ex"] = exchange
-        _exchange_cache["ts"] = now
-    else:
-        print("[WARN] build_exchange: not caching exchange due to init failure")
-
+    _exchange_cache["ex"] = exchange
+    _exchange_cache["ts"] = now
     _symbol_resolve_cache.clear()
     return exchange
+
 
 
 
@@ -3128,6 +3150,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
