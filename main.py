@@ -750,55 +750,66 @@ def build_exchange() -> ccxt.Exchange:
     if ex is not None and (now - ts) <= EXCHANGE_TTL_SEC:
         return ex
 
-    # OKX 初期化（defaultType は空や None を避ける）
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 10000,
         "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
     })
 
-    # ---- 重要：ccxt 内部で urls['api'] が None になるケースのガード ----
-    # "None + '/api/...'" で TypeError になり、load_markets / fetch_ohlcv が全滅するのを防ぐ
+    # ---- 確実策：urls['api'] を「文字列」に固定して None + str を根絶 ----
+    # さらに before/after をログに出して「補正が走った」ことを確定させる
     try:
         urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
             exchange.urls = {}
             urls = exchange.urls
 
-        api = urls.get("api")
+        api_before = urls.get("api", "<missing>")
+        print(f"[DBG] okx.urls.api(before)={repr(api_before)}")
 
-        if api is None:
-            urls["api"] = {}
-            api = urls["api"]
-
-        if isinstance(api, str):
-            if not api.strip():
-                urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
-        elif isinstance(api, dict):
-            if not api.get("public"):
-                api["public"] = "https://www.okx.com"
-            if not api.get("private"):
-                api["private"] = "https://www.okx.com"
+        # ccxt 実装差異に強い：最終的に api を必ず文字列に寄せる
+        if api_before is None:
+            urls["api"] = "https://www.okx.com"
+        elif isinstance(api_before, str):
+            if not api_before.strip():
+                urls["api"] = "https://www.okx.com"
+        elif isinstance(api_before, dict):
+            # dict を維持したい実装向けに中身も埋める（ただし最終的には文字列も用意）
+            for k in ("rest", "public", "private"):
+                v = api_before.get(k)
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    api_before[k] = "https://www.okx.com"
+            urls["api_dict"] = api_before  # 参照用（害はない）
+            urls["api"] = "https://www.okx.com"
         else:
-            urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
+            urls["api"] = "https://www.okx.com"
+
+        print(f"[DBG] okx.urls.api(after)={repr(urls.get('api'))}")
 
     except Exception as e:
         print(f"[WARN] okx urls harden failed: {e}")
 
-    # markets はロードできれば使う（できなくても fetch_ohlcv 自体が動けば運用は可能）
+    # ---- 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）----
+    load_ok = True
     try:
         exchange.load_markets()
         mk = getattr(exchange, "markets", None) or {}
         print(f"[OKX] load_markets ok: markets={len(mk)}")
     except Exception as e:
+        load_ok = False
         urls = getattr(exchange, "urls", None)
         api = urls.get("api") if isinstance(urls, dict) else None
-        print(f"[WARN] okx.load_markets failed: {e} urls.api={api}")
+        print(f"[WARN] okx.load_markets failed: {e} urls.api={repr(api)}")
 
-    _exchange_cache["ex"] = exchange
-    _exchange_cache["ts"] = now
+    if load_ok:
+        _exchange_cache["ex"] = exchange
+        _exchange_cache["ts"] = now
+    else:
+        print("[WARN] build_exchange: not caching exchange due to init failure")
+
     _symbol_resolve_cache.clear()
     return exchange
+
 
 
 
@@ -3117,6 +3128,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
