@@ -1591,6 +1591,26 @@ def reload_default_model() -> bool:
     AI_MODEL_SOURCE_RUNTIME = "none"
     return False
 
+
+def get_ai_model(force_reload: bool = False):
+    """
+    既定モデル(ai_model)を返す。
+    - ai_model が None の場合は reload_default_model() で読み込みを試みる
+    - force_reload=True の場合は必ず reload_default_model() を実行
+    """
+    global ai_model
+
+    if force_reload:
+        reload_default_model()
+        return ai_model
+
+    if ai_model is not None:
+        return ai_model
+
+    # ai_model が None のまま走り続けないよう、ここで必ずロードを試す
+    reload_default_model()
+    return ai_model
+
 def _build_training_dataset_from_learn_log(lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     learn_log から学習用 X,y を作る。
@@ -2963,6 +2983,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
