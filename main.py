@@ -2809,8 +2809,25 @@ def train_process():
         return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
     finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                msg = f"[WARN] /train release_run_mutex failed: {type(e).__name__}: {e}"
+                print(msg)
+                try:
+                    send_discord_message(msg)
+                except Exception as e2:
+                    print(f"[WARN] /train send_discord_message failed: {type(e2).__name__}: {e2}")
+
+
+
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            # 万一 release 済み or acquire 前なら無視
+            pass
+
 
 @app.route("/run", methods=["GET", "POST"])
 def run_process():
@@ -2856,9 +2873,30 @@ def run_process():
 
         return res_run, 200
 
+    except Exception as e:
+        # preflight_check / acquire_run_mutex / release_run_mutex 等で例外が出ても 500 を避ける
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /run outer exception: {err}")
+        send_discord_message(f"[ERR] /run outer crashed: {err}")
+        return f"ERR: {err}", 200
+
     finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                msg = f"[WARN] /run release_run_mutex failed: {type(e).__name__}: {e}"
+                print(msg)
+                try:
+                    send_discord_message(msg)
+                except Exception as e2:
+                    print(f"[WARN] /run send_discord_message failed: {type(e2).__name__}: {e2}")
+
+
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            pass
 
 
 
@@ -2893,9 +2931,31 @@ def judge_process():
             send_discord_message(f"[ERR] /judge crashed: {err}")
             return f"ERR: {err}", 200
 
+    except Exception as e:
+        # preflight_check / acquire_run_mutex / release_run_mutex 等で例外が出ても 500 を避ける
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /judge outer exception: {err}")
+        send_discord_message(f"[ERR] /judge outer crashed: {err}")
+        return f"ERR: {err}", 200
+
     finally:
-        release_run_mutex(mutex_token)
-        _run_lock.release()
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                msg = f"[WARN] /judge release_run_mutex failed: {type(e).__name__}: {e}"
+                print(msg)
+                try:
+                    send_discord_message(msg)
+                except Exception as e2:
+                    print(f"[WARN] /judge send_discord_message failed: {type(e2).__name__}: {e2}")
+
+
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            pass
+
 
 
 
@@ -2903,6 +2963,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
