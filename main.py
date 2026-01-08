@@ -87,11 +87,8 @@ discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
 print(f"[CFG] DISCORD_WEBHOOK_URL_LEN={len(discord_webhook_url)}")
 
 # Hyperliquid: 最大5倍銘柄（この銘柄だけ HL 表示を x5 にする）
+# ※環境変数 MAX_LEV_5X_SYMBOLS が未設定（空）の場合は、このデフォルトセットを使う
 HL_MAX5_SYMBOLS = {"STX", "XLM", "FET", "HBAR", "POL"}
-
-# Hyperliquid: 通常銘柄の表示レバ（基本10倍）
-HL_DEFAULT_LEVERAGE = 10.0
-
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "1XwWkzijIwRlafg2zDgPHQ4tgjYModapFI3T_wbYS9_8")
 MAIN_SHEET_NAME = os.environ.get("MAIN_SHEET_NAME", "table")
@@ -103,14 +100,19 @@ VERSION = "Ver7.7 ModelReloadFix (Code v3.5.5)"
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
+
+# Hyperliquid: 通常銘柄の表示レバ（基本10倍）
+# ※DEFAULT_LEV を正として一本化（環境変数 DEFAULT_LEV で変更可能）
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
 
-# "5倍までしか掛けられない銘柄" を環境変数で指定（例: "BTC,ETH,SOL"）
-MAX_LEV_5X_SYMBOLS = {
-    s.strip().upper()
-    for s in os.environ.get("MAX_LEV_5X_SYMBOLS", "").split(",")
-    if s.strip()
-}
+# "5倍までしか掛けられない銘柄" を環境変数で指定（例: "STX,XLM,FET,HBAR,POL"）
+# ※環境変数が空なら HL_MAX5_SYMBOLS を使う
+_env_max5 = os.environ.get("MAX_LEV_5X_SYMBOLS", "").strip()
+if _env_max5:
+    MAX_LEV_5X_SYMBOLS = {s.strip().upper() for s in _env_max5.split(",") if s.strip()}
+else:
+    MAX_LEV_5X_SYMBOLS = set(HL_MAX5_SYMBOLS)
+
 
 # --- Advanced toggles (SAFE DEFAULT: OFF) ---
 ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
@@ -1591,34 +1593,35 @@ def reload_default_model() -> bool:
 
 def _build_training_dataset_from_learn_log(lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
-    learn_log から学習用 X,y を作る（UIだけで回すため、learn_logの列だけで作る）
-    - y: Win=1, Lose=0
-    - X: 推論側の feature 名に揃える（無いものは0や簡易派生）
+    learn_log から学習用 X,y を作る。
+
+    方針：
+    - 学習データ（X,y）生成の「正」は _build_training_matrix_from_learn_log(df) に一本化する。
+    - この関数は「Sheets からの取得」「lookback 範囲の制御」「DataFrame 化」だけを担当するラッパーにする。
     """
-    info: Dict[str, Any] = {"rows_scanned": 0, "rows_used": 0, "class_balance": {}}
+    meta: Dict[str, Any] = {"rows_scanned": 0, "rows_used": 0, "class_balance": {}}
 
     ok, msg = self_heal_prerequisites()
     if not ok:
         raise RuntimeError(f"self_heal_prerequisites failed: {msg}")
 
     headers = read_header_row(LEARN_SHEET_NAME)
+    if not headers:
+        raise RuntimeError("learn_log header is empty")
+
+    # Win/Lose が無いと学習できないため早期に落とす（原因が分かりやすい）
     hm = _build_headers_map(headers)
-
-    col_side = _resolve_col_idx(hm, "Side")
-    col_score = _resolve_col_idx(hm, "ScoreSigma")
-    col_sigma = _resolve_col_idx(hm, "VolSigma")
-    col_btc1h = _resolve_col_idx(hm, "BTC_1h_Change")
-    col_rsi = _resolve_col_idx(hm, "RSI")
     col_winlose = _resolve_col_idx(hm, "Win/Lose")
-
-    if any(x == -1 for x in [col_side, col_score, col_sigma, col_btc1h, col_rsi, col_winlose]):
-        raise RuntimeError(f"learn_log required columns missing. headers={headers[:40]}")
+    if col_winlose == -1:
+        raise RuntimeError(f"learn_log required column missing: Win/Lose. headers={headers[:40]}")
 
     last_row = _get_row_count_cached(LEARN_SHEET_NAME)
     if last_row < 2:
         raise RuntimeError("learn_log is empty")
 
-    start_row = max(2, last_row - int(lookback_rows) + 1)
+    # lookback_rows は「末尾からの件数」
+    lb = int(lookback_rows) if (lookback_rows is not None and int(lookback_rows) > 0) else 0
+    start_row = 2 if lb <= 0 else max(2, last_row - lb + 1)
 
     service = get_sheet_service()
     res = service.spreadsheets().values().get(
@@ -1627,59 +1630,45 @@ def _build_training_dataset_from_learn_log(lookback_rows: int) -> Tuple[pd.DataF
     ).execute()
     rows = res.get("values", []) or []
 
-    X_rows: List[Dict[str, float]] = []
-    y_rows: List[int] = []
-
+    # DataFrame 化（列数が足りない行は右を空文字で埋める／多い行は切る）
+    norm_rows: List[List[Any]] = []
+    ncols = int(len(headers))
     for r in rows:
-        info["rows_scanned"] += 1
+        rr = list(r) if r is not None else []
+        if len(rr) < ncols:
+            rr = rr + [""] * (ncols - len(rr))
+        elif len(rr) > ncols:
+            rr = rr[:ncols]
+        norm_rows.append(rr)
 
-        def cell(idx: int) -> str:
-            return "" if idx < 0 or idx >= len(r) else str(r[idx]).strip()
+    df = pd.DataFrame(norm_rows, columns=headers)
 
-        wl = cell(col_winlose).strip().lower()
-        if wl not in {"win", "lose"}:
-            continue
+    meta["rows_scanned"] = int(len(df))
+    meta["start_row"] = int(start_row)
+    meta["last_row"] = int(last_row)
+    meta["lookback_rows_requested"] = int(lb) if lb > 0 else 0
 
-        y = 1 if wl == "win" else 0
+    # ここで「唯一の正」に委譲
+    X_df, y_arr, m2 = _build_training_matrix_from_learn_log(df)
 
-        side = cell(col_side).upper()
-        score = to_float(cell(col_score), default=None)
-        sig = to_float(cell(col_sigma), default=None)
-        btc1h = to_float(cell(col_btc1h), default=0.0)
-        rsi = to_float(cell(col_rsi), default=50.0)
+    # meta 統合（matrix側の情報を優先しつつ、ラッパー側も残す）
+    m2 = dict(m2 or {})
+    merged = dict(meta)
+    merged.update(m2)
 
-        if score is None or sig is None:
-            continue
+    # rows_used / class_balance が無ければ補完
+    if "rows_used" not in merged:
+        merged["rows_used"] = int(len(y_arr)) if y_arr is not None else 0
 
-        # 推論側feature名に合わせる（足りないものは0 / 簡易派生）
-        rise_score = float(score) if "LONG" in side else 0.0
-        drop_score = float(score) if "SHORT" in side else 0.0
+    if "class_balance" not in merged:
+        if y_arr is None or len(y_arr) == 0:
+            merged["class_balance"] = {}
+        else:
+            uniq, cnt = np.unique(np.asarray(y_arr, dtype=int), return_counts=True)
+            merged["class_balance"] = {str(int(k)): int(v) for k, v in zip(uniq, cnt)}
 
-        X_rows.append({
-            "Sigma": float(sig),
-            "BandWidth": 0.0,
-            "BW_Change": 0.0,
-            "RSI": float(rsi if rsi is not None else 50.0),
-            "Vol_Change": 0.0,
-            "Rise_Score": float(rise_score),
-            "Drop_Score": float(drop_score),
-            "BTC_Ret": 0.0,
-            "BTC_Vol": float(abs(btc1h) / 4.0),
-        })
-        y_rows.append(int(y))
-        info["rows_used"] += 1
+    return X_df, np.asarray(y_arr, dtype=int), merged
 
-    if not X_rows:
-        raise RuntimeError("No trainable rows found (need Win/Lose filled rows).")
-
-    X = pd.DataFrame(X_rows).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_arr = np.asarray(y_rows, dtype=int)
-
-    # クラス比
-    uniq, cnt = np.unique(y_arr, return_counts=True)
-    info["class_balance"] = {str(int(k)): int(v) for k, v in zip(uniq, cnt)}
-
-    return X, y_arr, info
 
 def _train_model_from_learn_log(lookback_rows: int, min_samples: int) -> Tuple[Any, Dict[str, Any]]:
     """
@@ -1801,7 +1790,20 @@ def logic_main(force: bool = False):
         send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
         return f"SelfHealFailed: {msg}"
 
+    # --- AIモデルを確実に確保（Noneのまま走り続けない） ---
+    try:
+        # get_ai_model() が「必要ならロード」する想定（あなたの現行コードに存在している前提）
+        m = get_ai_model()
+        ai_model = m  # 念のためglobalも同期
+        if ai_model is None:
+            send_discord_message("[WARN] AI model is None (load failed). Run will continue with rule-based parts if allowed.")
+    except Exception as e:
+        send_discord_message(f"[WARN] get_ai_model failed: {type(e).__name__}: {e}")
+        ai_model = None
+
     # 15分足の確定直後は取引所側の反映遅れがあるため、通常は「各15分の10分以降」に実行する
+    # ...以下、BTCデータの取得へ続く
+
     # ただし /run?force=1 のときはこの待機をスキップする
     if (not force) and ((now_jst.minute % 15) < 10):
         print(f"[RUN] skip (waiting window) minute={now_jst.minute}")
@@ -2901,6 +2903,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
