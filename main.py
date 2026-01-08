@@ -757,59 +757,46 @@ def build_exchange() -> ccxt.Exchange:
         "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
     })
 
-    # ==========================================================
-    # OKX URL harden（原因特定 + 確実に None を潰す）
-    # - None + "/api/..." を根絶する
-    # - before/after を必ずログに出して「補正が走った」ことを確定する
-    # ==========================================================
-    def _fill_none_url(v, default_url: str):
-        """dict/list 内を再帰的に走査して None/空文字 を default_url に置換"""
-        if v is None:
-            return default_url
-        if isinstance(v, str):
-            return v if v.strip() else default_url
-        if isinstance(v, dict):
-            for kk, vv in list(v.items()):
-                v[kk] = _fill_none_url(vv, default_url)
-            return v
-        if isinstance(v, list):
-            return [_fill_none_url(x, default_url) for x in v]
-        return v
+    # === 反映確認用の目印（これがログに出ない＝このコードがCloud Runで動いていない） ===
+    print("[DBG] build_exchange:v2_urls_harden_traceback")
 
+    # ---- urls の None/空を潰す（apiがdict前提の実装にも寄せる）----
     try:
         base = "https://www.okx.com"
+
         urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
             exchange.urls = {}
             urls = exchange.urls
 
-        api_before = urls.get("api", "<missing>")
-        print(f"[DBG] okx.urls.api(before) type={type(api_before).__name__} val={repr(api_before)}")
+        api = urls.get("api")
+        print(f"[DBG] okx.urls(before)={repr(urls)}")
 
-        # ccxt実装差異に備えて、api を「dictでもstrでも」最終的に壊れない形へ寄せる
-        if api_before is None or api_before == "<missing>":
-            urls["api"] = base
-        elif isinstance(api_before, str):
-            urls["api"] = api_before if api_before.strip() else base
-        elif isinstance(api_before, dict):
-            # よく参照されるキーをまず確実に埋める
-            for k in ("public", "private", "rest", "ws"):
-                if k not in api_before:
-                    api_before[k] = base
-            api_before = _fill_none_url(api_before, base)
-            urls["api"] = api_before
-        else:
-            urls["api"] = base
+        # api を dict に寄せる（okx実装の多くはdict前提）
+        if not isinstance(api, dict):
+            api = {}
+        urls["api"] = api
 
-        api_after = urls.get("api")
-        print(f"[DBG] okx.urls.api(after)  type={type(api_after).__name__} val={repr(api_after)}")
+        # NoneType + str の主因になりやすいキーを確実に埋める
+        for k in ("rest", "public", "private", "ws"):
+            v = api.get(k)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                api[k] = base
+
+        # 念のため：urls直下の参照され得るキーも埋める（実装差異対策）
+        for k in ("www", "doc"):
+            v = urls.get(k)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                urls[k] = base
+
+        print(f"[DBG] okx.urls(after)={repr(urls)}")
 
     except Exception as e:
+        import traceback
         print(f"[WARN] okx urls harden failed: {e}")
+        print(traceback.format_exc())
 
-    # ==========================================================
-    # 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）
-    # ==========================================================
+    # ---- 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）----
     load_ok = True
     try:
         exchange.load_markets()
@@ -817,9 +804,11 @@ def build_exchange() -> ccxt.Exchange:
         print(f"[OKX] load_markets ok: markets={len(mk)}")
     except Exception as e:
         load_ok = False
-        urls = getattr(exchange, "urls", None)
-        api = urls.get("api") if isinstance(urls, dict) else None
-        print(f"[WARN] okx.load_markets failed: {e} urls.api={repr(api)}")
+        import traceback
+        print(f"[WARN] okx.load_markets failed: {e}")
+        print(traceback.format_exc())
+        print(f"[WARN] okx.urls(dump)={repr(getattr(exchange, 'urls', None))}")
+        print(f"[WARN] okx.options(dump)={repr(getattr(exchange, 'options', None))}")
 
     if load_ok:
         _exchange_cache["ex"] = exchange
@@ -829,6 +818,7 @@ def build_exchange() -> ccxt.Exchange:
 
     _symbol_resolve_cache.clear()
     return exchange
+
 
 
 
@@ -3148,6 +3138,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
