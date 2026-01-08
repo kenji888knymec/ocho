@@ -750,20 +750,56 @@ def build_exchange() -> ccxt.Exchange:
     if ex is not None and (now - ts) <= EXCHANGE_TTL_SEC:
         return ex
 
+    # OKX 初期化（defaultType は空や None を避ける）
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 10000,
-        "options": {"defaultType": OKX_DEFAULT_TYPE},
+        "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
     })
+
+    # ---- 重要：ccxt 内部で urls['api'] が None になるケースのガード ----
+    # "None + '/api/...'" で TypeError になり、load_markets / fetch_ohlcv が全滅するのを防ぐ
+    try:
+        urls = getattr(exchange, "urls", None)
+        if not isinstance(urls, dict):
+            exchange.urls = {}
+            urls = exchange.urls
+
+        api = urls.get("api")
+
+        if api is None:
+            urls["api"] = {}
+            api = urls["api"]
+
+        if isinstance(api, str):
+            if not api.strip():
+                urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
+        elif isinstance(api, dict):
+            if not api.get("public"):
+                api["public"] = "https://www.okx.com"
+            if not api.get("private"):
+                api["private"] = "https://www.okx.com"
+        else:
+            urls["api"] = {"public": "https://www.okx.com", "private": "https://www.okx.com"}
+
+    except Exception as e:
+        print(f"[WARN] okx urls harden failed: {e}")
+
+    # markets はロードできれば使う（できなくても fetch_ohlcv 自体が動けば運用は可能）
     try:
         exchange.load_markets()
+        mk = getattr(exchange, "markets", None) or {}
+        print(f"[OKX] load_markets ok: markets={len(mk)}")
     except Exception as e:
-        print(f"[WARN] okx.load_markets failed: {e}")
+        urls = getattr(exchange, "urls", None)
+        api = urls.get("api") if isinstance(urls, dict) else None
+        print(f"[WARN] okx.load_markets failed: {e} urls.api={api}")
 
     _exchange_cache["ex"] = exchange
     _exchange_cache["ts"] = now
     _symbol_resolve_cache.clear()
     return exchange
+
 
 def _resolve_okx_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
     if not symbol:
@@ -3080,6 +3116,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
