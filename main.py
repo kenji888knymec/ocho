@@ -763,78 +763,70 @@ def build_exchange() -> ccxt.Exchange:
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "timeout": 10000,
-        "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
+        "options": {"defaultType": OKX_DEFAULT_TYPE},
     })
 
-    # === 反映確認用の目印（これがログに出ない＝このコードがCloud Runで動いていない） ===
-    print("[DBG] build_exchange:v3_urls_harden_compat")
+    # ---- OKX URL harden（ccxt内部で urls の一部が None になり TypeError を起こすケース対策）----
+    def _fix_okx_urls_if_needed(exch: ccxt.Exchange) -> bool:
+        try:
+            urls = getattr(exch, "urls", None)
+            if not isinstance(urls, dict):
+                return False
 
-    # ---- urls の None/空を潰す（CCXT実装差：apiがstr版 / dict版の両方に対応）----
+            api = urls.get("api")
+            bad = False
+            if api is None:
+                bad = True
+            elif isinstance(api, dict):
+                for _, v in api.items():
+                    if v is None:
+                        bad = True
+                        break
+            else:
+                # 文字列以外（想定外）
+                if not isinstance(api, str):
+                    bad = True
+
+            if not bad:
+                return False
+
+            print("[WARN] okx.urls.api seems broken (contains None). restoring default urls...")
+            fresh = ccxt.okx({
+                "enableRateLimit": True,
+                "timeout": 10000,
+                "options": {"defaultType": OKX_DEFAULT_TYPE},
+            })
+            exch.urls = getattr(fresh, "urls", exch.urls)
+            return True
+        except Exception as e:
+            print(f"[WARN] okx urls harden failed: {e}")
+            return False
+
+    _fix_okx_urls_if_needed(exchange)
+
+    # ccxtバージョンや defaultType をログに残す（原因切り分け用）
     try:
-        base = "https://www.okx.com"
+        print(f"[DBG] ccxt_version={getattr(ccxt, '__version__', 'unknown')} OKX_DEFAULT_TYPE={OKX_DEFAULT_TYPE}")
+    except Exception:
+        pass
 
-        urls = getattr(exchange, "urls", None)
-        if not isinstance(urls, dict):
-            urls = {}
-            exchange.urls = urls
-
-        api = urls.get("api")
-
-        # 1) api が None / 空文字 → base を入れる（str前提実装に対応）
-        if api is None or (isinstance(api, str) and not api.strip()):
-            urls["api"] = base
-
-        # 2) api が str → そのまま（str前提実装に対応）
-        elif isinstance(api, str):
-            urls["api"] = api.strip()
-
-        # 3) api が dict → 必要キーを埋める（dict前提実装に対応）
-        elif isinstance(api, dict):
-            for k in ("rest", "public", "private", "ws"):
-                v = api.get(k)
-                if v is None or (isinstance(v, str) and not v.strip()):
-                    api[k] = base
-            urls["api"] = api
-
-        # 4) それ以外の型 → base を入れる（保険）
-        else:
-            urls["api"] = base
-
-        # urls直下も参照され得るキーを保険で埋める
-        for k in ("www", "doc"):
-            v = urls.get(k)
-            if v is None or (isinstance(v, str) and not v.strip()):
-                urls[k] = base
-
-        print(f"[DBG] okx.urls(after)={repr(urls)}")
-
-    except Exception as e:
-        import traceback
-        print(f"[WARN] okx urls harden failed: {e}")
-        print(traceback.format_exc())
-
-    # ---- 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）----
-    load_ok = True
+    # load_markets は失敗しても bot 全体は落とさないが、TypeError の場合は urls 復旧後に1回だけ再試行
     try:
         exchange.load_markets()
-        mk = getattr(exchange, "markets", None) or {}
-        print(f"[OKX] load_markets ok: markets={len(mk)}")
     except Exception as e:
-        load_ok = False
-        import traceback
         print(f"[WARN] okx.load_markets failed: {e}")
-        print(traceback.format_exc())
-        print(f"[WARN] okx.urls(dump)={repr(getattr(exchange, 'urls', None))}")
-        print(f"[WARN] okx.options(dump)={repr(getattr(exchange, 'options', None))}")
+        msg = str(e)
+        if ("NoneType" in msg and "+" in msg) or ("unsupported operand type" in msg):
+            fixed = _fix_okx_urls_if_needed(exchange)
+            if fixed:
+                try:
+                    exchange.load_markets()
+                    print("[DBG] okx.load_markets retry success after urls restore")
+                except Exception as e2:
+                    print(f"[WARN] okx.load_markets retry failed: {e2}")
 
-    if load_ok:
-        _exchange_cache["ex"] = exchange
-        _exchange_cache["ts"] = now
-    else:
-        _exchange_cache.pop("ex", None)
-        _exchange_cache.pop("ts", None)
-        print("[WARN] build_exchange: not caching exchange due to init failure")
-
+    _exchange_cache["ex"] = exchange
+    _exchange_cache["ts"] = now
     _symbol_resolve_cache.clear()
     return exchange
 
@@ -3158,6 +3150,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
