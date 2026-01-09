@@ -376,12 +376,21 @@ def _normalize_headers(headers: List[Any]) -> List[str]:
     return hs
 
 def _build_headers_map(headers: List[str]) -> Dict[str, int]:
+    """
+    ヘッダー名 -> 列index の辞書を作る。
+    同名ヘッダーが複数ある場合は「左側（最初の列）」を優先する。
+    ※重複列が残っているシートで、書き込み先が右側にズレる事故を防ぐ。
+    """
     m: Dict[str, int] = {}
     for i, h in enumerate(headers):
         key = ("" if h is None else str(h)).strip()
-        if key != "":
-            m[key] = i
+        if key == "":
+            continue
+        if key in m:
+            continue  # 既に登録済みなら上書きしない（左側優先）
+        m[key] = i
     return m
+
 
 def _resolve_col_idx(headers_map: Dict[str, int], field: str) -> int:
     for cand in FIELD_ALIASES.get(field, [field]):
@@ -3138,6 +3147,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
