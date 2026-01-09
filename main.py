@@ -767,32 +767,40 @@ def build_exchange() -> ccxt.Exchange:
     })
 
     # === 反映確認用の目印（これがログに出ない＝このコードがCloud Runで動いていない） ===
-    print("[DBG] build_exchange:v2_urls_harden_traceback")
+    print("[DBG] build_exchange:v3_urls_harden_compat")
 
-    # ---- urls の None/空を潰す（apiがdict前提の実装にも寄せる）----
+    # ---- urls の None/空を潰す（CCXT実装差：apiがstr版 / dict版の両方に対応）----
     try:
         base = "https://www.okx.com"
 
         urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
-            exchange.urls = {}
-            urls = exchange.urls
+            urls = {}
+            exchange.urls = urls
 
         api = urls.get("api")
-        print(f"[DBG] okx.urls(before)={repr(urls)}")
 
-        # api を dict に寄せる（okx実装の多くはdict前提）
-        if not isinstance(api, dict):
-            api = {}
-        urls["api"] = api
+        # 1) api が None / 空文字 → base を入れる（str前提実装に対応）
+        if api is None or (isinstance(api, str) and not api.strip()):
+            urls["api"] = base
 
-        # NoneType + str の主因になりやすいキーを確実に埋める
-        for k in ("rest", "public", "private", "ws"):
-            v = api.get(k)
-            if v is None or (isinstance(v, str) and not v.strip()):
-                api[k] = base
+        # 2) api が str → そのまま（str前提実装に対応）
+        elif isinstance(api, str):
+            urls["api"] = api.strip()
 
-        # 念のため：urls直下の参照され得るキーも埋める（実装差異対策）
+        # 3) api が dict → 必要キーを埋める（dict前提実装に対応）
+        elif isinstance(api, dict):
+            for k in ("rest", "public", "private", "ws"):
+                v = api.get(k)
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    api[k] = base
+            urls["api"] = api
+
+        # 4) それ以外の型 → base を入れる（保険）
+        else:
+            urls["api"] = base
+
+        # urls直下も参照され得るキーを保険で埋める
         for k in ("www", "doc"):
             v = urls.get(k)
             if v is None or (isinstance(v, str) and not v.strip()):
@@ -823,10 +831,13 @@ def build_exchange() -> ccxt.Exchange:
         _exchange_cache["ex"] = exchange
         _exchange_cache["ts"] = now
     else:
+        _exchange_cache.pop("ex", None)
+        _exchange_cache.pop("ts", None)
         print("[WARN] build_exchange: not caching exchange due to init failure")
 
     _symbol_resolve_cache.clear()
     return exchange
+
 
 
 
@@ -3147,6 +3158,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
