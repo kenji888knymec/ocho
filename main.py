@@ -396,12 +396,19 @@ def send_discord_message(text: str):
         print("[DBG] discord webhook url empty or placeholder")
         return
 
+    # 集計用：通知文のどこにLONG/SHORTがあっても拾えるようにする
+    side = "-"
+    if "LONG" in text:
+        side = "LONG"
+    elif "SHORT" in text:
+        side = "SHORT"
+
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
     for idx, chunk in enumerate(chunks, start=1):
         try:
-            # 追加：送信内容の「先頭1行」だけログに出す（ログ肥大を防ぐ）
+            # 送信内容の「先頭1行」だけログに出す（ログ肥大を防ぐ）
             head = chunk.replace("\r", "").split("\n", 1)[0][:200]
-            print(f"[SEND] discord chunk={idx}/{len(chunks)} head={head}")
+            print(f"[SEND] discord side={side} chunk={idx}/{len(chunks)} head={head}")
 
             r = http.post(discord_webhook_url, json={"content": chunk}, timeout=10)
             print(f"[DBG] discord status={r.status_code}")
@@ -409,6 +416,7 @@ def send_discord_message(text: str):
                 print(f"[DBG] discord body={r.text[:200]}")
         except Exception as e:
             print(f"[ERR] discord webhook post: {e}")
+
 
 
 def get_sheet_service():
@@ -3257,6 +3265,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
