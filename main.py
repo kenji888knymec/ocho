@@ -42,6 +42,55 @@ except Exception as _e:
 app = Flask(__name__)
 app.url_map.strict_slashes = False  # /train と /train/ を両方受ける
 
+# ==========================================
+# Self diagnosis (/diag)
+# - Cloud Run の動作確認用（リビジョン/環境変数/モデル設定の見える化）
+# - Cloud Run 側で「認証必須」にしている前提なら、このエンドポイントも外部には公開されません
+# ==========================================
+def build_diag() -> dict:
+    # 既存 import 群を触らない（最小変更）ため、ここで import
+    import os
+    import sys
+    import platform
+    import time
+    import hashlib
+
+    def _sha(s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    # 重要：秘密が混ざりうるものは「値そのもの」を返さない（長さ/ハッシュだけ返す）
+    def _safe_env(name: str) -> dict:
+        v = os.environ.get(name, "")
+        return {
+            "present": bool(v),
+            "len": len(v) if v is not None else 0,
+            "sha12": _sha(v) if v else "",
+        }
+
+    return {
+        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        # Cloud Run 標準環境変数（「今動いてる裏側」と一致確認するキー）
+        "k_service": os.environ.get("K_SERVICE", ""),
+        "k_revision": os.environ.get("K_REVISION", ""),
+        "k_configuration": os.environ.get("K_CONFIGURATION", ""),
+        "region": os.environ.get("REGION", ""),
+        # あなたの運用で重要な環境変数（値はそのまま出してOKなものだけ）
+        "model_version": os.environ.get("MODEL_VERSION", ""),
+        "model_gcs_uri": os.environ.get("MODEL_GCS_URI", ""),
+        "restart_ts": os.environ.get("RESTART_TS", ""),
+        "ai_th": os.environ.get("AI_TH", ""),
+        "e_th": os.environ.get("E_TH", ""),
+        "btc_side_filter": os.environ.get("BTC_SIDE_FILTER", ""),
+        # 秘密の可能性があるものはマスク
+        "discord_webhook_url": _safe_env("DISCORD_WEBHOOK_URL"),
+    }
+
+@app.route("/diag", methods=["GET"])
+def diag():
+    return jsonify(build_diag()), 200
+
 # --- ここから追記（診断用：必ず app 定義の直後） ---
 def _route_exists(path: str, method: str = "GET") -> bool:
     m = method.upper()
@@ -3203,6 +3252,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
