@@ -775,8 +775,16 @@ def build_exchange() -> ccxt.Exchange:
 
         urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
-            urls = {}
+            fresh = ccxt.okx({
+                "enableRateLimit": True,
+                "timeout": 10000,
+                "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
+            })
+            urls = getattr(fresh, "urls", None)
+            if not isinstance(urls, dict):
+                urls = {}
             exchange.urls = urls
+
 
         api = urls.get("api")
 
@@ -3158,6 +3166,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
