@@ -262,6 +262,10 @@ EXPECTED_HEADERS_LEARN = [
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "Win/Lose", "HoldMin",
 ]
 
+# learn_log の末尾に追加したい “学習用特徴量列”（既存列は一切ズラさない）
+EXTRA_HEADERS_LEARN = ["BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol"]
+
+
 TABLE_FIELDS = [
     "Time", "Symbol", "Direction", "EntryPrice", "Score", "Sigma", "Group",
     "TP_Price", "SL_Price", "TP_%", "SL_%", "Lev", "TP_Lev%", "SL_Lev%",
@@ -584,21 +588,41 @@ def ensure_learn_headers() -> bool:
     ensure_sheet_exists(LEARN_SHEET_NAME, min_rows=5000, min_cols=max(32, HEADER_LEN_LEARN, 40))
     current = read_header_row(LEARN_SHEET_NAME)
 
-    if current[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN:
-        return True
-
-    if not AUTO_FIX_HEADERS:
-        return not STRICT_HEADER_CHECK
-
+    # 1) 先頭（EXPECTED_HEADERS_LEARN）は厳密に守る
+    # 2) それ以降（trailing）は既存を保持（ai_debug 等があっても壊さない）
+    # 3) さらに末尾に、追加列（EXTRA_HEADERS_LEARN）が無ければ “追記のみ” する
     trailing = []
-    if len(current) > len(EXPECTED_HEADERS_LEARN):
+    if current and len(current) > len(EXPECTED_HEADERS_LEARN):
         trailing = current[len(EXPECTED_HEADERS_LEARN):]
 
-    new_headers = list(EXPECTED_HEADERS_LEARN) + trailing
-    ok = write_header_row(LEARN_SHEET_NAME, new_headers)
-    if ok:
-        print("[CFG] learn_log headers fixed (preserve trailing headers).")
-    return ok
+    base_headers = EXPECTED_HEADERS_LEARN + trailing
+    missing_extra = [h for h in EXTRA_HEADERS_LEARN if h not in base_headers]
+    new_headers = base_headers + missing_extra
+
+    prefix_ok = bool(current) and (current[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN)
+
+    # 直す必要なし
+    if prefix_ok and not missing_extra:
+        return True
+
+    # AUTO_FIX_HEADERS=0 の場合：旧挙動に合わせて、prefix mismatch は STRICT_HEADER_CHECK で判断
+    if not AUTO_FIX_HEADERS:
+        if not prefix_ok:
+            return (not STRICT_HEADER_CHECK)
+        # prefix はOKだが追加列が無いだけ：運用は継続できる
+        print(f"[WARN] learn_log missing extra headers (AUTO_FIX_HEADERS=0): {missing_extra}")
+        return True
+
+    # AUTO_FIX_HEADERS=1 の場合：安全に修復（既存 trailing を保持しつつ、末尾に不足分だけ追記）
+    if not current:
+        print("[FIX] learn_log header is empty. Writing base + extras.")
+    elif not prefix_ok:
+        print("[FIX] learn_log header mismatch. Rewriting with expected prefix (preserve trailing if any).")
+    else:
+        print("[FIX] learn_log missing extra headers. Appending at end:", missing_extra)
+
+    write_header_row(LEARN_SHEET_NAME, new_headers)
+    return True
 
 def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
     max_i = len(headers) if limit is None else int(limit)
@@ -1532,17 +1556,24 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     drop_score = np.where(is_short, score, 0.0)
 
 
-    # 推論側の9特徴量へ揃える（learn_log に無いものは暫定0）
+    # 推論側の9特徴量へ揃える（learn_log に列があれば実値を使う。無ければ従来通り0/代替値）
+    bw = pd.to_numeric(df2.get("BandWidth", 0.0), errors="coerce")
+    bw_ch = pd.to_numeric(df2.get("BW_Change", 0.0), errors="coerce")
+    vol_ch = pd.to_numeric(df2.get("Vol_Change", 0.0), errors="coerce")
+
+    btc_ret_series = pd.to_numeric(df2.get("BTC_Ret", df2.get("BTC_1h_Change", 0.0)), errors="coerce")
+    btc_vol_series = pd.to_numeric(df2.get("BTC_Vol", (btc1h.abs() / 4.0)), errors="coerce")
+
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
-        "BandWidth": 0.0,
-        "BW_Change": 0.0,
+        "BandWidth": bw.astype(float),
+        "BW_Change": bw_ch.astype(float),
         "RSI": rsi.astype(float),
-        "Vol_Change": 0.0,
+        "Vol_Change": vol_ch.astype(float),
         "Rise_Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
         "Drop_Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
-        "BTC_Ret": 0.0,
-        "BTC_Vol": (btc1h.abs() / 4.0).astype(float),
+        "BTC_Ret": btc_ret_series.astype(float),
+        "BTC_Vol": btc_vol_series.astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     info["rows_used"] = int(len(X))
@@ -2317,6 +2348,13 @@ def logic_main(force: bool = False):
                 "ai_debug": dbg,
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
+
+                # --- 追加：学習用特徴量（learn_log に保存して、次回学習で効かせる） ---
+                "BandWidth": safe_float(row.get("BandWidth", 0.0), 0.0),
+                "BW_Change": safe_float(row.get("BW_Change", 0.0), 0.0),
+                "Vol_Change": safe_float(row.get("Vol_Change", 0.0), 0.0),
+                "BTC_Ret": safe_float(btc_ret, 0.0),
+                "BTC_Vol": safe_float(btc_vol, 0.0),
             }
 
 
@@ -2353,6 +2391,8 @@ def logic_main(force: bool = False):
     # 基本は「実シートのヘッダー」に合わせる（列ズレ防止）
     # もし取得できなければ EXPECTED を使う
     learn_fields = list(learn_headers) if (learn_headers and len(learn_headers) > 0) else list(EXPECTED_HEADERS_LEARN)
+
+
     
     # ai_debug 列の存在確認（大文字小文字ゆれ対応）
     ai_debug_field = ""
@@ -2366,7 +2406,11 @@ def logic_main(force: bool = False):
     if ai_debug_field:
         if all(str(x).strip().lower() != "ai_debug" for x in (learn_fields or [])):
             learn_fields.append(ai_debug_field)
+            
     
+    # 列名→index（小文字化して揺れに強くする）
+    learn_idx = {str(h).strip().lower(): i for i, h in enumerate(learn_fields) if str(h).strip()}
+
     candidate_rows: List[List[Any]] = []
 
 
@@ -2448,6 +2492,20 @@ def logic_main(force: bool = False):
 
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
+
+        # --- 追加：学習用特徴量を “列名で” 差し込む（列ズレしない） ---
+        feature_values = {
+            "bandwidth": safe_float(item.get("BandWidth", ""), ""),
+            "bw_change": safe_float(item.get("BW_Change", ""), ""),
+            "vol_change": safe_float(item.get("Vol_Change", ""), ""),
+            "btc_ret": safe_float(item.get("BTC_Ret", ""), ""),
+            "btc_vol": safe_float(item.get("BTC_Vol", ""), ""),
+        }
+        for col_lower, val in feature_values.items():
+            idx = learn_idx.get(col_lower)
+            if idx is not None:
+                row_out[idx] = val
+
 
         candidate_rows.append(row_out)
 
@@ -3265,31 +3323,5 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
