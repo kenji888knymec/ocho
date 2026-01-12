@@ -150,6 +150,14 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
+# --- Range Mean Reversion (optional) ---
+RANGE_MR_ENABLE = (os.environ.get("RANGE_MR_ENABLE", "0").strip() == "1")
+RANGE_MR_RSI_OB = float(os.environ.get("RANGE_MR_RSI_OB", "70"))  # overbought
+RANGE_MR_RSI_OS = float(os.environ.get("RANGE_MR_RSI_OS", "30"))  # oversold
+RANGE_MR_BAND_TOUCH_EPS = float(os.environ.get("RANGE_MR_BAND_TOUCH_EPS", "0.0015"))  # 0.15%
+RANGE_MR_MAX_BW = float(os.environ.get("RANGE_MR_MAX_BW", "0.02"))  # BandWidth <= 2% の時だけ
+
+
 # Hyperliquid: 通常銘柄の表示レバ（基本10倍）
 # ※DEFAULT_LEV を正として一本化（環境変数 DEFAULT_LEV で変更可能）
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
@@ -2185,13 +2193,45 @@ def logic_main(force: bool = False):
             is_sell = False
             signal_type = ""
 
-            if (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT:
+            # ----------------------------------------------------------
+            # Range Mean Reversion (optional)
+            #  - BTC_CALM（レンジ寄り）かつ BandWidth が狭い時だけ
+            #  - Upper2タッチ + RSI OB => SHORT
+            #  - Lower2タッチ + RSI OS => LONG
+            # ----------------------------------------------------------
+            mr_short = False
+            mr_long = False
+            try:
+                if RANGE_MR_ENABLE and BTC_CALM:
+                    close_now = safe_float(row.get("Close", 0.0), 0.0)
+                    rsi_now = safe_float(row.get("RSI", 50.0), 50.0)
+                    upper2 = safe_float(row.get("Upper2", 0.0), 0.0)
+                    lower2 = safe_float(row.get("Lower2", 0.0), 0.0)
+                    bw = safe_float(row.get("BandWidth", 999.0), 999.0)
+
+                    if bw <= RANGE_MR_MAX_BW:
+                        eps = RANGE_MR_BAND_TOUCH_EPS
+
+                        # SHORT: upper band touch + RSI overbought
+                        if (upper2 > 0.0) and (close_now >= upper2 * (1.0 - eps)) and (rsi_now >= RANGE_MR_RSI_OB):
+                            mr_short = True
+
+                        # LONG: lower band touch + RSI oversold
+                        if (lower2 > 0.0) and (close_now <= lower2 * (1.0 + eps)) and (rsi_now <= RANGE_MR_RSI_OS):
+                            mr_long = True
+            except Exception as e:
+                print("[WARN] RANGE_MR check failed:", e)
+
+            # 既存のσ候補 + MR候補（MRでも既存フローのAI評価・ログ記録に乗せる）
+            short_by_sigma = (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT
+            long_by_sigma = (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG and (row["Close"] > df.iloc[-6]["Close"])
+
+            if short_by_sigma or (mr_short and ALLOW_SHORT):
                 is_sell = True
-                signal_type = "SHORT"
-            elif (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG:
-                if row["Close"] > df.iloc[-6]["Close"]:
-                    is_buy = True
-                    signal_type = "LONG"
+                signal_type = "RANGE_MR" if (mr_short and not short_by_sigma) else "SHORT"
+            elif long_by_sigma or (mr_long and ALLOW_LONG):
+                is_buy = True
+                signal_type = "RANGE_MR" if (mr_long and not long_by_sigma) else "LONG"
 
             if not (is_buy or is_sell):
                 continue
