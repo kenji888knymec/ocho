@@ -158,6 +158,31 @@ RANGE_MR_BAND_TOUCH_EPS = float(os.environ.get("RANGE_MR_BAND_TOUCH_EPS", "0.001
 RANGE_MR_MAX_BW = float(os.environ.get("RANGE_MR_MAX_BW", "0.02"))  # BandWidth <= 2% の時だけ
 
 
+# --- Market Snapshot Logging (optional) ---
+MARKET_LOG_ENABLE = (os.environ.get("MARKET_LOG_ENABLE", "0").strip() == "1")
+MARKET_LOG_SHEET_NAME = os.environ.get("MARKET_LOG_SHEET_NAME", "market_log").strip() or "market_log"
+MARKET_LOG_MAX_ROWS_PER_RUN = int(float(os.environ.get("MARKET_LOG_MAX_ROWS_PER_RUN", "200") or "200"))
+MARKET_LOG_SAMPLE_EVERY_N = int(float(os.environ.get("MARKET_LOG_SAMPLE_EVERY_N", "1") or "1"))
+if MARKET_LOG_SAMPLE_EVERY_N < 1:
+    MARKET_LOG_SAMPLE_EVERY_N = 1
+if MARKET_LOG_MAX_ROWS_PER_RUN < 1:
+    MARKET_LOG_MAX_ROWS_PER_RUN = 1
+
+# --- Market Labeling (optional) ---
+MARKET_LABEL_ENABLE = (os.environ.get("MARKET_LABEL_ENABLE", "0").strip() == "1")
+MARKET_LABEL_SHEET_NAME = os.environ.get("MARKET_LABEL_SHEET_NAME", "market_label").strip() or "market_label"
+MARKET_LABEL_HORIZONS_MIN = [
+    int(x.strip())
+    for x in os.environ.get("MARKET_LABEL_HORIZONS_MIN", "60,120").split(",")
+    if x.strip().isdigit()
+]
+if not MARKET_LABEL_HORIZONS_MIN:
+    MARKET_LABEL_HORIZONS_MIN = [60, 120]
+MARKET_LABEL_MAX_PER_RUN = int(float(os.environ.get("MARKET_LABEL_MAX_PER_RUN", "200") or "200"))
+if MARKET_LABEL_MAX_PER_RUN < 1:
+    MARKET_LABEL_MAX_PER_RUN = 1
+MARKET_LABEL_RET_TH = float(os.environ.get("MARKET_LABEL_RET_TH", "0.0"))
+
 # Hyperliquid: 通常銘柄の表示レバ（基本10倍）
 # ※DEFAULT_LEV を正として一本化（環境変数 DEFAULT_LEV で変更可能）
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
@@ -272,6 +297,41 @@ EXPECTED_HEADERS_LEARN = [
 
 # learn_log の末尾に追加したい “学習用特徴量列”（既存列は一切ズラさない）
 EXTRA_HEADERS_LEARN = ["BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol"]
+
+
+MARKET_LOG_HEADERS: List[str] = [
+    "Datetime(SymbolTime_JST)",
+    "Symbol",
+    "Close",
+    "Sigma",
+    "BandWidth",
+    "BW_Change",
+    "RSI",
+    "Vol_Change",
+    "Rise_Score",
+    "Drop_Score",
+    "BTC_Ret",
+    "BTC_Vol",
+    "BTC_Mode",
+    "BTC_Calm",
+    "Upper2",
+    "Lower2",
+    "Version",
+    "SignalType",
+    "Note",
+]
+
+MARKET_LABEL_HEADERS: List[str] = [
+    "Datetime(SymbolTime_JST)",
+    "Symbol",
+    "HorizonMin",
+    "Close",
+    "FutureClose",
+    "Ret",
+    "LabelUp",
+    "Version",
+    "Note",
+]
 
 
 TABLE_FIELDS = [
@@ -688,6 +748,54 @@ def ensure_table_headers() -> bool:
         return (not STRICT_HEADER_CHECK)
 
     return True
+
+def ensure_market_log_headers() -> bool:
+    """
+    market_log シートを用意し、1行目ヘッダーを MARKET_LOG_HEADERS に揃える
+    """
+    try:
+        ok_sheet = ensure_sheet_exists(
+            MARKET_LOG_SHEET_NAME,
+            min_rows=200,
+            min_cols=len(MARKET_LOG_HEADERS),
+        )
+        if not ok_sheet:
+            return False
+
+        hdr = read_header_row(MARKET_LOG_SHEET_NAME)
+        if hdr == MARKET_LOG_HEADERS:
+            return True
+
+        write_header_row(MARKET_LOG_SHEET_NAME, MARKET_LOG_HEADERS)
+        return True
+    except Exception as e:
+        print("[WARN] ensure_market_log_headers failed:", e)
+        return False
+
+
+def ensure_market_label_headers() -> bool:
+    """
+    market_label シートを用意し、1行目ヘッダーを MARKET_LABEL_HEADERS に揃える
+    """
+    try:
+        ok_sheet = ensure_sheet_exists(
+            MARKET_LABEL_SHEET_NAME,
+            min_rows=200,
+            min_cols=len(MARKET_LABEL_HEADERS),
+        )
+        if not ok_sheet:
+            return False
+
+        hdr = read_header_row(MARKET_LABEL_SHEET_NAME)
+        if hdr == MARKET_LABEL_HEADERS:
+            return True
+
+        write_header_row(MARKET_LABEL_SHEET_NAME, MARKET_LABEL_HEADERS)
+        return True
+    except Exception as e:
+        print("[WARN] ensure_market_label_headers failed:", e)
+        return False
+
 
 def get_headers_and_len(sheet_name: str) -> Tuple[List[str], Optional[int], bool]:
     now = time.time()
@@ -2039,8 +2147,20 @@ def self_heal_prerequisites() -> Tuple[bool, str]:
         ok_lock = ensure_sheet_exists(RUN_MUTEX_SHEET, min_rows=50, min_cols=5)
         ok_learn = ensure_learn_headers()
         ok_table = ensure_table_headers()
-        ok_all = bool(ok_lock and ok_learn and ok_table)
-        return ok_all, f"lock={ok_lock} learn={ok_learn} table={ok_table}"
+
+        ok_market_log = True
+        if MARKET_LOG_ENABLE:
+            ok_market_log = ensure_market_log_headers()
+
+        ok_market_label = True
+        if MARKET_LABEL_ENABLE:
+            ok_market_label = ensure_market_label_headers()
+
+        ok_all = bool(ok_lock and ok_learn and ok_table and ok_market_log and ok_market_label)
+        return ok_all, (
+            f"lock={ok_lock} learn={ok_learn} table={ok_table} "
+            f"market_log={ok_market_log} market_label={ok_market_label}"
+        )
     except Exception as e:
         return False, f"self_heal failed: {e}"
 
@@ -2152,6 +2272,12 @@ def logic_main(force: bool = False):
     pending_candidates: List[Dict[str, Any]] = []
     pending_alerts: List[Dict[str, Any]] = []
 
+    # ----------------------------------------------------------
+    # Market snapshot logging buffers (optional)
+    # ----------------------------------------------------------
+    market_log_rows: List[List[Any]] = []
+    market_log_count = 0
+
     for symbol in symbols:
         try:
             ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
@@ -2188,6 +2314,57 @@ def logic_main(force: bool = False):
                 vol_ratio_val = ""
             else:
                 vol_ratio_val = vol_now / vol_ma20
+
+            # ----------------------------------------------------------
+            # Market snapshot logging (optional): market_log に全局面スナップショットを貯める
+            # ----------------------------------------------------------
+            if MARKET_LOG_ENABLE:
+                try:
+                    take = True
+                    if MARKET_LOG_SAMPLE_EVERY_N > 1:
+                        take = ((market_log_count % MARKET_LOG_SAMPLE_EVERY_N) == 0)
+
+                    if take and (len(market_log_rows) < MARKET_LOG_MAX_ROWS_PER_RUN):
+                        time_ms = safe_float(row.get("Time", 0.0), 0.0)
+                        if time_ms > 0.0:
+                            dt_jst = datetime.fromtimestamp(
+                                time_ms / 1000.0,
+                                tz=timezone.utc,
+                            ).astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            dt_jst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+
+                        bw_change_val = safe_float(row.get("BW_Change", 0.0), 0.0)
+
+                        vol_change_df = row.get("Vol_Change", None)
+                        vol_change_val = safe_float(vol_change_df, vol_ratio_val, default=vol_ratio_val) if (vol_change_df is not None) else vol_ratio_val
+
+                        market_row = [
+                            dt_jst,
+                            symbol,
+                            close_now,
+                            median_sigma,
+                            bw_val,
+                            bw_change_val,
+                            rsi_now,
+                            vol_change_val,
+                            rise_val,
+                            drop_val,
+                            safe_float(btc_ret, 0.0),
+                            safe_float(btc_vol, 0.0),
+                            btc_mode,
+                            bool(BTC_CALM),
+                            upper2_val,
+                            lower2_val,
+                            VERSION,
+                            "SNAPSHOT",
+                            "",
+                        ]
+                        market_log_rows.append(market_row)
+                except Exception as e:
+                    print("[WARN] market_log snapshot failed:", e)
+
+            market_log_count += 1
 
             is_buy = False
             is_sell = False
@@ -2406,6 +2583,17 @@ def logic_main(force: bool = False):
         except Exception as e:
             print(f"[ERR] {symbol} fetch/compute: {e}")
             continue
+
+    # ----------------------------------------------------------
+    # flush market_log rows (append)
+    # ----------------------------------------------------------
+    if MARKET_LOG_ENABLE:
+        try:
+            if market_log_rows:
+                append_rows_to_sheet(MARKET_LOG_SHEET_NAME, market_log_rows, MARKET_LOG_HEADERS)
+                print(f"[MARKET_LOG] appended {len(market_log_rows)} rows to {MARKET_LOG_SHEET_NAME}")
+        except Exception as e:
+            print("[WARN] market_log append failed:", e)
 
     def calc_tp_sl(item):
         tp_mult = 3.8
@@ -3298,6 +3486,170 @@ def run_process():
         except RuntimeError:
             pass
 
+
+
+@app.route("/label_market", methods=["GET", "POST"])
+def label_market_process():
+    """
+    market_log のスナップショットに対して、将来(H分後)の上昇/下落ラベルを market_label に追記する
+    - MARKET_LABEL_ENABLE=1 のときだけ動く
+    - 既にラベル済みの (Datetime, Symbol, HorizonMin) は重複追記しない
+    """
+    if not MARKET_LABEL_ENABLE:
+        return jsonify({"ok": True, "skipped": True, "reason": "MARKET_LABEL_ENABLE=0"})
+
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Busy: another run in progress"}), 429
+
+    mutex_token = None
+    try:
+        ok_pre, msg_pre = preflight_check()
+        if not ok_pre:
+            return jsonify({"ok": False, "error": msg_pre}), 500
+
+        ok_heal, msg_heal = self_heal_prerequisites()
+        if not ok_heal:
+            return jsonify({"ok": False, "error": msg_heal}), 500
+
+        mutex_token = acquire_run_mutex(ttl_sec=180)
+        if not mutex_token:
+            return jsonify({"ok": False, "error": "run_mutex busy"}), 429
+
+        svc = get_sheet_service()
+
+        # 既存ラベルのキーを作る（重複防止：直近3000行）
+        label_keys: Set[str] = set()
+        try:
+            n_lbl = _get_row_count_cached(MARKET_LABEL_SHEET_NAME)
+            if n_lbl >= 2:
+                start_lbl = max(2, n_lbl - 3000 + 1)
+                end_col_lbl = col_to_a1(len(MARKET_LABEL_HEADERS) - 1)
+                rng_lbl = f"{MARKET_LABEL_SHEET_NAME}!A{start_lbl}:{end_col_lbl}{n_lbl}"
+                vals_lbl = svc.spreadsheets().values().get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=rng_lbl,
+                ).execute().get("values", [])
+                for r in vals_lbl:
+                    if len(r) < 3:
+                        continue
+                    k = f"{str(r[1]).strip()}|{str(r[0]).strip()}|{str(r[2]).strip()}"
+                    label_keys.add(k)
+        except Exception as e:
+            print("[WARN] label_keys preload failed:", e)
+
+        # market_log の直近を読む（最大1500行）
+        n_mkt = _get_row_count_cached(MARKET_LOG_SHEET_NAME)
+        if n_mkt < 2:
+            return jsonify({"ok": True, "labeled": 0, "reason": "market_log empty"})
+
+        start_mkt = max(2, n_mkt - 1500 + 1)
+        end_col_mkt = col_to_a1(len(MARKET_LOG_HEADERS) - 1)
+        rng_mkt = f"{MARKET_LOG_SHEET_NAME}!A{start_mkt}:{end_col_mkt}{n_mkt}"
+        vals_mkt = svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=rng_mkt,
+        ).execute().get("values", [])
+
+        now_jst = datetime.now(timezone(timedelta(hours=9)))
+        ex = build_exchange()
+
+        out_rows: List[List[Any]] = []
+        processed = 0
+
+        for r in vals_mkt:
+            if processed >= MARKET_LABEL_MAX_PER_RUN:
+                break
+            if len(r) < 3:
+                continue
+
+            dt_str = str(r[0]).strip()
+            sym = str(r[1]).strip()
+            close0 = safe_float(r[2], 0.0)
+            if not dt_str or not sym or close0 <= 0.0:
+                continue
+
+            try:
+                dt0 = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone(timedelta(hours=9))
+                )
+            except Exception:
+                continue
+
+            for h in MARKET_LABEL_HORIZONS_MIN:
+                if processed >= MARKET_LABEL_MAX_PER_RUN:
+                    break
+
+                dt_target = dt0 + timedelta(minutes=int(h))
+                if now_jst < dt_target:
+                    continue  # まだ未来が来てない
+
+                k = f"{sym}|{dt_str}|{h}"
+                if k in label_keys:
+                    continue
+
+                try:
+                    candles = fetch_ohlcv_safe(ex, sym, timeframe="15m", limit=220)
+                    if not candles:
+                        continue
+
+                    target_ms = int(dt_target.astimezone(timezone.utc).timestamp() * 1000)
+                    future_close = None
+                    for c in candles:
+                        if len(c) < 5:
+                            continue
+                        ts = int(c[0])
+                        if ts >= target_ms:
+                            future_close = safe_float(c[4], 0.0)
+                            break
+                    if future_close is None or future_close <= 0.0:
+                        continue
+
+                    ret = (future_close - close0) / close0
+                    label_up = 1 if ret > MARKET_LABEL_RET_TH else 0
+
+                    out_rows.append([
+                        dt_str,
+                        sym,
+                        int(h),
+                        close0,
+                        future_close,
+                        ret,
+                        label_up,
+                        VERSION,
+                        "",
+                    ])
+                    label_keys.add(k)
+                    processed += 1
+
+                except Exception as e:
+                    print("[WARN] label calc failed:", sym, dt_str, h, e)
+                    continue
+
+        if out_rows:
+            append_rows_to_sheet(MARKET_LABEL_SHEET_NAME, out_rows, MARKET_LABEL_HEADERS)
+            print(f"[MARKET_LABEL] appended {len(out_rows)} rows to {MARKET_LABEL_SHEET_NAME}")
+
+        return jsonify({
+            "ok": True,
+            "labeled": len(out_rows),
+            "scanned": len(vals_mkt),
+            "max_per_run": MARKET_LABEL_MAX_PER_RUN,
+            "horizons": MARKET_LABEL_HORIZONS_MIN,
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    finally:
+        try:
+            if mutex_token:
+                release_run_mutex(mutex_token)
+        except Exception:
+            pass
+        try:
+            _run_lock.release()
+        except Exception:
+            pass
 
 
 @app.route("/judge", methods=["GET", "POST"])
