@@ -3518,9 +3518,11 @@ def label_market_process():
         if not ok_heal:
             return jsonify({"ok": False, "error": msg_heal}), 500
 
-        mutex_token = acquire_run_mutex(ttl_sec=180)
-        if not mutex_token:
+        okm, token = acquire_run_mutex()
+        if not okm:
             return jsonify({"ok": False, "error": "run_mutex busy"}), 429
+        mutex_token = token
+
 
         svc = get_sheet_service()
 
@@ -3722,6 +3724,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
