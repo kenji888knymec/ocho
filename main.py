@@ -1251,9 +1251,15 @@ def _mutex_write(value: str):
         body={"values": [[value]]},
     ).execute()
 
-def acquire_run_mutex() -> Tuple[bool, str]:
+def acquire_run_mutex(ttl_sec: Optional[int] = None) -> Tuple[bool, str]:
     if not RUN_MUTEX_ENABLED:
         return True, ""
+
+    # ttl_sec が渡されたらそれを優先。未指定なら従来どおり RUN_MUTEX_TTL_SEC
+    try:
+        effective_ttl = int(ttl_sec) if ttl_sec is not None else int(RUN_MUTEX_TTL_SEC)
+    except Exception:
+        effective_ttl = int(RUN_MUTEX_TTL_SEC)
 
     token = f"{int(time.time())}|{_INSTANCE_ID}"
     try:
@@ -1265,7 +1271,7 @@ def acquire_run_mutex() -> Tuple[bool, str]:
             except Exception:
                 ts = 0
 
-            if ts > 0 and (time.time() - ts) <= RUN_MUTEX_TTL_SEC:
+            if ts > 0 and (time.time() - ts) <= effective_ttl:
                 return False, ""
 
         _mutex_write(token)
@@ -1277,6 +1283,7 @@ def acquire_run_mutex() -> Tuple[bool, str]:
     except Exception as e:
         print(f"[WARN] acquire_run_mutex failed (fallback allow): {e}")
         return True, ""
+
 
 def release_run_mutex(token: str):
     if not RUN_MUTEX_ENABLED:
@@ -3715,5 +3722,6 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
