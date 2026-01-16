@@ -2355,7 +2355,8 @@ def logic_main(force: bool = False):
                         bw_change_val = safe_float(row.get("BW_Change", 0.0), 0.0)
 
                         vol_change_df = row.get("Vol_Change", None)
-                        vol_change_val = safe_float(vol_change_df, vol_ratio_val, default=vol_ratio_val) if (vol_change_df is not None) else vol_ratio_val
+                        vol_change_val = safe_float(vol_change_df, default=vol_ratio_val) if (vol_change_df is not None) else vol_ratio_val
+
 
                         market_row = [
                             dt_jst,                    # Time_JST
@@ -3736,6 +3737,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
