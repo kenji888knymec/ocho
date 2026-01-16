@@ -2332,6 +2332,7 @@ def logic_main(force: bool = False):
                         take = ((market_log_count % MARKET_LOG_SAMPLE_EVERY_N) == 0)
 
                     if take and (len(market_log_rows) < MARKET_LOG_MAX_ROWS_PER_RUN):
+                        # Time（ms想定）
                         time_ms = safe_float(row.get("Time", 0.0), 0.0)
                         if time_ms > 0.0:
                             dt_jst = datetime.fromtimestamp(
@@ -2341,35 +2342,46 @@ def logic_main(force: bool = False):
                         else:
                             dt_jst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
 
+                        # ここで row から安全に値を取る（未定義変数を参照しない）
+                        close_now = safe_float(row.get("Close", 0.0), 0.0)
+                        sigma_now = safe_float(row.get("Dynamic_Sigma", row.get("Sigma", 0.0)), 0.0)
+                        bw_val = safe_float(row.get("BandWidth", 0.0), 0.0)
+                        rsi_now = safe_float(row.get("RSI", 50.0), 50.0)
+                        rise_val = safe_float(row.get("Rise_Score", 0.0), 0.0)
+                        drop_val = safe_float(row.get("Drop_Score", 0.0), 0.0)
+                        upper2_val = safe_float(row.get("Upper2", 0.0), 0.0)
+                        lower2_val = safe_float(row.get("Lower2", 0.0), 0.0)
+
                         bw_change_val = safe_float(row.get("BW_Change", 0.0), 0.0)
 
                         vol_change_df = row.get("Vol_Change", None)
                         vol_change_val = safe_float(vol_change_df, vol_ratio_val, default=vol_ratio_val) if (vol_change_df is not None) else vol_ratio_val
 
                         market_row = [
-                            dt_jst,
-                            symbol,
-                            close_now,
-                            median_sigma,
-                            bw_val,
-                            bw_change_val,
-                            rsi_now,
-                            vol_change_val,
-                            rise_val,
-                            drop_val,
-                            safe_float(btc_ret, 0.0),
-                            safe_float(btc_vol, 0.0),
-                            btc_mode,
-                            bool(BTC_CALM),
-                            upper2_val,
-                            lower2_val,
-                            VERSION,
-                            "SNAPSHOT",
-                            "",
+                            dt_jst,                    # Time_JST
+                            symbol,                    # Symbol
+                            close_now,                 # Close
+                            sigma_now,                 # Sigma
+                            bw_val,                    # BandWidth
+                            bw_change_val,             # BW_Change
+                            rsi_now,                   # RSI
+                            vol_change_val,            # Vol_Change
+                            rise_val,                  # Rise_Score
+                            drop_val,                  # Drop_Score
+                            safe_float(btc_ret, 0.0),  # BTC_1h_Change
+                            safe_float(btc_vol, 0.0),  # BTC_1h_Vol
+                            btc_mode,                  # BTC_Mode
+                            bool(BTC_CALM),            # BTC_Calm
+                            upper2_val,                # Upper2
+                            lower2_val,                # Lower2
+                            VERSION,                   # Version
+                            "SNAPSHOT",                # Type
+                            "",                        # Note
                         ]
                         market_log_rows.append(market_row)
                 except Exception as e:
                     print("[WARN] market_log snapshot failed:", e)
+
 
             market_log_count += 1
 
@@ -3724,6 +3736,7 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
