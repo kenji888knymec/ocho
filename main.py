@@ -536,7 +536,11 @@ EXPECTED_HEADERS_LEARN = [
 ]
 
 # learn_log の末尾に追加したい “学習用特徴量列”（既存列は一切ズラさない）
-EXTRA_HEADERS_LEARN = ["BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol"]
+EXTRA_HEADERS_LEARN = ["BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
+    "market_ai_score",
+    "market_ai_pass",
+    "market_ai_debug",
+]
 
 
 MARKET_LOG_HEADERS: List[str] = [
@@ -3016,6 +3020,9 @@ def logic_main(force: bool = False):
             "vol_change": safe_float(item.get("Vol_Change", ""), ""),
             "btc_ret": safe_float(item.get("BTC_Ret", ""), ""),
             "btc_vol": safe_float(item.get("BTC_Vol", ""), ""),
+            "market_ai_score": safe_float(item.get("market_ai_score", ""), ""),
+            "market_ai_pass": bool(item.get("market_ai_pass", True)),
+            "market_ai_debug": item.get("market_ai_debug", ""),
         }
         for col_lower, val in feature_values.items():
             idx = learn_idx.get(col_lower)
