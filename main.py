@@ -326,15 +326,44 @@ def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
 def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
     dbg: Dict[str, Any] = {}
     try:
+        # 0) model が None の場合はバイパス
         if model is None:
             return None, True, {"error": "model_none"}
 
-        df = feats.copy()
+        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
+        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        if isinstance(model, dict):
+            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
+                if k in model:
+                    model = model[k]
+                    dbg["unwrap"] = f"dict:{k}"
+                    break
 
+        if isinstance(model, (tuple, list)) and len(model) >= 1:
+            model = model[0]
+            dbg["unwrap"] = "list0"
+
+        # unwrap した結果でも predict_proba が無いならバイパス
+        if not hasattr(model, "predict_proba"):
+            dbg["error"] = f"model_type={type(model)} has no predict_proba"
+            return None, True, dbg
+
+        # 2) feats を DataFrame に整形
+        if feats is None:
+            df = pd.DataFrame([{}])
+        elif isinstance(feats, pd.DataFrame):
+            df = feats.copy()
+        else:
+            df = pd.DataFrame(feats)
+
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # bool 列は int 化
         for c in df.columns:
             if df[c].dtype == bool:
                 df[c] = df[c].astype(int)
 
+        # 3) 特徴量列を feature_names_in_ に合わせる（あれば）
         expected = getattr(model, "feature_names_in_", None)
         if expected is not None:
             exp = [str(x) for x in list(expected)]
@@ -345,12 +374,14 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             df = df[exp]
             dbg["aligned_cols"] = list(df.columns)
 
+        # 4) predict_proba
         proba = model.predict_proba(df)
         return proba, False, dbg
 
     except Exception as e:
         dbg["error"] = f"{type(e).__name__}: {e}"
         return None, True, dbg
+
 
 def _market_feats_from_row(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> pd.DataFrame:
     close_now = float(row.get("Close", 0.0))
