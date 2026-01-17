@@ -218,6 +218,246 @@ ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
 AUTO_JUDGE_AFTER_RUN = os.environ.get("AUTO_JUDGE_AFTER_RUN", "0") == "1"
 FAIL_CLOSED_ON_AI_BYPASS = os.environ.get("FAIL_CLOSED_ON_AI_BYPASS", "1") == "1"
 
+# ==========================================================
+# Market AI Filter (optional)
+#  - GCS上の market_model_h60/h120 を読み込み、候補をフィルタする
+#  - ENABLE_MARKET_AI_FILTER=0 の間は「読み込み/採点しない」（運用を変えない）
+# ==========================================================
+ENABLE_MARKET_AI_FILTER = (os.environ.get("ENABLE_MARKET_AI_FILTER", "0").strip() == "1")
+MARKET_MODELS_GCS_PREFIX = os.environ.get("MARKET_MODELS_GCS_PREFIX", "").strip()
+
+# どのモデルを使って判定するか
+#  - "h60"      : h60 だけで判定（まずはこれ推奨）
+#  - "h120"     : h120 だけで判定
+#  - "both_min" : min(h60,h120) で判定（両方必要）
+#  - "both_avg" : avg(h60,h120) で判定（両方必要）
+MARKET_AI_MODE = os.environ.get("MARKET_AI_MODE", "h60").strip().lower()
+
+# しきい値（学習出力の threshold_pick を初期値に寄せる）
+MARKET_AI_TH_H60 = float(os.environ.get("MARKET_AI_TH_H60", "0.48"))
+MARKET_AI_TH_H120 = float(os.environ.get("MARKET_AI_TH_H120", "0.99"))
+
+# Marketモデルのキャッシュ（GCSアクセス抑制）
+MARKET_MODELS_CACHE_TTL_SEC = int(float(os.environ.get("MARKET_MODELS_CACHE_TTL_SEC", "3600") or "3600"))
+
+# 内部キャッシュ
+_market_models_lock = threading.Lock()
+_market_models_cache = {
+    "loaded_at": 0.0,
+    "prefix": "",
+    "models": {},  # {"h60": model, "h120": model}
+    "meta": {},    # {"h60": {...}, "h120": {...}, "all": {...}}
+    "error": "",
+}
+
+def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
+    s2 = (gs_uri or "").strip()
+    if not s2.startswith("gs://"):
+        raise ValueError(f"invalid gs uri: {gs_uri}")
+    rest = s2[len("gs://"):]
+    parts = rest.split("/", 1)
+    bucket = parts[0]
+    path = parts[1] if len(parts) > 1 else ""
+    return bucket, path
+
+def _download_gcs_bytes(gs_uri: str) -> bytes:
+    from google.cloud import storage
+    bucket, path = _parse_gs_uri(gs_uri)
+    client = storage.Client()
+    b = client.bucket(bucket)
+    blob = b.blob(path)
+    return blob.download_as_bytes()
+
+def _load_joblib_from_gcs(gs_uri: str):
+    import io
+    raw = _download_gcs_bytes(gs_uri)
+    return joblib.load(io.BytesIO(raw))
+
+def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    global _market_models_cache
+    now = time.time()
+    with _market_models_lock:
+        if (
+            _market_models_cache.get("models")
+            and _market_models_cache.get("prefix") == MARKET_MODELS_GCS_PREFIX
+            and (now - float(_market_models_cache.get("loaded_at", 0.0))) < float(MARKET_MODELS_CACHE_TTL_SEC)
+        ):
+            return dict(_market_models_cache["models"]), dict(_market_models_cache["meta"]), str(_market_models_cache.get("error", ""))
+
+    if not MARKET_MODELS_GCS_PREFIX:
+        return {}, {}, "MARKET_MODELS_GCS_PREFIX is empty"
+
+    err = ""
+    models: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {}
+
+    prefix = MARKET_MODELS_GCS_PREFIX.rstrip("/")
+
+    try:
+        uri_h60 = f"{prefix}/market_model_h60.joblib"
+        uri_h120 = f"{prefix}/market_model_h120.joblib"
+        models["h60"] = _load_joblib_from_gcs(uri_h60)
+        models["h120"] = _load_joblib_from_gcs(uri_h120)
+
+        try:
+            import json as _json
+            meta_h60 = _download_gcs_bytes(f"{prefix}/market_model_h60_meta.json")
+            meta_h120 = _download_gcs_bytes(f"{prefix}/market_model_h120_meta.json")
+            meta_all = _download_gcs_bytes(f"{prefix}/market_models_all_meta.json")
+            meta["h60"] = _json.loads(meta_h60.decode("utf-8"))
+            meta["h120"] = _json.loads(meta_h120.decode("utf-8"))
+            meta["all"] = _json.loads(meta_all.decode("utf-8"))
+        except Exception:
+            meta = {}
+    except Exception as e:
+        err = f"market models load failed: {type(e).__name__}: {e}"
+        models = {}
+        meta = {}
+
+    with _market_models_lock:
+        _market_models_cache["loaded_at"] = now
+        _market_models_cache["prefix"] = MARKET_MODELS_GCS_PREFIX
+        _market_models_cache["models"] = models
+        _market_models_cache["meta"] = meta
+        _market_models_cache["error"] = err
+
+    return dict(models), dict(meta), err
+
+def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
+    dbg: Dict[str, Any] = {}
+    try:
+        if model is None:
+            return None, True, {"error": "model_none"}
+
+        df = feats.copy()
+
+        for c in df.columns:
+            if df[c].dtype == bool:
+                df[c] = df[c].astype(int)
+
+        expected = getattr(model, "feature_names_in_", None)
+        if expected is not None:
+            exp = [str(x) for x in list(expected)]
+            dbg["expected_cols"] = exp
+            for c in exp:
+                if c not in df.columns:
+                    df[c] = 0
+            df = df[exp]
+            dbg["aligned_cols"] = list(df.columns)
+
+        proba = model.predict_proba(df)
+        return proba, False, dbg
+
+    except Exception as e:
+        dbg["error"] = f"{type(e).__name__}: {e}"
+        return None, True, dbg
+
+def _market_feats_from_row(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> pd.DataFrame:
+    close_now = float(row.get("Close", 0.0))
+    sigma_now = float(row.get("Dynamic_Sigma", row.get("Sigma", 0.0)))
+    bw = float(row.get("BandWidth", 0.0))
+    bw_chg = float(row.get("BW_Change", 0.0))
+    rsi = float(row.get("RSI", 50.0))
+    vol_chg = float(row.get("Vol_Change", 0.0))
+    rise = float(row.get("Rise_Score", 0.0))
+    drop = float(row.get("Drop_Score", 0.0))
+    upper2 = float(row.get("Upper2", 0.0))
+    lower2 = float(row.get("Lower2", 0.0))
+
+    m = str(btc_mode or "").strip()
+    return pd.DataFrame([{
+        "Close": close_now,
+        "Sigma": sigma_now,
+        "BandWidth": bw,
+        "BW_Change": bw_chg,
+        "RSI": rsi,
+        "Vol_Change": vol_chg,
+        "Rise_Score": rise,
+        "Drop_Score": drop,
+        "BTC_Ret": float(btc_ret),
+        "BTC_Vol": float(btc_vol),
+        "BTC_Mode": m,
+        "BTC_Calm": int(bool(btc_calm)),
+        "Upper2": upper2,
+        "Lower2": lower2,
+        "BTC_Mode_Up": int(m == "Up"),
+        "BTC_Mode_Down": int(m == "Down"),
+        "BTC_Mode_Side": int(m == "Side"),
+        "BTC_Mode_Other": int(m not in ["Up", "Down", "Side"]),
+    }])
+
+def eval_market_ai(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> Tuple[Optional[float], bool, Dict[str, Any]]:
+    dbg: Dict[str, Any] = {
+        "enabled": bool(ENABLE_MARKET_AI_FILTER),
+        "mode": str(MARKET_AI_MODE),
+        "prefix": str(MARKET_MODELS_GCS_PREFIX),
+    }
+
+    models, meta, err = get_market_models()
+    dbg["load_error"] = err
+    if not models:
+        dbg["bypassed"] = True
+        return None, True, dbg
+
+    feats = _market_feats_from_row(row, btc_mode, btc_calm, btc_ret, btc_vol)
+
+    p60 = None
+    p120 = None
+
+    proba60, by60, dbg60 = safe_market_predict_proba(models.get("h60"), feats)
+    proba120, by120, dbg120 = safe_market_predict_proba(models.get("h120"), feats)
+    dbg["dbg_h60"] = dbg60
+    dbg["dbg_h120"] = dbg120
+
+    if not by60 and proba60 is not None:
+        try:
+            p60 = float(proba60[0][1])
+        except Exception:
+            p60 = None
+
+    if not by120 and proba120 is not None:
+        try:
+            p120 = float(proba120[0][1])
+        except Exception:
+            p120 = None
+
+    dbg["p60"] = p60
+    dbg["p120"] = p120
+
+    mode = str(MARKET_AI_MODE or "h60").lower()
+
+    score_agg: Optional[float] = None
+    passed = True
+
+    if mode == "h120":
+        score_agg = p120
+        passed = (p120 is None) or (float(p120) >= float(MARKET_AI_TH_H120))
+    elif mode == "both_min":
+        if (p60 is None) or (p120 is None):
+            score_agg = None
+            passed = True
+        else:
+            score_agg = float(min(float(p60), float(p120)))
+            passed = (float(p60) >= float(MARKET_AI_TH_H60)) and (float(p120) >= float(MARKET_AI_TH_H120))
+    elif mode == "both_avg":
+        if (p60 is None) or (p120 is None):
+            score_agg = None
+            passed = True
+        else:
+            score_agg = float((float(p60) + float(p120)) / 2.0)
+            passed = (float(p60) >= float(MARKET_AI_TH_H60)) and (float(p120) >= float(MARKET_AI_TH_H120))
+    else:
+        score_agg = p60
+        passed = (p60 is None) or (float(p60) >= float(MARKET_AI_TH_H60))
+
+    dbg["score_agg"] = score_agg
+    dbg["passed"] = bool(passed)
+    dbg["th_h60"] = float(MARKET_AI_TH_H60)
+    dbg["th_h120"] = float(MARKET_AI_TH_H120)
+
+    return score_agg, bool(passed), dbg
+
+
 # 60本取れないケースを安定運用で捌くための最低本数（rolling20 + 参照(-6) を考慮）
 MIN_BARS = int(float(os.environ.get("MIN_BARS", "30")))
 
@@ -2554,7 +2794,7 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
-            # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
+                        # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
             if bypassed:
                 if FAIL_CLOSED_ON_AI_BYPASS:
                     ai_pass = False
@@ -2565,9 +2805,30 @@ def logic_main(force: bool = False):
             else:
                 ai_pass = (float(ai_score) >= float(ai_th_used))
 
+            # ----------------------------------------------------------
+            # Market AI Filter (optional)
+            #  - ENABLE_MARKET_AI_FILTER=1 のときだけ採点して ai_pass に合成する
+            # ----------------------------------------------------------
+            market_ai_score = None
+            market_ai_pass = True
+            market_ai_debug: Dict[str, Any] = {"enabled": False, "skipped": True, "reason": "ENABLE_MARKET_AI_FILTER=0"}
 
+            if ENABLE_MARKET_AI_FILTER:
+                try:
+                    market_ai_score, market_ai_pass, market_ai_debug = eval_market_ai(
+                        row=row,
+                        btc_mode=btc_mode,
+                        btc_calm=bool(BTC_CALM),
+                        btc_ret=float(btc_ret),
+                        btc_vol=float(btc_vol),
+                    )
+                except Exception as e:
+                    market_ai_score = None
+                    market_ai_pass = True  # 失敗時はバイパス（運用を壊さない）
+                    market_ai_debug = {"enabled": True, "bypassed": True, "error": f"{type(e).__name__}: {e}"}
 
-
+            # 合成（Market AI が有効な時だけ効かせる）
+            ai_pass_effective = bool(ai_pass) and (bool(market_ai_pass) if ENABLE_MARKET_AI_FILTER else True)
 
             item = {
                 "symbol": symbol.replace("/USDT", ""),
@@ -2580,13 +2841,21 @@ def logic_main(force: bool = False):
                 "rsi": float(row["RSI"]),
                 "type": signal_type,
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
+
+                # 既存AI
                 "ai_score": ai_score,
-                "ai_pass": bool(ai_pass),
+                "ai_pass": bool(ai_pass_effective),
                 "ai_debug": dbg,
+
+                # Market AI（追加）
+                "market_ai_score": market_ai_score,
+                "market_ai_pass": bool(market_ai_pass),
+                "market_ai_debug": market_ai_debug,
+
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
 
-                # --- 追加：学習用特徴量（learn_log に保存して、次回学習で効かせる） ---
+                # --- 学習用特徴量（learn_log に保存） ---
                 "BandWidth": safe_float(row.get("BandWidth", 0.0), 0.0),
                 "BW_Change": safe_float(row.get("BW_Change", 0.0), 0.0),
                 "Vol_Change": safe_float(row.get("Vol_Change", 0.0), 0.0),
@@ -2594,10 +2863,9 @@ def logic_main(force: bool = False):
                 "BTC_Vol": safe_float(btc_vol, 0.0),
             }
 
-
             pending_candidates.append(item)
 
-            if ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
+            if ai_pass_effective and BTC_CALM and item["score"] >= ALERT_SIGMA:
                 pending_alerts.append(item)
 
         except Exception as e:
