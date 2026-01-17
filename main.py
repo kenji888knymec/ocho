@@ -2929,7 +2929,24 @@ def logic_main(force: bool = False):
             
     
     # 列名→index（小文字化して揺れに強くする）
-    learn_idx = {str(h).strip().lower(): i for i, h in enumerate(learn_fields) if str(h).strip()}
+    # 同名列があっても「最初（左側）」を優先して固定する（右側に上書きしない）
+    learn_idx: Dict[str, int] = {}
+    for i, h in enumerate(learn_fields):
+        key = str(h).strip().lower()
+        if key and (key not in learn_idx):
+            learn_idx[key] = i
+
+    def _cell_json(v: Any) -> str:
+        """
+        Google Sheets の values.append は「文字列/数値/真偽/空」しか安全に入らない。
+        dict/list は JSON 文字列化して入れる。
+        """
+        if v is None:
+            return ""
+        if isinstance(v, (dict, list, tuple)):
+            import json
+            return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+        return str(v)
 
     candidate_rows: List[List[Any]] = []
 
@@ -3013,21 +3030,26 @@ def logic_main(force: bool = False):
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
-        # --- 追加：学習用特徴量を “列名で” 差し込む（列ズレしない） ---
+        # --- 列名で差し込む（列ズレしない） ---
         feature_values = {
+            # 既存の学習用特徴量
             "bandwidth": safe_float(item.get("BandWidth", ""), ""),
             "bw_change": safe_float(item.get("BW_Change", ""), ""),
             "vol_change": safe_float(item.get("Vol_Change", ""), ""),
             "btc_ret": safe_float(item.get("BTC_Ret", ""), ""),
             "btc_vol": safe_float(item.get("BTC_Vol", ""), ""),
-            "market_ai_score": safe_float(item.get("market_ai_score", ""), ""),
-            "market_ai_pass": bool(item.get("market_ai_pass", True)),
-            "market_ai_debug": item.get("market_ai_debug", ""),
+
+            # Market AI（learn_log に表示・追跡したい列）
+            "market_ai_score": "" if (item.get("market_ai_score", None) is None) else safe_float(item.get("market_ai_score"), ""),
+            "market_ai_pass": "" if (item.get("market_ai_pass", None) is None) else bool(item.get("market_ai_pass")),
+            "market_ai_debug": _cell_json(item.get("market_ai_debug", "")),
         }
+
         for col_lower, val in feature_values.items():
-            idx = learn_idx.get(col_lower)
+            idx = learn_idx.get(str(col_lower).strip().lower())
             if idx is not None:
                 row_out[idx] = val
+
 
 
         candidate_rows.append(row_out)
