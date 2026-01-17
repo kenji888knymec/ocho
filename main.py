@@ -326,27 +326,71 @@ def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
 def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
     dbg: Dict[str, Any] = {}
     try:
-        # 0) model が None の場合はバイパス
         if model is None:
             return None, True, {"error": "model_none"}
 
-        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
-        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        # --- dict ラッパー対応（joblib で dict が返るケースを吸収） ---
+        base_model = model
         if isinstance(model, dict):
-            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
-                if k in model:
-                    model = model[k]
-                    dbg["unwrap"] = f"dict:{k}"
+            dbg["model_wrapper"] = "dict"
+            dbg["wrapper_keys"] = [str(k) for k in list(model.keys())]
+
+            # よくあるキーを優先して探す
+            for k in ["model", "clf", "estimator", "pipeline", "sk_model"]:
+                v = model.get(k)
+                if v is not None and hasattr(v, "predict_proba"):
+                    base_model = v
+                    dbg["unwrapped_from"] = k
                     break
 
-        if isinstance(model, (tuple, list)) and len(model) >= 1:
-            model = model[0]
-            dbg["unwrap"] = "list0"
+            # それでも見つからなければ、dict の中身を総当たり
+            if (base_model is model) and (not hasattr(base_model, "predict_proba")):
+                for k, v in model.items():
+                    if v is not None and hasattr(v, "predict_proba"):
+                        base_model = v
+                        dbg["unwrapped_from"] = str(k)
+                        break
 
-        # unwrap した結果でも predict_proba が無いならバイパス
-        if not hasattr(model, "predict_proba"):
-            dbg["error"] = f"model_type={type(model)} has no predict_proba"
-            return None, True, dbg
+            # 最後まで見つからないなら fail-open（運用を止めない）
+            if not hasattr(base_model, "predict_proba"):
+                dbg["error"] = "model_has_no_predict_proba"
+                return None, True, dbg
+
+        # --- list/tuple ラッパー対応（念のため） ---
+        if isinstance(base_model, (tuple, list)) and len(base_model) >= 1:
+            cand = base_model[0]
+            if hasattr(cand, "predict_proba"):
+                dbg["model_wrapper2"] = "list0"
+                base_model = cand
+
+        df = feats.copy()
+
+        # bool → int（BTC_Calm など）
+        for c in df.columns:
+            if df[c].dtype == bool:
+                df[c] = df[c].astype(int)
+
+        # feature_names_in_ は base_model 優先。
+        expected = getattr(base_model, "feature_names_in_", None)
+        if expected is None and isinstance(model, dict):
+            expected = model.get("feature_names_in_", None) or model.get("feature_names", None)
+
+        if expected is not None:
+            exp = [str(x) for x in list(expected)]
+            dbg["expected_cols"] = exp
+            for c in exp:
+                if c not in df.columns:
+                    df[c] = 0
+            df = df[exp]
+            dbg["aligned_cols"] = list(df.columns)
+
+        proba = base_model.predict_proba(df)
+        return proba, False, dbg
+
+    except Exception as e:
+        dbg["error"] = f"{type(e).__name__}: {e}"
+        return None, True, dbg
+
 
         # 2) feats を DataFrame に整形
         if feats is None:
