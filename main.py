@@ -326,73 +326,50 @@ def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
 def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
     dbg: Dict[str, Any] = {}
     try:
+        # 0) model が None の場合はバイパス
         if model is None:
             return None, True, {"error": "model_none"}
 
-        # --- dict ラッパー対応（joblib で dict が返るケースを吸収） ---
+        # 1) wrapper 対応（dict / tuple / list を吸収）
         base_model = model
-        if isinstance(model, dict):
-            dbg["model_wrapper"] = "dict"
-            dbg["wrapper_keys"] = [str(k) for k in list(model.keys())]
 
-            # よくあるキーを優先して探す
+        # list/tuple wrapper（先頭要素がモデルのケース）
+        if isinstance(base_model, (tuple, list)) and len(base_model) >= 1:
+            dbg["model_wrapper"] = "list_or_tuple"
+            dbg["wrapper_len"] = len(base_model)
+            cand = base_model[0]
+            if cand is not None and hasattr(cand, "predict_proba"):
+                base_model = cand
+                dbg["unwrapped_from"] = "index0"
+
+        # dict wrapper（joblib で dict が返るケース）
+        if isinstance(base_model, dict):
+            dbg["model_wrapper"] = "dict"
+            dbg["wrapper_keys"] = [str(k) for k in list(base_model.keys())]
+
+            # よくあるキーを優先
             for k in ["model", "clf", "estimator", "pipeline", "sk_model"]:
-                v = model.get(k)
+                v = base_model.get(k)
                 if v is not None and hasattr(v, "predict_proba"):
-                    base_model = v
                     dbg["unwrapped_from"] = k
+                    base_model = v
                     break
 
-            # それでも見つからなければ、dict の中身を総当たり
-            if (base_model is model) and (not hasattr(base_model, "predict_proba")):
-                for k, v in model.items():
+            # 見つからなければ総当たり
+            if not hasattr(base_model, "predict_proba"):
+                for k, v in base_model.items():
                     if v is not None and hasattr(v, "predict_proba"):
-                        base_model = v
                         dbg["unwrapped_from"] = str(k)
+                        base_model = v
                         break
 
-            # 最後まで見つからないなら fail-open（運用を止めない）
+            # 最後まで無ければ fail-open
             if not hasattr(base_model, "predict_proba"):
                 dbg["error"] = "model_has_no_predict_proba"
+                dbg["model_type"] = str(type(model))
                 return None, True, dbg
 
-        # --- list/tuple ラッパー対応（念のため） ---
-        if isinstance(base_model, (tuple, list)) and len(base_model) >= 1:
-            cand = base_model[0]
-            if hasattr(cand, "predict_proba"):
-                dbg["model_wrapper2"] = "list0"
-                base_model = cand
-
-        df = feats.copy()
-
-        # bool → int（BTC_Calm など）
-        for c in df.columns:
-            if df[c].dtype == bool:
-                df[c] = df[c].astype(int)
-
-        # feature_names_in_ は base_model 優先。
-        expected = getattr(base_model, "feature_names_in_", None)
-        if expected is None and isinstance(model, dict):
-            expected = model.get("feature_names_in_", None) or model.get("feature_names", None)
-
-        if expected is not None:
-            exp = [str(x) for x in list(expected)]
-            dbg["expected_cols"] = exp
-            for c in exp:
-                if c not in df.columns:
-                    df[c] = 0
-            df = df[exp]
-            dbg["aligned_cols"] = list(df.columns)
-
-        proba = base_model.predict_proba(df)
-        return proba, False, dbg
-
-    except Exception as e:
-        dbg["error"] = f"{type(e).__name__}: {e}"
-        return None, True, dbg
-
-
-        # 2) feats を DataFrame に整形
+        # 2) feats を DataFrame に整形（安全化）
         if feats is None:
             df = pd.DataFrame([{}])
         elif isinstance(feats, pd.DataFrame):
@@ -402,13 +379,24 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
 
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        # bool 列は int 化
+        # bool → int（BTC_Calm など）
         for c in df.columns:
             if df[c].dtype == bool:
                 df[c] = df[c].astype(int)
 
         # 3) 特徴量列を feature_names_in_ に合わせる（あれば）
-        expected = getattr(model, "feature_names_in_", None)
+        expected = getattr(base_model, "feature_names_in_", None)
+
+        # wrapper 側に feature 名があるケースを吸収（model / base_model の dict を両方見る）
+        if expected is None:
+            src = None
+            if isinstance(model, dict):
+                src = model
+            elif isinstance(base_model, dict):
+                src = base_model
+            if src is not None:
+                expected = src.get("feature_names_in_", None) or src.get("feature_names", None)
+
         if expected is not None:
             exp = [str(x) for x in list(expected)]
             dbg["expected_cols"] = exp
@@ -419,12 +407,13 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             dbg["aligned_cols"] = list(df.columns)
 
         # 4) predict_proba
-        proba = model.predict_proba(df)
+        proba = base_model.predict_proba(df)
         return proba, False, dbg
 
     except Exception as e:
         dbg["error"] = f"{type(e).__name__}: {e}"
         return None, True, dbg
+
 
 
 def _market_feats_from_row(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> pd.DataFrame:
