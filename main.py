@@ -836,6 +836,32 @@ def get_sheet_service():
     _sheet_service_cache["ts"] = now
     return svc
 
+def sheets_execute_with_retry(req, max_retries: int = 6, base_sleep: float = 2.0, max_sleep: float = 30.0):
+    """
+    Google Sheets API の execute を 429/5xx のときだけリトライする。
+    ログは増やさない（成功すれば何も出さない）。
+    """
+    import random
+    for attempt in range(max_retries + 1):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = None
+            # googleapiclient の HttpError は resp.status に入っていることが多い
+            if hasattr(e, "resp") and hasattr(e.resp, "status"):
+                status = e.resp.status
+
+            # 429: rate limit / 5xx: transient
+            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
+                sleep_sec = min(max_sleep, base_sleep * (2 ** attempt))
+                # ジッター（同時リトライ衝突を避ける）
+                time.sleep(sleep_sec + random.uniform(0.0, 0.7))
+                continue
+
+            # リトライ対象外 or リトライしきったら上に投げる（/judge が catch して Discord 通知する）
+            raise
+
+
 def _normalize_headers(headers: List[Any]) -> List[str]:
     hs = [("" if h is None else str(h)).strip() for h in headers]
     while hs and hs[-1] == "":
@@ -1914,10 +1940,12 @@ def _sheet_rows_as_df(sheet_name: str, lookback_rows: int) -> pd.DataFrame:
 
     start_row = max(2, last_row - int(lookback_rows) + 1)
     rng = f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}"
-    res = service.spreadsheets().values().get(
+    req = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=rng,
-    ).execute()
+    )
+    res = sheets_execute_with_retry(req)
+
 
     rows = res.get("values", []) or []
     if not rows:
