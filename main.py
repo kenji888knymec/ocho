@@ -223,6 +223,23 @@ FAIL_CLOSED_ON_AI_BYPASS = os.environ.get("FAIL_CLOSED_ON_AI_BYPASS", "1") == "1
 #  - GCS上の market_model_h60/h120 を読み込み、候補をフィルタする
 #  - ENABLE_MARKET_AI_FILTER=0 の間は「読み込み/採点しない」（運用を変えない）
 # ==========================================================
+def _env_float(name: str, default: str) -> float:
+    """
+    環境変数のfloat読み取りを安全化。
+    - "0.48" はそのまま
+    - "0,48" のような「小数点カンマ」を "0.48" に補正
+    """
+    s = os.environ.get(name, default)
+    s = (s or "").strip()
+
+    # 小数点カンマの補正（例: "0,48" -> "0.48"）
+    if ("," in s) and ("." not in s) and (s.count(",") == 1):
+        left, right = s.split(",", 1)
+        if left.isdigit() and right.isdigit() and 1 <= len(right) <= 6:
+            s = f"{left}.{right}"
+
+    return float(s)
+
 ENABLE_MARKET_AI_FILTER = (os.environ.get("ENABLE_MARKET_AI_FILTER", "0").strip() == "1")
 MARKET_MODELS_GCS_PREFIX = os.environ.get("MARKET_MODELS_GCS_PREFIX", "").strip()
 
@@ -233,9 +250,13 @@ MARKET_MODELS_GCS_PREFIX = os.environ.get("MARKET_MODELS_GCS_PREFIX", "").strip(
 #  - "both_avg" : avg(h60,h120) で判定（両方必要）
 MARKET_AI_MODE = os.environ.get("MARKET_AI_MODE", "h60").strip().lower()
 
+# 単体URIで Market AI モデルを指したい場合（任意）
+# 例: gs://.../market_ai_btc_h60.pkl
+MARKET_AI_MODEL_URI = os.environ.get("MARKET_AI_MODEL_URI", "").strip()
+
 # しきい値（学習出力の threshold_pick を初期値に寄せる）
-MARKET_AI_TH_H60 = float(os.environ.get("MARKET_AI_TH_H60", "0.48"))
-MARKET_AI_TH_H120 = float(os.environ.get("MARKET_AI_TH_H120", "0.99"))
+MARKET_AI_TH_H60 = _env_float("MARKET_AI_TH_H60", "0.48")
+MARKET_AI_TH_H120 = _env_float("MARKET_AI_TH_H120", "0.99")
 
 # Marketモデルのキャッシュ（GCSアクセス抑制）
 MARKET_MODELS_CACHE_TTL_SEC = int(float(os.environ.get("MARKET_MODELS_CACHE_TTL_SEC", "3600") or "3600"))
@@ -244,11 +265,13 @@ MARKET_MODELS_CACHE_TTL_SEC = int(float(os.environ.get("MARKET_MODELS_CACHE_TTL_
 _market_models_lock = threading.Lock()
 _market_models_cache = {
     "loaded_at": 0.0,
+    "cache_key": "",
     "prefix": "",
     "models": {},  # {"h60": model, "h120": model}
     "meta": {},    # {"h60": {...}, "h120": {...}, "all": {...}}
     "error": "",
 }
+
 
 def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     s2 = (gs_uri or "").strip()
@@ -274,41 +297,57 @@ def _load_joblib_from_gcs(gs_uri: str):
     return joblib.load(io.BytesIO(raw))
 
 def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
+    """
+    Market AI のモデル取得。
+    優先順位:
+      1) MARKET_AI_MODEL_URI が指定されていれば、それを MARKET_AI_MODE のキーにロード
+      2) それ以外は MARKET_MODELS_GCS_PREFIX 配下の固定名（market_model_h60.joblib 等）をロード
+    """
     global _market_models_cache
     now = time.time()
+
+    cache_key = f"{MARKET_MODELS_GCS_PREFIX}__{MARKET_AI_MODEL_URI}__{MARKET_AI_MODE}"
     with _market_models_lock:
         if (
             _market_models_cache.get("models")
-            and _market_models_cache.get("prefix") == MARKET_MODELS_GCS_PREFIX
+            and _market_models_cache.get("cache_key") == cache_key
             and (now - float(_market_models_cache.get("loaded_at", 0.0))) < float(MARKET_MODELS_CACHE_TTL_SEC)
         ):
             return dict(_market_models_cache["models"]), dict(_market_models_cache["meta"]), str(_market_models_cache.get("error", ""))
-
-    if not MARKET_MODELS_GCS_PREFIX:
-        return {}, {}, "MARKET_MODELS_GCS_PREFIX is empty"
 
     err = ""
     models: Dict[str, Any] = {}
     meta: Dict[str, Any] = {}
 
-    prefix = MARKET_MODELS_GCS_PREFIX.rstrip("/")
-
     try:
-        uri_h60 = f"{prefix}/market_model_h60.joblib"
-        uri_h120 = f"{prefix}/market_model_h120.joblib"
-        models["h60"] = _load_joblib_from_gcs(uri_h60)
-        models["h120"] = _load_joblib_from_gcs(uri_h120)
+        # 1) 単体URI指定があればそれを優先
+        if MARKET_AI_MODEL_URI:
+            key = str(MARKET_AI_MODE or "h60")
+            models[key] = _load_joblib_from_gcs(MARKET_AI_MODEL_URI)
 
-        try:
-            import json as _json
-            meta_h60 = _download_gcs_bytes(f"{prefix}/market_model_h60_meta.json")
-            meta_h120 = _download_gcs_bytes(f"{prefix}/market_model_h120_meta.json")
-            meta_all = _download_gcs_bytes(f"{prefix}/market_models_all_meta.json")
-            meta["h60"] = _json.loads(meta_h60.decode("utf-8"))
-            meta["h120"] = _json.loads(meta_h120.decode("utf-8"))
-            meta["all"] = _json.loads(meta_all.decode("utf-8"))
-        except Exception:
-            meta = {}
+        # 2) prefix もあれば従来どおり h60/h120 を補完ロード
+        if MARKET_MODELS_GCS_PREFIX:
+            prefix = MARKET_MODELS_GCS_PREFIX.rstrip("/")
+
+            if "h60" not in models:
+                models["h60"] = _load_joblib_from_gcs(f"{prefix}/market_model_h60.joblib")
+            if "h120" not in models:
+                models["h120"] = _load_joblib_from_gcs(f"{prefix}/market_model_h120.joblib")
+
+            try:
+                import json as _json
+                meta_h60 = _download_gcs_bytes(f"{prefix}/market_model_h60_meta.json")
+                meta_h120 = _download_gcs_bytes(f"{prefix}/market_model_h120_meta.json")
+                meta_all = _download_gcs_bytes(f"{prefix}/market_models_all_meta.json")
+                meta["h60"] = _json.loads(meta_h60.decode("utf-8"))
+                meta["h120"] = _json.loads(meta_h120.decode("utf-8"))
+                meta["all"] = _json.loads(meta_all.decode("utf-8"))
+            except Exception:
+                meta = {}
+
+        if (not models) and (not MARKET_MODELS_GCS_PREFIX) and (not MARKET_AI_MODEL_URI):
+            err = "MARKET_MODELS_GCS_PREFIX and MARKET_AI_MODEL_URI are both empty"
+
     except Exception as e:
         err = f"market models load failed: {type(e).__name__}: {e}"
         models = {}
@@ -316,12 +355,14 @@ def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
 
     with _market_models_lock:
         _market_models_cache["loaded_at"] = now
+        _market_models_cache["cache_key"] = cache_key
         _market_models_cache["prefix"] = MARKET_MODELS_GCS_PREFIX
         _market_models_cache["models"] = models
         _market_models_cache["meta"] = meta
         _market_models_cache["error"] = err
 
     return dict(models), dict(meta), err
+
 
 def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
     dbg: Dict[str, Any] = {}
@@ -365,7 +406,7 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
 
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        # bool 列は int 化
+        # bool → int（BTC_Calm など）
         for c in df.columns:
             if df[c].dtype == bool:
                 df[c] = df[c].astype(int)
@@ -391,12 +432,13 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             dbg["aligned_cols"] = list(df.columns)
 
         # 4) predict_proba
-        proba = model.predict_proba(df)
+        proba = base_model.predict_proba(df)
         return proba, False, dbg
 
     except Exception as e:
         dbg["error"] = f"{type(e).__name__}: {e}"
         return None, True, dbg
+
 
 
 def _market_feats_from_row(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> pd.DataFrame:
