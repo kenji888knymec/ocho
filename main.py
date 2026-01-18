@@ -371,46 +371,32 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
         if model is None:
             return None, True, {"error": "model_none"}
 
-        # 1) wrapper 対応（dict / tuple / list を吸収）
-        base_model = model
+        # wrapper(dict) の features を「期待列」として先に確保（feature_names_in_ が無いモデル対策）
+        expected_cols = None
+        if isinstance(model, dict):
+            feats_list = model.get("features", None)
+            if isinstance(feats_list, (list, tuple)) and len(feats_list) > 0:
+                expected_cols = [str(x) for x in list(feats_list)]
+                dbg["expected_from_wrapper"] = len(expected_cols)
 
-        # list/tuple wrapper（先頭要素がモデルのケース）
-        if isinstance(base_model, (tuple, list)) and len(base_model) >= 1:
-            dbg["model_wrapper"] = "list_or_tuple"
-            dbg["wrapper_len"] = len(base_model)
-            cand = base_model[0]
-            if cand is not None and hasattr(cand, "predict_proba"):
-                base_model = cand
-                dbg["unwrapped_from"] = "index0"
-
-        # dict wrapper（joblib で dict が返るケース）
-        if isinstance(base_model, dict):
-            dbg["model_wrapper"] = "dict"
-            dbg["wrapper_keys"] = [str(k) for k in list(base_model.keys())]
-
-            # よくあるキーを優先
-            for k in ["model", "clf", "estimator", "pipeline", "sk_model"]:
-                v = base_model.get(k)
-                if v is not None and hasattr(v, "predict_proba"):
-                    dbg["unwrapped_from"] = k
-                    base_model = v
+            # 重要：wrapper の中身(estimator)を取り出す（dict のままだと predict_proba が無い）
+            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
+                if k in model:
+                    model = model[k]
+                    dbg["unwrap"] = f"dict:{k}"
                     break
 
-            # 見つからなければ総当たり
-            if not hasattr(base_model, "predict_proba"):
-                for k, v in base_model.items():
-                    if v is not None and hasattr(v, "predict_proba"):
-                        dbg["unwrapped_from"] = str(k)
-                        base_model = v
-                        break
+        # list/tuple wrapper 対応
+        if isinstance(model, (tuple, list)) and len(model) >= 1:
+            model = model[0]
+            dbg["unwrap"] = "list0"
 
-            # 最後まで無ければ fail-open
-            if not hasattr(base_model, "predict_proba"):
-                dbg["error"] = "model_has_no_predict_proba"
-                dbg["model_type"] = str(type(model))
-                return None, True, dbg
+        # unwrap した結果でも predict_proba が無いならバイパス
+        if not hasattr(model, "predict_proba"):
+            dbg["error"] = f"model_type={type(model)} has no predict_proba"
+            return None, True, dbg
 
-        # 2) feats を DataFrame に整形（安全化）
+        # 1) feats を DataFrame に整形
         if feats is None:
             df = pd.DataFrame([{}])
         elif isinstance(feats, pd.DataFrame):
@@ -425,25 +411,23 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             if df[c].dtype == bool:
                 df[c] = df[c].astype(int)
 
-        # 3) 特徴量列を feature_names_in_ に合わせる（あれば）
-        expected = getattr(base_model, "feature_names_in_", None)
-
-        # wrapper 側に feature 名があるケースを吸収（model / base_model の dict を両方見る）
-        if expected is None:
-            src = None
-            if isinstance(model, dict):
-                src = model
-            elif isinstance(base_model, dict):
-                src = base_model
-            if src is not None:
-                expected = src.get("feature_names_in_", None) or src.get("feature_names", None)
-
+        # 2) 期待列の決定（model.feature_names_in_ があれば優先、無ければ wrapper features）
+        expected = getattr(model, "feature_names_in_", None)
         if expected is not None:
-            exp = [str(x) for x in list(expected)]
-            dbg["expected_cols"] = exp
+            expected_cols = [str(x) for x in list(expected)]
+            dbg["expected_from_model"] = len(expected_cols)
+
+        # 3) 列を期待列に合わせる（不足列は 0 で追加、余分列は捨てる）
+        if expected_cols is not None:
+            exp = [str(x) for x in expected_cols]
             for c in exp:
                 if c not in df.columns:
-                    df[c] = 0
+                    df[c] = 0.0
+
+            extra = [c for c in df.columns if c not in exp]
+            if extra:
+                dbg["dropped_cols"] = extra
+
             df = df[exp]
             dbg["aligned_cols"] = list(df.columns)
 
