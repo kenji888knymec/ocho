@@ -330,15 +330,22 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
         if model is None:
             return None, True, {"error": "model_none"}
 
-        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
-        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        # wrapper(dict) の features を「期待列」として先に確保（feature_names_in_ が無いモデル対策）
+        expected_cols = None
         if isinstance(model, dict):
+            feats_list = model.get("features", None)
+            if isinstance(feats_list, (list, tuple)) and len(feats_list) > 0:
+                expected_cols = [str(x) for x in list(feats_list)]
+                dbg["expected_from_wrapper"] = len(expected_cols)
+
+            # 重要：wrapper の中身(estimator)を取り出す（dict のままだと predict_proba が無い）
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
                     model = model[k]
                     dbg["unwrap"] = f"dict:{k}"
                     break
 
+        # list/tuple wrapper 対応
         if isinstance(model, (tuple, list)) and len(model) >= 1:
             model = model[0]
             dbg["unwrap"] = "list0"
@@ -348,7 +355,7 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             dbg["error"] = f"model_type={type(model)} has no predict_proba"
             return None, True, dbg
 
-        # 2) feats を DataFrame に整形
+        # 1) feats を DataFrame に整形
         if feats is None:
             df = pd.DataFrame([{}])
         elif isinstance(feats, pd.DataFrame):
@@ -363,14 +370,23 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             if df[c].dtype == bool:
                 df[c] = df[c].astype(int)
 
-        # 3) 特徴量列を feature_names_in_ に合わせる（あれば）
+        # 2) 期待列の決定（model.feature_names_in_ があれば優先、無ければ wrapper features）
         expected = getattr(model, "feature_names_in_", None)
         if expected is not None:
-            exp = [str(x) for x in list(expected)]
-            dbg["expected_cols"] = exp
+            expected_cols = [str(x) for x in list(expected)]
+            dbg["expected_from_model"] = len(expected_cols)
+
+        # 3) 列を期待列に合わせる（不足列は 0 で追加、余分列は捨てる）
+        if expected_cols is not None:
+            exp = [str(x) for x in expected_cols]
             for c in exp:
                 if c not in df.columns:
-                    df[c] = 0
+                    df[c] = 0.0
+
+            extra = [c for c in df.columns if c not in exp]
+            if extra:
+                dbg["dropped_cols"] = extra
+
             df = df[exp]
             dbg["aligned_cols"] = list(df.columns)
 
