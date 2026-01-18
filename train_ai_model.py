@@ -152,6 +152,10 @@ def _to_numeric_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     全列を数値化トライ（失敗は NaN）
     ・空文字/空白/null 系は NaN
     ・カンマ区切りを除去
+
+    重要:
+      学習の特徴量数を固定したいので「全部NaNの列を drop しない」。
+      NaN は後段の SimpleImputer(strategy="median") が基本的に埋める。
     戻り:
       (数値化DataFrame, すべてNaNだった列名)
     """
@@ -162,8 +166,8 @@ def _to_numeric_frame(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         x_num[c] = pd.to_numeric(s, errors="coerce")
 
     all_nan_cols = [c for c in x_num.columns if x_num[c].isna().all()]
-    x_num = x_num.drop(columns=all_nan_cols, errors="ignore")
     return x_num, all_nan_cols
+
 
 
 def main() -> int:
@@ -248,19 +252,47 @@ def main() -> int:
         print(f"[TRAIN][ERROR] not enough labeled rows after cleaning: {rows_labeled}", flush=True)
         return 7
 
-    # ---- features: label列を除外 + リーク列を除外
+    # ---- features: 本番互換の 9特徴量に固定（推論側 expected_cols と一致させる）
+    FEATURE_COLUMNS = [
+        "Sigma",
+        "BandWidth",
+        "BW_Change",
+        "RSI",
+        "Vol_Change",
+        "Rise_Score",
+        "Drop_Score",
+        "BTC_Ret",
+        "BTC_Vol",
+    ]
+
+    # 形式上、既存の変数も残す（レポート用途・互換）
     candidate_cols = [c for c in df.columns if c != label_col]
     leak_cols = [c for c in candidate_cols if _is_leak_feature(c)]
-    feat_cols = [c for c in candidate_cols if c not in leak_cols]
+    feat_cols = FEATURE_COLUMNS[:]  # 9列固定
 
-    if len(feat_cols) == 0:
-        print("[TRAIN][ERROR] no feature columns left after leak removal.", flush=True)
-        return 8
+    # Sigma が無いが VolSigma があるケースを吸収（main 側の alias と整合）
+    if "Sigma" not in df.columns and "VolSigma" in df.columns:
+        df["Sigma"] = df["VolSigma"]
 
-    X_raw = df[feat_cols].copy()
+    # 欠損列があっても学習が落ちないように 0.0 で補完
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    for c in missing_cols:
+        df[c] = 0.0
+
+    X_raw = df[FEATURE_COLUMNS].copy()
+
 
     # 数値化（失敗は NaN）
     X_num, all_nan_cols = _to_numeric_frame(X_raw)
+    
+    # 重要：全行NaNの列は SimpleImputer(median) が詰む可能性があるので 0.0 で埋める
+    for c in all_nan_cols:
+        X_num[c] = 0.0
+    
+    # 任意：ログ（事故検知が早くなる）
+    print(f"[TRAIN] FEATURE_COLUMNS={FEATURE_COLUMNS}", flush=True)
+    print(f"[TRAIN] all_nan_cols={all_nan_cols}", flush=True)
+
 
     if X_num.shape[1] < 5:
         print(f"[TRAIN][ERROR] too few numeric feature columns: {X_num.shape[1]}", flush=True)
@@ -268,37 +300,42 @@ def main() -> int:
         return 9
 
     # クラスが両方あるかチェック（片寄り過ぎで stratify が落ちるのを防ぐ）
-    y_values = y.values
-    unique_classes = np.unique(y_values)
+    # y も index を保ったまま扱う（X_num とズレにくくする）
+    y_series = pd.Series(y.values, index=X_num.index)
+    
+    unique_classes = np.unique(y_series.values)
     if unique_classes.size < 2:
         print(f"[TRAIN][ERROR] only one class present after cleaning: classes={unique_classes.tolist()}", flush=True)
         return 10
-
-    stratify_arg = y_values
+    
+    stratify_arg = y_series
     # 少なすぎる場合は stratify 無しにする（落ちないための保険）
-    counts = {int(k): int((y_values == k).sum()) for k in unique_classes.tolist()}
+    counts = {int(k): int((y_series.values == k).sum()) for k in unique_classes.tolist()}
     if min(counts.values()) < 10:
         stratify_arg = None
         print(f"[TRAIN][WARN] too few samples in a class -> stratify disabled. class_counts={counts}", flush=True)
-
+    
     # ---- split & train (NaN は SimpleImputer で埋める)
+    # DataFrameのまま学習（列順事故を減らす）
     X_train, X_test, y_train, y_test = train_test_split(
-        X_num.values,
-        y_values,
+        X_num,
+        y_series,
         test_size=0.2,
         random_state=42,
         stratify=stratify_arg,
     )
 
+    
     model = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
             ("clf", LogisticRegression(max_iter=2000, solver="liblinear")),
         ]
     )
-
+    
     model.fit(X_train, y_train)
     pred = model.predict(X_test)
+
 
     acc = float(accuracy_score(y_test, pred))
     report_txt = classification_report(y_test, pred, digits=4)
@@ -321,7 +358,14 @@ def main() -> int:
         "leak_removed_columns": leak_cols,
         "all_nan_dropped_columns": all_nan_cols,
     }
-    joblib.dump(payload, local_pkl_path)
+
+    # trade_ai_model.pkl は「モデル直」で保存（dictは禁止）
+    joblib.dump(payload["pipeline"], local_pkl_path)
+
+    print("[SAVE] pkl_path:", local_pkl_path, flush=True)
+    print("[SAVE] saved_object_type:", type(payload["pipeline"]).__name__, flush=True)
+    print("[SAVE] n_features:", int(X_num.shape[1]), flush=True)
+
 
     report_obj = {
         "trained_at_utc": _now_utc_str(),
