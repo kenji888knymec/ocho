@@ -1773,6 +1773,35 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         debug["input_n_features"] = int(feats.shape[1])
 
+        # ★追加：14列スキーマに強制整列（X=9 expected=14 を bypass させない）
+        # train_report.json の feature_columns と同順（14列）
+        FEATURE_COLUMNS_14 = [
+            "EntryPrice",
+            "ScoreSigma",
+            "VolSigma",
+            "TP",
+            "SL",
+            "TP_Pct",
+            "SL_Pct",
+            "Leverage",
+            "Reserved1",
+            "Reserved2",
+            "Reserved3",
+            "Reserved4",
+            "BTC_1h_Change",
+            "RSI",
+        ]
+        try:
+            if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
+                expected_n = int(getattr(model, "n_features_in_", 0) or 0)
+                if expected_n == 14:
+                    # 足りない列は 0.0 で補い、列順も固定する
+                    feats = feats.reindex(columns=FEATURE_COLUMNS_14, fill_value=0.0)
+                    debug["input_n_features"] = int(feats.shape[1])
+        except Exception:
+            # ここで落ちても /run を落とさない
+            pass
+
         # 3) 特徴量の整合
         expected_cols = _extract_feature_names(model)
         if expected_cols:
@@ -1803,6 +1832,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
+
 
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
