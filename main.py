@@ -3762,24 +3762,32 @@ def ai_health():
 
     return jsonify(resp), 200
 
-
-
 @app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
     """
     - safe_predict_proba が bypass / None / 形不正でも 500 を出さない
     - score は取れれば返す。取れなければ None のまま返す
+
+    重要：
+    /ai_smoke は「本番モデルが要求する特徴量スキーマ」でテストする。
+    そうしないと feature mismatch (9 vs 14) が発生し、bypass を誘発する。
     """
+    # train_report.json の feature_columns と同順を想定（14列）
     feats = pd.DataFrame([{
-        "Sigma": 0.001,
-        "BandWidth": 0.01,
-        "BW_Change": 0.0,
+        "EntryPrice": 0.0,
+        "ScoreSigma": 0.0,
+        "VolSigma": 0.0,
+        "TP": 0.0,
+        "SL": 0.0,
+        "TP_Pct": 0.0,
+        "SL_Pct": 0.0,
+        "Leverage": 10.0,
+        "Reserved1": 0.0,
+        "Reserved2": 0.0,
+        "Reserved3": 0.0,
+        "Reserved4": 0.0,
+        "BTC_1h_Change": 0.0,
         "RSI": 50.0,
-        "Vol_Change": 0.0,
-        "Rise_Score": 0.0,
-        "Drop_Score": 0.0,
-        "BTC_Ret": 0.0,
-        "BTC_Vol": 0.0,
     }])
 
     proba = None
@@ -3817,6 +3825,7 @@ def ai_smoke():
         "debug": dbg,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
+
 
 
 @app.route("/reload_model", methods=["POST", "GET"])
