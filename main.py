@@ -2845,16 +2845,18 @@ def logic_main(force: bool = False):
                         if v is None or v == "":
                             return float(default)
 
-                        # "0.58%" みたいな表示を吸収（必要なら）
+                        # "0.58%" みたいな表示は 0.0058 にする（/100）
                         if isinstance(v, str):
                             vv = v.strip().replace(",", "")
                             if vv.endswith("%"):
                                 vv = vv[:-1]
-                            v = vv
+                                return float(vv) / 100.0
+                            return float(vv)
 
                         return float(v)
                     except Exception:
                         return float(default)
+
 
                 # sig_score が None/空でも落ちないように
                 sig_score_f = _f("ScoreSigma", float(sig_score) if (sig_score is not None and sig_score != "") else 0.0)
