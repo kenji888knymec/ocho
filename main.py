@@ -2855,86 +2855,101 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> pd.DataFrame:
-                # モデル(train_report.json)が期待する14列に合わせる
-                # feature_columns:
+                # モデル(train_report.json)が期待する14列に合わせる（列名・列数を固定）
                 # ['EntryPrice','ScoreSigma','VolSigma','TP','SL','TP_Pct','SL_Pct','Leverage',
                 #  'Reserved1','Reserved2','Reserved3','Reserved4','BTC_1h_Change','RSI']
-
+            
                 def _f(key: str, default: float = 0.0) -> float:
                     try:
-                        # row が dict / pandas.Series / その他でも落ちにくく
                         if hasattr(row, "get"):
                             v = row.get(key, default)
                         else:
-                            # pandas.Series 想定：列名は row.index に入る
                             if hasattr(row, "index") and key in row.index:
                                 v = row[key]
                             else:
                                 v = default
-
+            
                         if v is None or v == "":
                             return float(default)
-
-                        # "0.58%" みたいな表示は 0.0058 にする（/100）
+            
                         if isinstance(v, str):
                             vv = v.strip().replace(",", "")
                             if vv.endswith("%"):
                                 vv = vv[:-1]
                                 return float(vv) / 100.0
                             return float(vv)
-
+            
                         return float(v)
                     except Exception:
                         return float(default)
-
-
-                # sig_score が None/空でも落ちないように
-                sig_score_f = _f("ScoreSigma", float(sig_score) if (sig_score is not None and sig_score != "") else 0.0)
-
-                rise = sig_score_f if side == "LONG" else 0.0
-                drop = sig_score_f if side == "SHORT" else 0.0
-
-                # learn_log / table 側の列が無い場合に備えたフォールバック
-                entry_price = _f("EntryPrice", _f("Entry_Price", _f("Entry", 0.0)))
-                score_sigma = _f("ScoreSigma", sig_score_f)
-                vol_sigma = _f("VolSigma", _f("Dynamic_Sigma", 0.0))
-
-                tp = _f("TP", _f("TPPrice", 0.0))
-                sl = _f("SL", _f("SLPrice", 0.0))
-                tp_pct = _f("TP_Pct", _f("TPPct", 0.0))
-                sl_pct = _f("SL_Pct", _f("SLPct", 0.0))
-
-                leverage = _f("Leverage", _f("Lev", 0.0))
-
-                reserved1 = _f("Reserved1", 0.0)
-                reserved2 = _f("Reserved2", 0.0)
-                reserved3 = _f("Reserved3", 0.0)
-                reserved4 = _f("Reserved4", 0.0)
-
-                # ★ここ：列が無ければ btc_ret を使う（0埋めを減らす）
+            
+                # 現在価格（推論時の入力の中心）：
+                # row から Close/close/c/EntryPrice/Entry を拾う
+                cp = _f("Close", _f("close", _f("c", _f("EntryPrice", _f("Entry", 0.0)))))
+            
+                # 追加しておくと安全：cp が 0 のままになった場合のフォールバック
+                if cp == 0.0:
+                    # close_now がスコープにある場合だけ拾う（無ければ except で無害に通る）
+                    try:
+                        cp = float(close_now)
+                    except Exception:
+                        pass
+            
+                # sigma（推論時にTP/SLを作るために使う）
+                sig = _f("Dynamic_Sigma", _f("VolSigma", 0.0))
+            
+                # ScoreSigma：既存の sig_score を優先し、無ければ row から拾う
+                try:
+                    score_sigma = float(sig_score) if (sig_score is not None and sig_score != "") else _f("ScoreSigma", 0.0)
+                except Exception:
+                    score_sigma = _f("ScoreSigma", 0.0)
+            
+                # TP/SL を推論時に計算（rowには通常入っていないため）
+                tp_mult = 3.8
+                sl_mult = 1.5
+            
+                if str(side).upper() == "LONG":
+                    tp = cp * (1.0 + sig * tp_mult)
+                    sl = cp * (1.0 - sig * sl_mult)
+                else:
+                    tp = cp * (1.0 - sig * tp_mult)
+                    sl = cp * (1.0 + sig * sl_mult)
+            
+                # 比率（%ではなく 0.0058 のような比率）に統一
+                tp_pct = abs((tp - cp) / cp) if cp != 0 else 0.0
+                sl_pct = abs((sl - cp) / cp) if cp != 0 else 0.0
+            
+                # レバレッジ：0埋め回避（銘柄ルールで決め打ち）
+                try:
+                    lev = float(MAX_LEV_5X if sym_code in MAX_LEV_5X_SYMBOLS else DEFAULT_LEV)
+                except Exception:
+                    lev = 10.0
+            
+                # BTC_1h_Change：rowに無ければ btc_ret を使う
                 try:
                     _btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
                 except Exception:
                     _btc_ret_f = 0.0
-
                 btc_1h_change = _f("BTC_1h_Change", _btc_ret_f)
-                rsi = _f("RSI", 0.0)
-
+            
+                # RSI：rowに無ければ 50（中立）を入れる（0固定は張り付き要因になりやすい）
+                rsi = _f("RSI", 50.0)
+            
                 return pd.DataFrame([{
-                    "EntryPrice": entry_price,
-                    "ScoreSigma": score_sigma,
-                    "VolSigma": vol_sigma,
-                    "TP": tp,
-                    "SL": sl,
-                    "TP_Pct": tp_pct,
-                    "SL_Pct": sl_pct,
-                    "Leverage": leverage,
-                    "Reserved1": reserved1,
-                    "Reserved2": reserved2,
-                    "Reserved3": reserved3,
-                    "Reserved4": reserved4,
-                    "BTC_1h_Change": btc_1h_change,
-                    "RSI": rsi,
+                    "EntryPrice": float(cp),
+                    "ScoreSigma": float(score_sigma),
+                    "VolSigma": float(sig),
+                    "TP": float(tp),
+                    "SL": float(sl),
+                    "TP_Pct": float(tp_pct),
+                    "SL_Pct": float(sl_pct),
+                    "Leverage": float(lev),
+                    "Reserved1": 0.0,
+                    "Reserved2": 0.0,
+                    "Reserved3": 0.0,
+                    "Reserved4": 0.0,
+                    "BTC_1h_Change": float(btc_1h_change),
+                    "RSI": float(rsi),
                 }])
 
 
