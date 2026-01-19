@@ -2825,19 +2825,86 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> pd.DataFrame:
-                rise = sig_score if side == "LONG" else 0.0
-                drop = sig_score if side == "SHORT" else 0.0
+                # モデル(train_report.json)が期待する14列に合わせる
+                # feature_columns:
+                # ['EntryPrice','ScoreSigma','VolSigma','TP','SL','TP_Pct','SL_Pct','Leverage',
+                #  'Reserved1','Reserved2','Reserved3','Reserved4','BTC_1h_Change','RSI']
+
+                def _f(key: str, default: float = 0.0) -> float:
+                    try:
+                        # row が dict / pandas.Series / その他でも落ちにくく
+                        if hasattr(row, "get"):
+                            v = row.get(key, default)
+                        else:
+                            # pandas.Series 想定：列名は row.index に入る
+                            if hasattr(row, "index") and key in row.index:
+                                v = row[key]
+                            else:
+                                v = default
+
+                        if v is None or v == "":
+                            return float(default)
+
+                        # "0.58%" みたいな表示を吸収（必要なら）
+                        if isinstance(v, str):
+                            vv = v.strip().replace(",", "")
+                            if vv.endswith("%"):
+                                vv = vv[:-1]
+                            v = vv
+
+                        return float(v)
+                    except Exception:
+                        return float(default)
+
+                # sig_score が None/空でも落ちないように
+                sig_score_f = _f("ScoreSigma", float(sig_score) if (sig_score is not None and sig_score != "") else 0.0)
+
+                rise = sig_score_f if side == "LONG" else 0.0
+                drop = sig_score_f if side == "SHORT" else 0.0
+
+                # learn_log / table 側の列が無い場合に備えたフォールバック
+                entry_price = _f("EntryPrice", _f("Entry_Price", _f("Entry", 0.0)))
+                score_sigma = _f("ScoreSigma", sig_score_f)
+                vol_sigma = _f("VolSigma", _f("Dynamic_Sigma", 0.0))
+
+                tp = _f("TP", _f("TPPrice", 0.0))
+                sl = _f("SL", _f("SLPrice", 0.0))
+                tp_pct = _f("TP_Pct", _f("TPPct", 0.0))
+                sl_pct = _f("SL_Pct", _f("SLPct", 0.0))
+
+                leverage = _f("Leverage", _f("Lev", 0.0))
+
+                reserved1 = _f("Reserved1", 0.0)
+                reserved2 = _f("Reserved2", 0.0)
+                reserved3 = _f("Reserved3", 0.0)
+                reserved4 = _f("Reserved4", 0.0)
+
+                # ★ここ：列が無ければ btc_ret を使う（0埋めを減らす）
+                try:
+                    _btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
+                except Exception:
+                    _btc_ret_f = 0.0
+
+                btc_1h_change = _f("BTC_1h_Change", _btc_ret_f)
+                rsi = _f("RSI", 0.0)
+
                 return pd.DataFrame([{
-                    "Sigma": float(row["Dynamic_Sigma"]),
-                    "BandWidth": float(row["BandWidth"]),
-                    "BW_Change": float(row["BW_Change"]),
-                    "RSI": float(row["RSI"]),
-                    "Vol_Change": float(row["Vol_Change"]),
-                    "Rise_Score": float(rise),
-                    "Drop_Score": float(drop),
-                    "BTC_Ret": float(btc_ret),
-                    "BTC_Vol": float(btc_vol),
+                    "EntryPrice": entry_price,
+                    "ScoreSigma": score_sigma,
+                    "VolSigma": vol_sigma,
+                    "TP": tp,
+                    "SL": sl,
+                    "TP_Pct": tp_pct,
+                    "SL_Pct": sl_pct,
+                    "Leverage": leverage,
+                    "Reserved1": reserved1,
+                    "Reserved2": reserved2,
+                    "Reserved3": reserved3,
+                    "Reserved4": reserved4,
+                    "BTC_1h_Change": btc_1h_change,
+                    "RSI": rsi,
                 }])
+
 
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
