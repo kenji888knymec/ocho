@@ -3183,7 +3183,52 @@ def logic_main(force: bool = False):
     candidate_rows: List[List[Any]] = []
 
 
+    # ==========================================================
+    # DEBUG: candidates が 0 になる理由を内訳で出す（最小ログ）
+    # ==========================================================
+    drop_reason = {
+        "ai_pass_false": 0,
+        "market_ai_pass_false": 0,
+        "btc_calm_false": 0,
+        "score_lt_alert_sigma": 0,
+        "ev_filtered": 0,
+        "passed_to_pending_alerts": 0,
+    }
+
     for item in pending_candidates:
+        # --- DEBUG観測（ロジックは変えない）---
+        try:
+            _ai_pass = bool(item.get("ai_pass", False))
+            _market_pass = bool(item.get("market_ai_pass", True))
+            _score = float(item.get("score", 0.0))
+            _ev_pass = True
+            try:
+                exp_ret = item.get("exp_ret", None)
+                if exp_ret is None:
+                    exp_ret = item.get("Reserved2", None)
+                if exp_ret is not None:
+                    _ev_pass = float(exp_ret) >= float(E_TH)
+            except Exception:
+                _ev_pass = True
+        
+            if not _ai_pass:
+                drop_reason["ai_pass_false"] += 1
+            if ENABLE_MARKET_AI_FILTER and (not _market_pass):
+                drop_reason["market_ai_pass_false"] += 1
+            if not BTC_CALM:
+                drop_reason["btc_calm_false"] += 1
+            if _score < float(ALERT_SIGMA):
+                drop_reason["score_lt_alert_sigma"] += 1
+            if not _ev_pass:
+                drop_reason["ev_filtered"] += 1
+        
+            if _ai_pass and (bool(_market_pass) if ENABLE_MARKET_AI_FILTER else True) and BTC_CALM and (_score >= float(ALERT_SIGMA)) and _ev_pass:
+                drop_reason["passed_to_pending_alerts"] += 1
+        except Exception:
+            pass
+        # --- DEBUG観測ここまで ---
+
+
         sym = item["symbol"]
         ts_ms = item["time"]
 
@@ -3405,6 +3450,16 @@ def logic_main(force: bool = False):
         append_rows_to_sheet(MAIN_SHEET_NAME, alert_rows, TABLE_FIELDS)
 
     elapsed = time.time() - start
+    print(
+        "[DBG] drop_reason "
+        f"ai_pass_false={drop_reason['ai_pass_false']} "
+        f"market_ai_pass_false={drop_reason['market_ai_pass_false']} "
+        f"btc_calm_false={drop_reason['btc_calm_false']} "
+        f"score_lt_alert_sigma={drop_reason['score_lt_alert_sigma']} "
+        f"ev_filtered={drop_reason['ev_filtered']} "
+        f"passed_to_pending_alerts={drop_reason['passed_to_pending_alerts']}"
+    )
+
     print(f"[RUN] done alerts={count} candidates={len(candidate_rows)} elapsed={elapsed:.2f}s")
     print(f"[DBG] pending_candidates={len(pending_candidates)} pending_alerts={len(pending_alerts)} "
           f"BTC_CALM={BTC_CALM} btc_mode={btc_mode} median_sigma={median_sigma} btc_ok={btc_ok}")
