@@ -1835,6 +1835,49 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         return np.array([[0.5, 0.5]], dtype=float), True, debug
 
 
+def _unwrap_estimator_for_classes(model: Any) -> Any:
+    """
+    safe_predict_proba と同様に、model が dict/list/tuple のラッパーなら中身(estimator)を取り出す。
+    classes_ を参照できる形に寄せるための補助。
+    """
+    try:
+        if isinstance(model, dict):
+            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
+                if k in model:
+                    return model[k]
+        if isinstance(model, (tuple, list)) and len(model) >= 1:
+            return model[0]
+    except Exception:
+        pass
+    return model
+
+
+def _pick_positive_class_index(model: Any, proba: Optional[np.ndarray]) -> int:
+    """
+    predict_proba の「どの列が勝ち(=1)か」を classes_ から決める。
+    classes_ が取れない場合は、従来互換で 1 を優先（2列以上なら 1列目、それ以外は0列目）。
+    """
+    m = _unwrap_estimator_for_classes(model)
+
+    try:
+        classes = getattr(m, "classes_", None)
+        if classes is not None:
+            cls_list = [str(c) for c in list(classes)]
+            if "1" in cls_list:
+                return cls_list.index("1")
+            if "True" in cls_list:
+                return cls_list.index("True")
+    except Exception:
+        pass
+
+    try:
+        if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[1] > 1:
+            return 1
+    except Exception:
+        pass
+
+    return 0
+
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
     """
@@ -2953,18 +2996,30 @@ def logic_main(force: bool = False):
                     "RSI": float(rsi),
                 }])
 
-
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
                 if bypass_x:
                     return None, True, (dbg_x or {})
+            
                 try:
-                    s = float(proba_x[0][1])
+                    pos_idx = _pick_positive_class_index(model_for_sym, proba_x)
+                    s = float(proba_x[0][pos_idx])
+            
+                    if isinstance(dbg_x, dict):
+                        dbg_x["pos_class_index"] = int(pos_idx)
+                        try:
+                            m = _unwrap_estimator_for_classes(model_for_sym)
+                            dbg_x["classes_"] = [str(c) for c in list(getattr(m, "classes_", []))]
+                        except Exception:
+                            dbg_x["classes_"] = []
                 except Exception:
                     return None, True, {"error": "proba_parse_failed"}
+            
                 if not np.isfinite(s):
                     return None, True, {"error": "non_finite_score"}
+            
                 return float(s), False, (dbg_x or {})
+
 
             # base 採点
             score_b, bypass_b, dbg_b = _score_side(base_side)
@@ -3923,10 +3978,21 @@ def ai_smoke():
         proba = None
         bypassed = True
 
+
     score = None
     try:
-        if proba is not None and len(proba) > 0 and len(proba[0]) > 1:
-            s = float(proba[0][1])
+        if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[0] > 0 and proba.shape[1] > 0:
+            pos_idx = _pick_positive_class_index(ai_model, proba)
+            s = float(proba[0][pos_idx])
+    
+            if isinstance(dbg, dict):
+                dbg["pos_class_index"] = int(pos_idx)
+                try:
+                    m = _unwrap_estimator_for_classes(ai_model)
+                    dbg["classes_"] = [str(c) for c in list(getattr(m, "classes_", []))]
+                except Exception:
+                    dbg["classes_"] = []
+    
             if np.isfinite(s):
                 score = s
             else:
@@ -3937,6 +4003,7 @@ def ai_smoke():
         bypassed = True
         if isinstance(dbg, dict):
             dbg["score_error"] = f"{type(e).__name__}: {e}"
+
 
     return jsonify({
         "ok": True,
