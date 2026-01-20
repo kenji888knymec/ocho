@@ -3279,16 +3279,36 @@ def logic_main(force: bool = False):
             side=("LONG" if item["is_buy"] else "SHORT"),
         )
 
+        # --- Reserved1/Reserved2: Reserved1=AI(%) / Reserved2=E(Expected Value) ---
+        _ai_raw = item.get("ai_score", None)
+        try:
+            _p_win = float(_ai_raw) if (_ai_raw is not None and _ai_raw != "") else 0.5
+        except Exception:
+            _p_win = 0.5
+        
+        try:
+            _exp_ret = (_p_win * float(tp_pct)) - ((1.0 - _p_win) * float(sl_pct))
+        except Exception:
+            _exp_ret = 0.0
+        
+        try:
+            _ai_pct = round(float(_ai_raw) * 100.0, 4) if (_ai_raw is not None and _ai_raw != "") else 0.0
+        except Exception:
+            _ai_pct = 0.0
+        
+        _e_val = round(float(_exp_ret), 6)
+        
         row_out = [
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, 0, 0, bool(item["ai_pass"]), bool(BTC_CALM),
+            DEFAULT_LEV, _ai_pct, _e_val, bool(item["ai_pass"]), bool(BTC_CALM),
             VERSION, item["type"], 0, 0,
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
             "", "", "", "", "", "", ""
         ]
+
 
         # ai_debug 列が存在する場合は「末尾append」ではなく、その列位置に代入する（列ズレ防止）
         if ai_debug_field:
