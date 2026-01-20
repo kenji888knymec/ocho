@@ -1,0 +1,25 @@
+steps:
+  # 1) Build image with Buildpacks (pack)
+  - name: 'gcr.io/k8s-skaffold/pack'
+    args:
+      - 'build'
+      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
+      - '--builder'
+      - 'gcr.io/buildpacks/builder'
+
+  # 2) Deploy to Cloud Run (same service/region)
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'crypto-alert'
+      - '--project'
+      - 'crypto-alert-479023'
+      - '--region'
+      - 'asia-northeast1'
+      - '--image'
+      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
+      - '--quiet'
+
+images:
+  - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
