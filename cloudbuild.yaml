@@ -1,5 +1,7 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
-  # 1) Build image with Buildpacks (pack)
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
@@ -7,7 +9,6 @@ steps:
       - '--builder'
       - 'gcr.io/buildpacks/builder'
 
-  # 2) Deploy to Cloud Run (same service/region)
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
