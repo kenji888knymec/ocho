@@ -501,15 +501,32 @@ def eval_market_ai(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float
 
     if not by60 and proba60 is not None:
         try:
-            p60 = float(proba60[0][1])
+            idx60 = _pick_positive_class_index(models.get("h60"), proba60, prefer_label=1)
+            p60 = float(proba60[0][idx60])
+            if isinstance(dbg60, dict):
+                dbg60["proba_idx"] = int(idx60)
+                try:
+                    m60 = _unwrap_estimator_for_classes(models.get("h60"))
+                    dbg60["classes"] = list(getattr(m60, "classes_", []))
+                except Exception:
+                    pass
         except Exception:
             p60 = None
-
+    
     if not by120 and proba120 is not None:
         try:
-            p120 = float(proba120[0][1])
+            idx120 = _pick_positive_class_index(models.get("h120"), proba120, prefer_label=1)
+            p120 = float(proba120[0][idx120])
+            if isinstance(dbg120, dict):
+                dbg120["proba_idx"] = int(idx120)
+                try:
+                    m120 = _unwrap_estimator_for_classes(models.get("h120"))
+                    dbg120["classes"] = list(getattr(m120, "classes_", []))
+                except Exception:
+                    pass
         except Exception:
             p120 = None
+
 
     dbg["p60"] = p60
     dbg["p120"] = p120
