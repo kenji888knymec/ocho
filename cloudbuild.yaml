@@ -2,7 +2,6 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 1) Build image with Buildpacks (and publish to registry)
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
@@ -11,7 +10,6 @@ steps:
       - 'gcr.io/buildpacks/builder'
       - '--publish'
 
-  # 2) Deploy to Cloud Run
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
       - 'run'
@@ -24,6 +22,3 @@ steps:
       - '--image'
       - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
       - '--quiet'
-
-images:
-  - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
