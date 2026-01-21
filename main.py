@@ -1217,6 +1217,94 @@ def _compute_out_len(sheet_name: str, headers: List[str], colcount: Optional[int
         return None
     return need_len
 
+def _to_sheet_cell(v: Any) -> Any:
+    """
+    Google Sheets API の body に入れて安全な型へ寄せる。
+    - numpy scalar は Python の int/float に変換
+    - dict/list/tuple/set/ndarray は JSON 文字列へ
+    - Timestamp/datetime は ISO 文字列へ
+    """
+    import json
+
+    try:
+        import numpy as np
+    except Exception:
+        np = None  # type: ignore
+
+    try:
+        import pandas as pd
+    except Exception:
+        pd = None  # type: ignore
+
+    def _jsonable(x: Any) -> Any:
+        if x is None:
+            return None
+
+        if np is not None:
+            try:
+                if isinstance(x, np.integer):
+                    return int(x)
+                if isinstance(x, np.floating):
+                    return float(x)
+                if isinstance(x, np.ndarray):
+                    return [_jsonable(y) for y in x.tolist()]
+            except Exception:
+                pass
+
+        if pd is not None:
+            try:
+                if isinstance(x, pd.Timestamp):
+                    return x.isoformat()
+            except Exception:
+                pass
+
+        try:
+            from datetime import datetime
+            if isinstance(x, datetime):
+                return x.isoformat()
+        except Exception:
+            pass
+
+        if isinstance(x, dict):
+            return {str(k): _jsonable(val) for k, val in x.items()}
+        if isinstance(x, (list, tuple, set)):
+            return [_jsonable(y) for y in x]
+
+        if isinstance(x, (str, int, float, bool)):
+            return x
+
+        return str(x)
+
+    if v is None:
+        return ""
+
+    if np is not None:
+        try:
+            if isinstance(v, np.integer):
+                return int(v)
+            if isinstance(v, np.floating):
+                return float(v)
+            if isinstance(v, np.ndarray):
+                return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            pass
+
+    if pd is not None:
+        try:
+            if isinstance(v, pd.Timestamp):
+                return v.isoformat()
+        except Exception:
+            pass
+
+    if isinstance(v, (dict, list, tuple, set)):
+        return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
+
+    if isinstance(v, (str, int, float, bool)):
+        return v
+
+    return str(v)
+
+
 def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_values: List[Any]) -> List[Any]:
     hm = _build_headers_map(headers)
     out = [""] * out_len
@@ -1225,8 +1313,9 @@ def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_v
         if col == -1:
             continue
         if 0 <= col < out_len:
-            out[col] = v
+            out[col] = _to_sheet_cell(v)
     return out
+
 
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
     headers, colcount, ok = get_headers_and_len(sheet_name)
