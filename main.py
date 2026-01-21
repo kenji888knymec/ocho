@@ -3263,14 +3263,86 @@ def logic_main(force: bool = False):
     def _cell_json(v: Any) -> str:
         """
         Google Sheets の values.append は「文字列/数値/真偽/空」しか安全に入らない。
-        dict/list は JSON 文字列化して入れる。
+        dict/list/tuple/ndarray は JSON 文字列化して入れる。
+        ※ numpy の int64/float64 が混ざると json.dumps が落ちるので、先に Python 素の型へ変換する。
         """
+        import json
+
+        try:
+            import numpy as np
+        except Exception:
+            np = None  # type: ignore
+
+        try:
+            import pandas as pd
+        except Exception:
+            pd = None  # type: ignore
+
+        def _jsonable(x: Any) -> Any:
+            # None
+            if x is None:
+                return None
+
+            # numpy scalar / ndarray
+            if np is not None:
+                try:
+                    if isinstance(x, np.integer):
+                        return int(x)
+                    if isinstance(x, np.floating):
+                        return float(x)
+                    if isinstance(x, np.ndarray):
+                        return [_jsonable(y) for y in x.tolist()]
+                except Exception:
+                    pass
+
+            # pandas Timestamp
+            if pd is not None:
+                try:
+                    if isinstance(x, pd.Timestamp):
+                        return x.isoformat()
+                except Exception:
+                    pass
+
+            # datetime (念のため)
+            try:
+                from datetime import datetime
+                if isinstance(x, datetime):
+                    return x.isoformat()
+            except Exception:
+                pass
+
+            # dict / list / tuple / set
+            if isinstance(x, dict):
+                return {str(k): _jsonable(val) for k, val in x.items()}
+            if isinstance(x, (list, tuple, set)):
+                return [_jsonable(y) for y in x]
+
+            # 素の JSON 型
+            if isinstance(x, (str, int, float, bool)):
+                return x
+
+            # その他（最後は文字列化）
+            return str(x)
+
         if v is None:
             return ""
-        if isinstance(v, (dict, list, tuple)):
-            import json
-            return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+        # dict/list/tuple/set/ndarray は JSON 化
+        if isinstance(v, (dict, list, tuple, set)) or (np is not None and isinstance(v, np.ndarray)):
+            return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
+
+        # numpy scalar は素の型へ
+        if np is not None:
+            try:
+                if isinstance(v, np.integer):
+                    return str(int(v))
+                if isinstance(v, np.floating):
+                    return str(float(v))
+            except Exception:
+                pass
+
         return str(v)
+
 
     candidate_rows: List[List[Any]] = []
 
