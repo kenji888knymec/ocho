@@ -433,7 +433,7 @@ def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional
             dbg["aligned_cols"] = list(df.columns)
 
         # 4) predict_proba
-        proba = base_model.predict_proba(df)
+        proba = model.predict_proba(df)
         return proba, False, dbg
 
     except Exception as e:
@@ -1869,24 +1869,43 @@ def _unwrap_estimator_for_classes(model: Any) -> Any:
     return model
 
 
-def _pick_positive_class_index(model: Any, proba: Optional[np.ndarray]) -> int:
+def _pick_positive_class_index(model: Any, proba: Optional[np.ndarray], prefer_label: Any = 1) -> int:
     """
-    predict_proba の「どの列が勝ち(=1)か」を classes_ から決める。
-    classes_ が取れない場合は、従来互換で 1 を優先（2列以上なら 1列目、それ以外は0列目）。
+    predict_proba の「どの列が陽性（勝ち）」かを classes_ から決める。
+    - prefer_label を最優先（通常は 1）
+    - classes_ が取れない場合は、2値なら 1 列目、それ以外は 0 列目
     """
-    m = _unwrap_estimator_for_classes(model)
+    try:
+        m = _unwrap_estimator_for_classes(model)
+    except Exception:
+        m = model
 
+    # classes_ 優先
     try:
         classes = getattr(m, "classes_", None)
         if classes is not None:
-            cls_list = [str(c) for c in list(classes)]
-            if "1" in cls_list:
-                return cls_list.index("1")
-            if "True" in cls_list:
-                return cls_list.index("True")
+            cls_list = list(classes)
+
+            # prefer_label を最優先（数値/文字列どちらも拾う）
+            if prefer_label in cls_list:
+                return int(cls_list.index(prefer_label))
+
+            cls_str = [str(c) for c in cls_list]
+            if str(prefer_label) in cls_str:
+                return int(cls_str.index(str(prefer_label)))
+
+            # 代表的な文字列ラベルも保険で拾う
+            low = [s.strip().lower() for s in cls_str]
+            if "win" in low:
+                return int(low.index("win"))
+            if "true" in low:
+                return int(low.index("true"))
+            if "1" in low:
+                return int(low.index("1"))
     except Exception:
         pass
 
+    # fallback（2値なら 1 を優先）
     try:
         if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[1] > 1:
             return 1
@@ -1894,6 +1913,7 @@ def _pick_positive_class_index(model: Any, proba: Optional[np.ndarray]) -> int:
         pass
 
     return 0
+
 
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
