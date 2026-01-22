@@ -3,7 +3,7 @@ import sys
 import json
 import traceback
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+
 
 from google.cloud import storage
 import joblib
@@ -252,86 +255,197 @@ def main() -> int:
         print(f"[TRAIN][ERROR] not enough labeled rows after cleaning: {rows_labeled}", flush=True)
         return 7
 
-    # ---- features: 本番互換の 9特徴量に固定（推論側 expected_cols と一致させる）
-    FEATURE_COLUMNS = [
+    # ---- features: learn_log から学習に使う列を定義（数値 + カテゴリ + 時刻特徴）
+    # 形式上、既存の変数も残す（レポート用途・互換）
+    candidate_cols = [c for c in df.columns if c != label_col]
+    leak_cols = [c for c in candidate_cols if _is_leak_feature(c)]
+
+    NUMERIC_FEATURE_COLUMNS: List[str] = [
+        # エントリー時点で分かる数値
+        "EntryPrice",
+        "ScoreSigma",
+        "VolSigma",
         "Sigma",
+        "TP",
+        "SL",
+        "TP_Pct",
+        "SL_Pct",
+        "Leverage",
+        "Reserved1",
+        "Reserved2",
+        "Reserved3",
+        "Reserved4",
+        "BTC_1h_Change",
+        "BTC_Calm",
+        "RSI",
         "BandWidth",
         "BW_Change",
-        "RSI",
         "Vol_Change",
         "Rise_Score",
         "Drop_Score",
         "BTC_Ret",
         "BTC_Vol",
+        # （あれば）Market AI のスコアも数値として使える
+        "market_ai_score",
     ]
 
-    # 形式上、既存の変数も残す（レポート用途・互換）
-    candidate_cols = [c for c in df.columns if c != label_col]
-    leak_cols = [c for c in candidate_cols if _is_leak_feature(c)]
-    feat_cols = FEATURE_COLUMNS[:]  # 9列固定
+    CATEGORICAL_FEATURE_COLUMNS: List[str] = [
+        # エントリー時点で分かるカテゴリ
+        "Symbol",
+        "Side",
+        "SignalType",
+        "MarketTag",
+        "BTC_Mode",
+        "Version",
+    ]
 
-    # Sigma が無いが VolSigma があるケースを吸収（main 側の alias と整合）
+    # Datetime 列は “そのまま文字列” では使わず、下で hour/dow/month 等へ変換する
+    DATETIME_COL_CANDIDATES: List[str] = [
+        "Datetime(SymbolTime_JST)",
+        "SymbolTime_JST",
+        "Datetime",
+        "Time",
+    ]
+
+    def _pick_existing_col(df_: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c in df_.columns:
+                return c
+        return None
+
+    # Sigma が無いが VolSigma があるケースを吸収（既存コードの安全策を維持）
     if "Sigma" not in df.columns and "VolSigma" in df.columns:
         df["Sigma"] = df["VolSigma"]
 
-    # 欠損列があっても学習が落ちないように 0.0 で補完
-    missing_cols = [c for c in FEATURE_COLUMNS if c not in df.columns]
-    for c in missing_cols:
-        df[c] = 0.0
+    dt_col = _pick_existing_col(df, DATETIME_COL_CANDIDATES)
+    TIME_FEATURE_COLUMNS: List[str] = []
+    if dt_col:
+        dt = pd.to_datetime(df[dt_col], errors="coerce")
 
-    X_raw = df[FEATURE_COLUMNS].copy()
+        df["time_hour"] = dt.dt.hour.astype("Int64")
+        df["time_day_of_week"] = dt.dt.dayofweek.astype("Int64")  # 0=Mon
+        df["time_month"] = dt.dt.month.astype("Int64")
 
+        # 周期性（任意だが効きやすい）
+        hour = df["time_hour"].fillna(0).astype(float)
+        df["time_hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
+        df["time_hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
 
-    # 数値化（失敗は NaN）
-    X_num, all_nan_cols = _to_numeric_frame(X_raw)
-    
-    # 重要：全行NaNの列は SimpleImputer(median) が詰む可能性があるので 0.0 で埋める
-    for c in all_nan_cols:
-        X_num[c] = 0.0
-    
-    # 任意：ログ（事故検知が早くなる）
-    print(f"[TRAIN] FEATURE_COLUMNS={FEATURE_COLUMNS}", flush=True)
-    print(f"[TRAIN] all_nan_cols={all_nan_cols}", flush=True)
+        TIME_FEATURE_COLUMNS = [
+            "time_hour",
+            "time_day_of_week",
+            "time_month",
+            "time_hour_sin",
+            "time_hour_cos",
+        ]
 
+    # 欠けている列は “学習で落とさない” ために作って埋める
+    for c in NUMERIC_FEATURE_COLUMNS:
+        if c not in df.columns:
+            df[c] = np.nan
 
-    if X_num.shape[1] < 5:
-        print(f"[TRAIN][ERROR] too few numeric feature columns: {X_num.shape[1]}", flush=True)
-        print(f"[TRAIN] hint: maybe most columns are non-numeric or empty.", flush=True)
-        return 9
+    for c in CATEGORICAL_FEATURE_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
 
-    # クラスが両方あるかチェック（片寄り過ぎで stratify が落ちるのを防ぐ）
-    # y も index を保ったまま扱う（X_num とズレにくくする）
-    y_series = pd.Series(y.values, index=X_num.index)
-    
+    feature_cols_all: List[str] = NUMERIC_FEATURE_COLUMNS + CATEGORICAL_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS
+
+    # X: 欠損や型の整形は前処理 Pipeline 側で吸収（ただし numeric は先に数値化しておく）
+    X = df[feature_cols_all].copy()
+
+    # BTC_Calm は TRUE/FALSE 文字列が混ざりやすいので 0/1 に寄せる（安全策）
+    if "BTC_Calm" in X.columns:
+        s = X["BTC_Calm"].astype(str).str.strip().str.lower()
+        X["BTC_Calm"] = s.map({"true": 1, "false": 0, "1": 1, "0": 0, "yes": 1, "no": 0}).astype("float")
+
+    # bool -> int（念のため）
+    for c in X.columns:
+        if X[c].dtype == bool:
+            X[c] = X[c].astype(int)
+
+    # 数値列は「文字列のまま」だと median が落ちるので、ここで数値化して NaN に寄せる
+    for c in (NUMERIC_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS):
+        if c in X.columns:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    # カテゴリ列は string に寄せる（OneHotEncoder に安全に渡す）
+    for c in CATEGORICAL_FEATURE_COLUMNS:
+        if c in X.columns:
+            X[c] = X[c].astype(str)
+
+    # y を X に揃えた Series として明示
+    y_series = pd.Series(y.values, index=X.index)
+
+    # クラスが両方あるかチェック
     unique_classes = np.unique(y_series.values)
     if unique_classes.size < 2:
         print(f"[TRAIN][ERROR] only one class present after cleaning: classes={unique_classes.tolist()}", flush=True)
         return 10
-    
-    stratify_arg = y_series
-    # 少なすぎる場合は stratify 無しにする（落ちないための保険）
+
     counts = {int(k): int((y_series.values == k).sum()) for k in unique_classes.tolist()}
+
+    stratify_arg = y_series
     if min(counts.values()) < 10:
         stratify_arg = None
         print(f"[TRAIN][WARN] too few samples in a class -> stratify disabled. class_counts={counts}", flush=True)
-    
-    # ---- split & train (NaN は SimpleImputer で埋める)
-    # DataFrameのまま学習（列順事故を減らす）
+
+    # ---- split
     X_train, X_test, y_train, y_test = train_test_split(
-        X_num,
+        X,
         y_series,
         test_size=0.2,
         random_state=42,
         stratify=stratify_arg,
     )
 
-    
-    model = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", LogisticRegression(max_iter=2000, solver="liblinear")),
-        ]
+    # ---- preprocessing + model
+    numeric_cols = [c for c in (NUMERIC_FEATURE_COLUMNS + TIME_FEATURE_COLUMNS) if c in X.columns]
+    cat_cols = [c for c in CATEGORICAL_FEATURE_COLUMNS if c in X.columns]
+
+    # 学習不能（特徴量ゼロ）を早期検知
+    if (len(numeric_cols) + len(cat_cols)) == 0:
+        print("[TRAIN][ERROR] no usable feature columns (numeric+categorical=0).", flush=True)
+        return 9
+
+    # numeric が “全て欠損” の列は SimpleImputer(median) が落ちるので除外
+    all_nan_cols = [c for c in numeric_cols if X_train[c].isna().all()]
+    if all_nan_cols:
+        print(f"[WARN] drop all-NaN numeric cols: {all_nan_cols}", flush=True)
+    numeric_cols = [c for c in numeric_cols if c not in set(all_nan_cols)]
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                ]),
+                numeric_cols,
+            ),
+            (
+                "cat",
+                Pipeline(steps=[
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                ]),
+                cat_cols,
+            ),
+        ],
+        remainder="drop",
+        sparse_threshold=0.3,
     )
+
+    clf = LogisticRegression(
+        max_iter=2000,
+        solver="liblinear",
+        class_weight="balanced",
+    )
+
+    model = Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("clf", clf),
+    ])
+
     
     model.fit(X_train, y_train)
     pred = model.predict(X_test)
@@ -341,7 +455,7 @@ def main() -> int:
     report_txt = classification_report(y_test, pred, digits=4)
     cm = confusion_matrix(y_test, pred).tolist()
 
-    print(f"[TRAIN] trained. features={X_num.shape[1]} rows_used={len(X_num)} acc={acc:.4f}", flush=True)
+    print(f"[TRAIN] trained. features={X.shape[1]} rows_used={len(X)} acc={acc:.4f}", flush=True)
     print("[TRAIN] classification_report:\n" + report_txt, flush=True)
     print(f"[TRAIN] confusion_matrix={cm}", flush=True)
 
@@ -351,10 +465,11 @@ def main() -> int:
 
     payload = {
         "pipeline": model,
-        "feature_columns": X_num.columns.tolist(),  # 推論側はこの順序に揃える
+        # 推論側は「この入力列名（X.columns）」を揃えると精度が出やすい
+        "feature_columns": list(X.columns),
         "label_column": label_col,
         "trained_at_utc": _now_utc_str(),
-        "rows_used": int(len(X_num)),
+        "rows_used": int(len(X)),
         "leak_removed_columns": leak_cols,
         "all_nan_dropped_columns": all_nan_cols,
     }
@@ -364,8 +479,8 @@ def main() -> int:
 
     print("[SAVE] pkl_path:", local_pkl_path, flush=True)
     print("[SAVE] saved_object_type:", type(payload["pipeline"]).__name__, flush=True)
-    print("[SAVE] n_features:", int(X_num.shape[1]), flush=True)
-
+    print("[SAVE] input_feature_cols:", int(X.shape[1]), flush=True)
+    print("[SAVE] n_features_in:", int(getattr(payload["pipeline"], "n_features_in_", 0) or 0), flush=True)
 
     report_obj = {
         "trained_at_utc": _now_utc_str(),
@@ -375,19 +490,20 @@ def main() -> int:
         "header_cols": int(header_cols),
         "rows_total": int(rows_total),
         "rows_labeled": int(rows_labeled),
-        "rows_used": int(len(X_num)),
+        "rows_used": int(len(X)),
         "label_column": label_col,
         "class_counts": counts,
-        "feature_count": int(X_num.shape[1]),
-        "feature_columns": X_num.columns.tolist(),
+        "feature_count": int(X.shape[1]),
+        "feature_columns": list(X.columns),
         "leak_removed_columns": leak_cols,
         "all_nan_dropped_columns": all_nan_cols,
         "accuracy": acc,
         "confusion_matrix": cm,
         "classification_report": report_txt,
-        "note": "Leakage removed (Exit/PnL/Hold/Status etc) + NaN-safe training (SimpleImputer median) + LogisticRegression(liblinear).",
+        "note": "Leakage removed (Exit/PnL/Hold/Status etc) + OneHot(categorical) + time features + NaN-safe preprocessing + LogisticRegression(liblinear, balanced).",
     }
     _write_json(local_report_path, report_obj)
+
 
     # ---- write to /gcs mount first, fallback to API
     gcs_dir = f"{out_dir_prefix}/{model_version}"
