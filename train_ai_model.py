@@ -458,15 +458,28 @@ def main() -> int:
     report_txt = classification_report(y_test, pred_default, digits=4)
     cm_default = confusion_matrix(y_test, pred_default).tolist()
 
-    # predict_proba の「陽性(=Win=1)」列を取り出す
+    # predict_proba の「陽性(=Win=1)」列を取り出す（classes_ を見て安全に列選択）
     proba = None
+    pos_idx = None
     try:
         proba_all = model.predict_proba(X_test)
         # 2値分類を想定（念のため形状チェック）
         if hasattr(proba_all, "shape") and len(proba_all.shape) == 2 and proba_all.shape[1] >= 2:
-            proba = proba_all[:, 1]
+            classes = getattr(model, "classes_", None)
+            if classes is not None:
+                classes_list = [int(x) for x in list(classes)]
+                if 1 in classes_list:
+                    pos_idx = classes_list.index(1)
+                else:
+                    pos_idx = 1  # 従来互換（不明なら 2列目）
+            else:
+                pos_idx = 1
+
+            proba = proba_all[:, pos_idx]
     except Exception:
         proba = None
+        pos_idx = None
+
 
     # proba 分布と “推奨しきい値(F1最大)” を計算
     best_thr = None
@@ -555,11 +568,23 @@ def main() -> int:
         "feature_columns": list(X.columns),
         "leak_removed_columns": leak_cols,
         "all_nan_dropped_columns": all_nan_cols,
+
+        # --- metrics（既存）
         "accuracy": acc,
         "confusion_matrix": cm,
         "classification_report": report_txt,
+
+        # --- probability-aware metrics（追加）
+        "positive_class_index": (int(pos_idx) if "pos_idx" in locals() and pos_idx is not None else None),
+        "proba_percentiles": (proba_summary if isinstance(proba_summary, dict) else {}),
+        "best_threshold_f1": (float(best_thr) if best_thr is not None else None),
+        "best_f1": (float(best_f1) if best_f1 is not None else None),
+        "confusion_matrix_default": cm_default,
+        "confusion_matrix_best_f1": cm_best,
+
         "note": "Leakage removed (Exit/PnL/Hold/Status etc) + OneHot(categorical) + time features + NaN-safe preprocessing + LogisticRegression(liblinear, balanced).",
     }
+
     _write_json(local_report_path, report_obj)
 
 
