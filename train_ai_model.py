@@ -448,16 +448,74 @@ def main() -> int:
 
     
     model.fit(X_train, y_train)
-    pred = model.predict(X_test)
 
+    # --------------------------
+    # Evaluation (probability-aware)
+    # --------------------------
+    pred_default = model.predict(X_test)
 
-    acc = float(accuracy_score(y_test, pred))
-    report_txt = classification_report(y_test, pred, digits=4)
-    cm = confusion_matrix(y_test, pred).tolist()
+    acc = float(accuracy_score(y_test, pred_default))
+    report_txt = classification_report(y_test, pred_default, digits=4)
+    cm_default = confusion_matrix(y_test, pred_default).tolist()
+
+    # predict_proba の「陽性(=Win=1)」列を取り出す
+    proba = None
+    try:
+        proba_all = model.predict_proba(X_test)
+        # 2値分類を想定（念のため形状チェック）
+        if hasattr(proba_all, "shape") and len(proba_all.shape) == 2 and proba_all.shape[1] >= 2:
+            proba = proba_all[:, 1]
+    except Exception:
+        proba = None
+
+    # proba 分布と “推奨しきい値(F1最大)” を計算
+    best_thr = None
+    best_f1 = None
+    cm_best = None
+    proba_summary = {}
+
+    if proba is not None and len(proba) > 0:
+        # 分位点（運用のAI_TH調整の根拠）
+        qs = [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]
+        proba_summary = {f"p{q}": float(np.percentile(proba, q)) for q in qs}
+
+        # F1 最大の閾値探索（0.01刻み）
+        # ※ sklearn を増やさず自前で計算
+        y_true = np.asarray(y_test, dtype=int)
+        best_f1 = -1.0
+        best_thr = 0.5
+        best_pred = None
+
+        for t in np.linspace(0.0, 1.0, 101):
+            y_hat = (proba >= t).astype(int)
+            tp = int(((y_true == 1) & (y_hat == 1)).sum())
+            fp = int(((y_true == 0) & (y_hat == 1)).sum())
+            fn = int(((y_true == 1) & (y_hat == 0)).sum())
+
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thr = float(t)
+                best_pred = y_hat
+
+        if best_pred is not None:
+            cm_best = confusion_matrix(y_true, best_pred).tolist()
 
     print(f"[TRAIN] trained. features={X.shape[1]} rows_used={len(X)} acc={acc:.4f}", flush=True)
     print("[TRAIN] classification_report:\n" + report_txt, flush=True)
-    print(f"[TRAIN] confusion_matrix={cm}", flush=True)
+    print(f"[TRAIN] confusion_matrix(default_predict)={cm_default}", flush=True)
+
+    if proba_summary:
+        print(f"[TRAIN] proba_percentiles={json.dumps(proba_summary, ensure_ascii=False)}", flush=True)
+    if best_thr is not None:
+        print(f"[TRAIN] best_threshold_f1={best_thr:.2f} best_f1={best_f1:.4f} cm_at_best={cm_best}", flush=True)
+
+    # 既存の変数名 cm は downstream で使うので合わせる
+    cm = cm_default
+
 
     # ---- outputs
     local_pkl_path = "/tmp/" + out_pkl_name
