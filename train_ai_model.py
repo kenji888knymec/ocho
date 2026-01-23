@@ -215,10 +215,23 @@ def main() -> int:
     header_cols = len(header)
     print(f"[TRAIN] learn_log header cols={header_cols}", flush=True)
 
-    # 安全に広めに取得（列増でも落ちないように）
-    all_vals = _get_sheet_values(svc, spreadsheet_id, f"{learn_sheet}!A2:AF")
+    def _col_letter(n: int) -> str:
+        # 1 -> A, 26 -> Z, 27 -> AA ...
+        if n <= 0:
+            return "A"
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(ord("A") + r) + s
+        return s
+
+    # ヘッダ列数に合わせて最終列まで読む（列が増えても追従）
+    end_col = _col_letter(header_cols)  # header_cols=40 なら AN
+    range_a1 = f"{learn_sheet}!A2:{end_col}"
+    all_vals = _get_sheet_values(svc, spreadsheet_id, range_a1)
     rows_total = len(all_vals)
-    print(f"[TRAIN] learn_log rows_total={rows_total}", flush=True)
+    print(f"[TRAIN] read_range={range_a1} rows_total={rows_total}", flush=True)
+
 
     if header_cols == 0 or rows_total == 0:
         print("[TRAIN][ERROR] learn_log is empty (header or rows).", flush=True)
