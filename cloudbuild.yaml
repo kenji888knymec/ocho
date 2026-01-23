@@ -5,7 +5,7 @@ steps:
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
-      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
+      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${BUILD_ID}'
       - '--builder'
       - 'gcr.io/buildpacks/builder'
       - '--publish'
@@ -20,5 +20,5 @@ steps:
       - '--region'
       - 'asia-northeast1'
       - '--image'
-      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${COMMIT_SHA}'
+      - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${BUILD_ID}'
       - '--quiet'
