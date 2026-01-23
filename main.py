@@ -3620,7 +3620,7 @@ def logic_main(force: bool = False):
     alert_rows: List[List[Any]] = []
 
     for item in filtered:
-        if count >= 3:
+        if count >= 20:
             break
 
         sym = item["symbol"]
