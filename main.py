@@ -3288,6 +3288,23 @@ def logic_main(force: bool = False):
                 "BTC_Vol": safe_float(btc_vol, 0.0),
             }
 
+            # ★追加：RUN_DEBUG=1 のときだけ、この候補が alert にならない理由を1行で確定する
+            try:
+                _rd = str(RUN_DEBUG).strip().lower()
+                if _rd in ('1','true','yes','on'):
+                    _will_alert = bool(ai_pass_effective and BTC_CALM and (item.get('score', 0.0) >= ALERT_SIGMA))
+                    print(
+                        f"[AI_DECIDE] sym={item.get('symbol')} side={item.get('type')} "
+                        f"btc_mode={btc_mode} ALLOW_LONG={ALLOW_LONG} ALLOW_SHORT={ALLOW_SHORT} "
+                        f"ai_score={ai_score} ai_th={ai_th_used} ai_pass={ai_pass} "
+                        f"market_ai_pass={market_ai_pass} ai_pass_effective={ai_pass_effective} "
+                        f"BTC_CALM={BTC_CALM} score={item.get('score')} ALERT_SIGMA={ALERT_SIGMA} "
+                        f"will_alert={_will_alert}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+
             pending_candidates.append(item)
 
             if ai_pass_effective and BTC_CALM and item["score"] >= ALERT_SIGMA:
