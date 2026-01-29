@@ -3525,6 +3525,14 @@ def logic_main(force: bool = False):
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
+        # ★追加：RUN_DEBUG=1 のときだけ、候補(CANDIDATE)側のAI判定行を Cloud Runログに出す
+        try:
+            _rd = str(RUN_DEBUG).strip().lower()
+            if _rd in ("1", "true", "yes", "on"):
+                print(f"[AI_LINE] sym={sym} dt={dt_str} {note_str}", flush=True)
+        except Exception:
+            pass
+
 
         ai_debug_label = derive_ai_debug(
             btc_mode=btc_mode,
