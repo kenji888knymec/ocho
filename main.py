@@ -2852,7 +2852,7 @@ def logic_main(force: bool = False):
             if not ohlcv or len(ohlcv) < MIN_BARS:
                 # RUN_DEBUG=1 のときだけ、スキップ理由をログに出す（通常運用は汚さない）
                 try:
-                    _rd = str(RUN_DEBUG).strip().lower()
+                    _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
                     if _rd in ("1", "true", "yes", "on"):
                         _n = 0 if not ohlcv else len(ohlcv)
                         print(f"[DBG_OHLCV] symbol={symbol} n={_n} MIN_BARS={MIN_BARS}", flush=True)
@@ -3290,7 +3290,7 @@ def logic_main(force: bool = False):
 
             # ★追加：RUN_DEBUG=1 のときだけ、この候補が alert にならない理由を1行で確定する
             try:
-                _rd = str(RUN_DEBUG).strip().lower()
+                _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
                 if _rd in ('1','true','yes','on'):
                     _will_alert = bool(ai_pass_effective and BTC_CALM and (item.get('score', 0.0) >= ALERT_SIGMA))
                     print(
@@ -3552,7 +3552,7 @@ def logic_main(force: bool = False):
 
         # ★追加：RUN_DEBUG=1 のときだけ、候補(CANDIDATE)側のAI判定行を Cloud Runログに出す
         try:
-            _rd = str(RUN_DEBUG).strip().lower()
+            _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
             if _rd in ("1", "true", "yes", "on"):
                 print(f"[AI_LINE] sym={sym} dt={dt_str} {note_str}", flush=True)
         except Exception:
