@@ -2850,6 +2850,14 @@ def logic_main(force: bool = False):
         try:
             ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
             if not ohlcv or len(ohlcv) < MIN_BARS:
+                # RUN_DEBUG=1 のときだけ、スキップ理由をログに出す（通常運用は汚さない）
+                try:
+                    _rd = str(RUN_DEBUG).strip().lower()
+                    if _rd in ("1", "true", "yes", "on"):
+                        _n = 0 if not ohlcv else len(ohlcv)
+                        print(f"[DBG_OHLCV] symbol={symbol} n={_n} MIN_BARS={MIN_BARS}", flush=True)
+                except Exception:
+                    pass
                 continue
 
             df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
