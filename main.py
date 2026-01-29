@@ -3549,7 +3549,6 @@ def logic_main(force: bool = False):
                 print(f"[AI_LINE] {sym} {note_str}")
         except Exception:
             pass
-)
 
 
         ai_debug_label = derive_ai_debug(
