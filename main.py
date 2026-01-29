@@ -2982,9 +2982,6 @@ def logic_main(force: bool = False):
 
             # 既存のσ候補 + MR候補（MRでも既存フローのAI評価・ログ記録に乗せる）
             short_by_sigma = (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT
-
-            # LONG だけ不利な追加条件（Close > df.iloc[-6]["Close"]）が入っていると
-            # 構造的に SHORT 偏りになりやすいので、まずは外してバランスを戻す
             long_by_sigma = (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG
 
             if short_by_sigma or (mr_short and ALLOW_SHORT):
@@ -3002,7 +2999,6 @@ def logic_main(force: bool = False):
             # - base_side: 現行ロジックが出した side
             # - flip_side: 反対 side
             # - 勝てそうな方（Win確率が高い方）を採用
-            # - ただし「弱い根拠での反転」は禁止（chosen_score < ai_th_used なら flip しない）
             # - AIがbypassしたら従来通り（fail-open/closedに従う）
             # ==========================================================
             ai_score = None
@@ -3032,7 +3028,7 @@ def logic_main(force: bool = False):
                 # モデル(train_report.json)が期待する14列に合わせる（列名・列数を固定）
                 # ['EntryPrice','ScoreSigma','VolSigma','TP','SL','TP_Pct','SL_Pct','Leverage',
                 #  'Reserved1','Reserved2','Reserved3','Reserved4','BTC_1h_Change','RSI']
-
+            
                 def _f(key: str, default: float = 0.0) -> float:
                     try:
                         if hasattr(row, "get"):
@@ -3042,25 +3038,25 @@ def logic_main(force: bool = False):
                                 v = row[key]
                             else:
                                 v = default
-
+            
                         if v is None or v == "":
                             return float(default)
-
+            
                         if isinstance(v, str):
                             vv = v.strip().replace(",", "")
                             if vv.endswith("%"):
                                 vv = vv[:-1]
                                 return float(vv) / 100.0
                             return float(vv)
-
+            
                         return float(v)
                     except Exception:
                         return float(default)
-
+            
                 # 現在価格（推論時の入力の中心）：
                 # row から Close/close/c/EntryPrice/Entry を拾う
                 cp = _f("Close", _f("close", _f("c", _f("EntryPrice", _f("Entry", 0.0)))))
-
+            
                 # 追加しておくと安全：cp が 0 のままになった場合のフォールバック
                 if cp == 0.0:
                     # close_now がスコープにある場合だけ拾う（無ければ except で無害に通る）
@@ -3068,47 +3064,47 @@ def logic_main(force: bool = False):
                         cp = float(close_now)
                     except Exception:
                         pass
-
+            
                 # sigma（推論時にTP/SLを作るために使う）
                 sig = _f("Dynamic_Sigma", _f("VolSigma", 0.0))
-
+            
                 # ScoreSigma：既存の sig_score を優先し、無ければ row から拾う
                 try:
                     score_sigma = float(sig_score) if (sig_score is not None and sig_score != "") else _f("ScoreSigma", 0.0)
                 except Exception:
                     score_sigma = _f("ScoreSigma", 0.0)
-
+            
                 # TP/SL を推論時に計算（rowには通常入っていないため）
                 tp_mult = 3.8
                 sl_mult = 1.5
-
+            
                 if str(side).upper() == "LONG":
                     tp = cp * (1.0 + sig * tp_mult)
                     sl = cp * (1.0 - sig * sl_mult)
                 else:
                     tp = cp * (1.0 - sig * tp_mult)
                     sl = cp * (1.0 + sig * sl_mult)
-
+            
                 # 比率（%ではなく 0.0058 のような比率）に統一
                 tp_pct = abs((tp - cp) / cp) if cp != 0 else 0.0
                 sl_pct = abs((sl - cp) / cp) if cp != 0 else 0.0
-
+            
                 # レバレッジ：0埋め回避（銘柄ルールで決め打ち）
                 try:
                     lev = float(MAX_LEV_5X if sym_code in MAX_LEV_5X_SYMBOLS else DEFAULT_LEV)
                 except Exception:
                     lev = 10.0
-
+            
                 # BTC_1h_Change：rowに無ければ btc_ret を使う
                 try:
                     _btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
                 except Exception:
                     _btc_ret_f = 0.0
                 btc_1h_change = _f("BTC_1h_Change", _btc_ret_f)
-
+            
                 # RSI：rowに無ければ 50（中立）を入れる（0固定は張り付き要因になりやすい）
                 rsi = _f("RSI", 50.0)
-
+            
                 return pd.DataFrame([{
                     "EntryPrice": float(cp),
                     "ScoreSigma": float(score_sigma),
@@ -3130,11 +3126,11 @@ def logic_main(force: bool = False):
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
                 if bypass_x:
                     return None, True, (dbg_x or {})
-
+            
                 try:
                     pos_idx = _pick_positive_class_index(model_for_sym, proba_x)
                     s = float(proba_x[0][pos_idx])
-
+            
                     if isinstance(dbg_x, dict):
                         dbg_x["pos_class_index"] = int(pos_idx)
                         try:
@@ -3144,11 +3140,12 @@ def logic_main(force: bool = False):
                             dbg_x["classes_"] = []
                 except Exception:
                     return None, True, {"error": "proba_parse_failed"}
-
+            
                 if not np.isfinite(s):
                     return None, True, {"error": "non_finite_score"}
-
+            
                 return float(s), False, (dbg_x or {})
+
 
             # base 採点
             score_b, bypass_b, dbg_b = _score_side(base_side)
@@ -3177,17 +3174,6 @@ def logic_main(force: bool = False):
 
             flipped = (chosen_side != base_side)
 
-            # 重要：弱い根拠（chosen_score < ai_th_used）での flip を禁止する
-            flip_cancelled = False
-            if flipped and (chosen_score is not None) and np.isfinite(float(chosen_score)):
-                try:
-                    if float(chosen_score) < float(ai_th_used):
-                        chosen_side = base_side
-                        flipped = False
-                        flip_cancelled = True
-                except Exception:
-                    pass
-
             # dbg は item["ai_debug"] に入れる前提
             dbg = {
                 "ai_side_select": bool(AI_SIDE_SELECT),
@@ -3202,7 +3188,6 @@ def logic_main(force: bool = False):
                 "dbg_flip": dbg_f,
                 "chosen_side": chosen_side,
                 "flipped": bool(flipped),
-                "flip_cancelled": bool(flip_cancelled),
                 "chosen_score": chosen_score,
                 "ai_th_used": float(ai_th_used),
             }
@@ -3226,7 +3211,7 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
-            # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
+                        # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
             if bypassed:
                 if FAIL_CLOSED_ON_AI_BYPASS:
                     ai_pass = False
@@ -3236,7 +3221,6 @@ def logic_main(force: bool = False):
                     print(f"[AI] bypassed -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
             else:
                 ai_pass = (float(ai_score) >= float(ai_th_used))
-
 
             # ----------------------------------------------------------
             # Market AI Filter (optional)
@@ -3541,15 +3525,6 @@ def logic_main(force: bool = False):
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
-        # ★追加：RUN_DEBUG=1 のときだけ、候補(CANDIDATE)側のAI判定行を Cloud Runログに出す
-        # これで gcloud logging 側で "AI:" "Pass:" "SideChosen:" を確実に拾える
-        try:
-            if str(RUN_DEBUG).strip() == "1" or str(RUN_DEBUG).strip().lower() == "true":
-                # sym はこのブロックの後ろで row_out に使っている変数（既に存在している前提）
-                print(f"[AI_LINE] {sym} {note_str}")
-        except Exception:
-            pass
-
 
         ai_debug_label = derive_ai_debug(
             btc_mode=btc_mode,
@@ -3645,7 +3620,7 @@ def logic_main(force: bool = False):
     alert_rows: List[List[Any]] = []
 
     for item in filtered:
-        if count >= 20:
+        if count >= 3:
             break
 
         sym = item["symbol"]
