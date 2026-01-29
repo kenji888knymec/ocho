@@ -3541,6 +3541,16 @@ def logic_main(force: bool = False):
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
+        # ★追加：RUN_DEBUG=1 のときだけ、候補(CANDIDATE)側のAI判定行を Cloud Runログに出す
+        # これで gcloud logging 側で "AI:" "Pass:" "SideChosen:" を確実に拾える
+        try:
+            if str(RUN_DEBUG).strip() == "1" or str(RUN_DEBUG).strip().lower() == "true":
+                # sym はこのブロックの後ろで row_out に使っている変数（既に存在している前提）
+                print(f"[AI_LINE] {sym} {note_str}")
+        except Exception:
+            pass
+)
+
 
         ai_debug_label = derive_ai_debug(
             btc_mode=btc_mode,
