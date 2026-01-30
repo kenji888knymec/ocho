@@ -982,6 +982,11 @@ def get_sheet_colcount(sheet_name: str) -> Optional[int]:
     return fs if fs > 0 else None
 
 def read_header_row(sheet_name: str) -> List[str]:
+    """
+    ヘッダー1行目を読む。
+    そのため、直近キャッシュがあればキャッシュを返して「空扱い」を避ける。
+    """
+    now = time.time()
     try:
         service = get_sheet_service()
         rng = f"{sheet_name}!A1:{HEADER_COL_END}1"
@@ -989,6 +994,12 @@ def read_header_row(sheet_name: str) -> List[str]:
         raw = (res.get("values", [[]]) or [[]])[0]
         return _normalize_headers(raw)
     except Exception as e:
+        cached = _sheet_header_cache.get(sheet_name, {})
+        ts = float(cached.get("ts", 0.0))
+        cached_headers = cached.get("headers", [])
+        if cached_headers and (now - ts) <= HEADER_TTL_SEC:
+            print(f"[WARN] read_header_row failed (use cache): sheet={sheet_name} err={e}")
+            return cached_headers
         print(f"[WARN] read_header_row failed: sheet={sheet_name} err={e}")
         return []
 
@@ -1082,11 +1093,19 @@ def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
 def ensure_table_headers() -> bool:
     ensure_sheet_exists(MAIN_SHEET_NAME, min_rows=20000, min_cols=max(HEADER_LEN_TABLE, 40))
 
-    headers = read_header_row(MAIN_SHEET_NAME)
-    colcount = get_sheet_colcount(MAIN_SHEET_NAME)
+    headers, colcount, _ok = get_headers_and_len(MAIN_SHEET_NAME)
+
+    # ★超重要★
+    if not headers:
+        msg = "[WARN] table header unavailable (empty). Skip AUTO_FIX/check to avoid corruption. sheet=table"
+        print(msg)
+        return (not STRICT_HEADER_CHECK)
+
     hm = _build_headers_map(headers)
+    updated = False
 
     if AUTO_FIX_HEADERS:
+        # 1) alias がある列を canonical にリネーム（同じ列位置）
         for canonical in TABLE_REQUIRED_FIELDS:
             if canonical in hm:
                 continue
@@ -1094,16 +1113,18 @@ def ensure_table_headers() -> bool:
                 if alias in hm:
                     idx = int(hm[alias])
                     if str(alias).strip() != canonical:
-                        update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical)
+                        if update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical):
+                            updated = True
+                            headers[idx] = canonical
+                            hm = _build_headers_map(headers)
                     break
 
-        headers = read_header_row(MAIN_SHEET_NAME)
-        hm = _build_headers_map(headers)
+        # 2) まだ無い必須列は blank に入れる（headers が取れている時だけ）
+        limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
         for canonical in TABLE_REQUIRED_FIELDS:
             if canonical in hm:
                 continue
 
-            limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
             blank_idx = _find_first_blank_index(headers, limit)
             if blank_idx == -1:
                 msg = f"[WARN] table missing required col '{canonical}' and no blank header cell. Please add a blank column."
@@ -1111,12 +1132,16 @@ def ensure_table_headers() -> bool:
                 send_discord_message(msg)
                 return False
 
-            update_single_cell(MAIN_SHEET_NAME, blank_idx, 1, canonical)
-            headers = read_header_row(MAIN_SHEET_NAME)
-            hm = _build_headers_map(headers)
+            if update_single_cell(MAIN_SHEET_NAME, blank_idx, 1, canonical):
+                updated = True
+                if blank_idx >= len(headers):
+                    headers = headers + [""] * (blank_idx + 1 - len(headers))
+                headers[blank_idx] = canonical
+                hm = _build_headers_map(headers)
 
-    headers = read_header_row(MAIN_SHEET_NAME)
-    hm = _build_headers_map(headers)
+        if updated:
+            _invalidate_sheet_caches(MAIN_SHEET_NAME)
+
     missing = [f for f in TABLE_REQUIRED_FIELDS if _resolve_col_idx(hm, f) == -1]
     if missing:
         msg = f"[WARN] table headers still missing: {missing}"
@@ -1125,6 +1150,7 @@ def ensure_table_headers() -> bool:
         return (not STRICT_HEADER_CHECK)
 
     return True
+
 
 def ensure_market_log_headers() -> bool:
     """
