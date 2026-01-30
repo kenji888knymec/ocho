@@ -854,30 +854,55 @@ def get_sheet_service():
     _sheet_service_cache["ts"] = now
     return svc
 
-def sheets_execute_with_retry(req, max_retries: int = 6, base_sleep: float = 2.0, max_sleep: float = 30.0):
+import time
+import random
+
+from googleapiclient.errors import HttpError
+
+_SHEETS_LAST_CALL_TS = 0.0
+
+def sheets_execute(req, *, min_interval_sec: float = 1.2, max_retries: int = 6, label: str = ""):
     """
-    Google Sheets API の execute を 429/5xx のときだけリトライする。
-    ログは増やさない（成功すれば何も出さない）。
+    Google Sheets API の execute() を安全に呼ぶ:
+      - 呼び出し間隔を min_interval_sec 以上空ける
+      - 429/5xx は指数バックオフでリトライ
     """
-    import random
+    global _SHEETS_LAST_CALL_TS
+
     for attempt in range(max_retries + 1):
+        now = time.time()
+        wait = (_SHEETS_LAST_CALL_TS + min_interval_sec) - now
+        if wait > 0:
+            time.sleep(wait)
+
         try:
-            return req.execute()
+            resp = req.execute()
+            _SHEETS_LAST_CALL_TS = time.time()
+            return resp
+
         except HttpError as e:
-            status = None
-            # googleapiclient の HttpError は resp.status に入っていることが多い
-            if hasattr(e, "resp") and hasattr(e.resp, "status"):
-                status = e.resp.status
-
-            # 429: rate limit / 5xx: transient
+            status = getattr(getattr(e, "resp", None), "status", None)
             if status in (429, 500, 502, 503, 504) and attempt < max_retries:
-                sleep_sec = min(max_sleep, base_sleep * (2 ** attempt))
-                # ジッター（同時リトライ衝突を避ける）
-                time.sleep(sleep_sec + random.uniform(0.0, 0.7))
+                backoff = (2 ** attempt) * 0.8 + random.random() * 0.4
+                time.sleep(backoff)
                 continue
-
-            # リトライ対象外 or リトライしきったら上に投げる（/judge が catch して Discord 通知する）
             raise
+
+def sheets_execute_with_retry(
+    req,
+    max_retries: int = 6,
+    base_sleep: float = 2.0,
+    max_sleep: float = 30.0
+):
+    """
+    既存互換のため残す。
+    base_sleep / max_sleep は受け取るが、基本は sheets_execute の
+    min_interval_sec + backoff に寄せる。
+    """
+    # base_sleep を最低間隔の目安として流用（小さすぎる値を入れられても守る）
+    min_interval_sec = max(1.2, float(base_sleep))
+    return sheets_execute(req, min_interval_sec=min_interval_sec, max_retries=max_retries)
+
 
 
 def _normalize_headers(headers: List[Any]) -> List[str]:
