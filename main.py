@@ -877,16 +877,21 @@ def sheets_execute(req, *, min_interval_sec: float = 1.2, max_retries: int = 6, 
 
         try:
             resp = req.execute()
+            # ★成功/失敗に関わらず「呼んだ直後」に更新したいので、成功時はここでOK
             _SHEETS_LAST_CALL_TS = time.time()
             return resp
 
         except HttpError as e:
+            # ★失敗でも「呼んだ」のでここで更新（これが肝）
+            _SHEETS_LAST_CALL_TS = time.time()
+
             status = getattr(getattr(e, "resp", None), "status", None)
             if status in (429, 500, 502, 503, 504) and attempt < max_retries:
                 backoff = (2 ** attempt) * 0.8 + random.random() * 0.4
                 time.sleep(backoff)
                 continue
             raise
+
 
 def sheets_execute_with_retry(
     req,
