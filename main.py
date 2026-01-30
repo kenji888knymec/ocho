@@ -572,7 +572,7 @@ MIN_BARS = int(float(os.environ.get("MIN_BARS", "30")))
 HEADER_COL_END = os.environ.get("HEADER_COL_END", "ZZ")
 
 # ---- 期待最低列数（ヘッダー取得失敗時のフェイルセーフ）----
-HEADER_LEN_TABLE = int(float(os.environ.get("HEADER_LEN_TABLE", "37")))
+HEADER_LEN_TABLE = int(float(os.environ.get("HEADER_LEN_TABLE", "33")))
 HEADER_LEN_LEARN = int(float(os.environ.get("HEADER_LEN_LEARN", "34")))
 
 # ---- Self-Heal 設定（重要：手作業を減らす）----
