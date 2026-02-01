@@ -1912,16 +1912,40 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
-        # 3) 特徴量の整合（35など feature_names_in_ に追従）
+        # 14列モデルに対して列順だけ固定したい場合（0埋めはしない）
+        FEATURE_COLUMNS_14 = [
+            "EntryPrice",
+            "ScoreSigma",
+            "VolSigma",
+            "TP",
+            "SL",
+            "TP_Pct",
+            "SL_Pct",
+            "Leverage",
+            "Reserved1",
+            "Reserved2",
+            "Reserved3",
+            "Reserved4",
+            "BTC_1h_Change",
+            "RSI",
+        ]
+        try:
+            if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
+                expected_n = int(getattr(model, "n_features_in_", 0) or 0)
+                if expected_n == 14:
+                    # ★列順は固定するが、足りない列は NaN のまま（=欠損扱い）
+                    feats = feats.reindex(columns=FEATURE_COLUMNS_14)
+                    debug["input_n_features"] = int(feats.shape[1])
+        except Exception:
+            pass
+
+        # 3) 特徴量の整合
         expected_cols = _extract_feature_names(model)
         if expected_cols:
-            expected_cols = [str(c) for c in list(expected_cols)]
             debug["expected_cols"] = list(expected_cols)
-            debug["expected_n_features"] = int(len(expected_cols))
-
-            # 期待列に整列（欠損は NaN のまま）
             feats = _align_by_feature_names(feats, expected_cols)
             debug["action"] = "aligned_by_feature_names"
+            debug["expected_n_features"] = int(len(expected_cols))
         else:
             expected_n = _infer_expected_n_features(model)
             debug["expected_n_features"] = int(expected_n)
@@ -1930,16 +1954,13 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 4) ★追加：NaN が残っているなら FAIL_CLOSED（その判定だけ bypass）
+        # ★ここが追加：predict_proba の直前で NaN を検知したら FAIL_CLOSED
         if isinstance(feats, pd.DataFrame) and feats.isna().any().any():
-            nan_cols = [c for c in feats.columns if feats[c].isna().any()]
             debug["action"] = "nan_input_fail_closed_bypass"
             debug["error"] = "input contains NaN (missing features); bypassed"
-            debug["nan_cols"] = nan_cols
-            debug["nan_n_cols"] = int(len(nan_cols))
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 5) predict_proba 実行
+        # 4) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1954,6 +1975,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
+
 
 
 
