@@ -1886,6 +1886,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             debug["action"] = "model_none_bypass"
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+
         # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
