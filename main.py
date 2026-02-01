@@ -1893,13 +1893,83 @@ def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd
     return aligned
 
 def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+    """
+    方針A（latest 35列 Pipeline を最優先で安定化）：
+    - model.feature_names_in_ が取れるなら、それ（=期待する生入力35列）に必ず整形して predict_proba。
+      * 不足列: 数値は NaN、カテゴリは「モデルが知っている既知カテゴリ」へ（取れなければ "__MISSING__"）
+      * 余計列: 捨てる
+      * 順序: expected_cols の順に揃える
+      * 数値: to_numeric(errors="coerce")（NaNは残す＝Pipeline側に任せる）
+      * カテゴリ: 空/NaN は既知カテゴリ or "__MISSING__"
+    - feature_names_in_ が取れない旧モデル:
+      * n_features_in_ == 14 なら legacy14列固定で整形して predict（従来互換）
+      * それ以外は列数が合わなければ bypass
+    - 失敗時は例外で落とさず 0.5/0.5 で bypass
+    """
     debug: Dict[str, Any] = {
         "expected_cols": None,
         "expected_n_features": -1,
         "input_n_features": -1,
+        "missing_cols": [],
+        "extra_cols": [],
         "action": "none",
         "error": "",
     }
+
+    def _legacy_14_cols() -> List[str]:
+        return [
+            "EntryPrice", "ScoreSigma", "VolSigma", "TP", "SL", "TP_Pct", "SL_Pct", "Leverage",
+            "Reserved1", "Reserved2", "Reserved3", "Reserved4", "BTC_1h_Change", "RSI",
+        ]
+
+    def _default_known_category_from_model(m, col_name: str) -> Optional[Any]:
+        """
+        可能なら Pipeline(preprocess) 内の OneHotEncoder.categories_ から、
+        col_name の既知カテゴリ（先頭）を取り出す。取れなければ None。
+        """
+        try:
+            named_steps = getattr(m, "named_steps", None)
+            if not isinstance(named_steps, dict):
+                return None
+            pre = named_steps.get("preprocess")
+            if pre is None:
+                return None
+
+            transformers = getattr(pre, "transformers_", None)
+            if not transformers:
+                return None
+
+            for _tname, trans, cols in transformers:
+                if trans is None or trans == "drop":
+                    continue
+                if not isinstance(cols, (list, tuple)):
+                    continue
+
+                cols_s = [str(x) for x in cols]
+                if col_name not in cols_s:
+                    continue
+
+                # Pipelineなら最後のステップを使う
+                t = trans
+                steps = getattr(t, "steps", None)
+                if isinstance(steps, list) and steps:
+                    t = steps[-1][1]
+
+                cats = getattr(t, "categories_", None)
+                if cats is None:
+                    continue
+
+                idx = cols_s.index(col_name)
+                if idx < 0 or idx >= len(cats):
+                    continue
+
+                arr = cats[idx]
+                if arr is None or len(arr) == 0:
+                    continue
+                return arr[0]
+            return None
+        except Exception:
+            return None
 
     try:
         # 0) model が None の場合は即バイパス
@@ -1907,81 +1977,136 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             debug["action"] = "model_none_bypass"
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
-        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        # 1) model unwrap（dict/tuple/list wrapper 対応）
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
                     model = model[k]
-                    debug["action"] = "unwrapped_dict_model"
+                    debug["action"] = f"unwrapped_dict_model:{k}"
                     break
 
         if isinstance(model, (tuple, list)) and len(model) >= 1:
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
-        # unwrap した結果でも predict_proba が無いならバイパス
         if not hasattr(model, "predict_proba"):
             debug["action"] = "no_predict_proba_bypass"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
             print(f"[AI] safe_predict_proba fallback: {debug['error']}")
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 2) feats の整形
+        # 2) feats を DataFrame 化（※ここでは 0埋めしない）
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
-        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
-        # ★追加：14列スキーマに強制整列（X=9 expected=14 を bypass させない）
-        # train_report.json の feature_columns と同順（14列）
-        FEATURE_COLUMNS_14 = [
-            "EntryPrice",
-            "ScoreSigma",
-            "VolSigma",
-            "TP",
-            "SL",
-            "TP_Pct",
-            "SL_Pct",
-            "Leverage",
-            "Reserved1",
-            "Reserved2",
-            "Reserved3",
-            "Reserved4",
-            "BTC_1h_Change",
-            "RSI",
-        ]
-        try:
-            if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
-                expected_n = int(getattr(model, "n_features_in_", 0) or 0)
-                if expected_n == 14:
-                    # 足りない列は 0.0 で補い、列順も固定する
-                    feats = feats.reindex(columns=FEATURE_COLUMNS_14, fill_value=0.0)
-                    debug["input_n_features"] = int(feats.shape[1])
-        except Exception:
-            # ここで落ちても /run を落とさない
-            pass
-
-        # 3) 特徴量の整合
+        # 3) 期待列（feature_names_in_ が取れるならそれが唯一の正）
         expected_cols = _extract_feature_names(model)
-        if expected_cols:
-            debug["expected_cols"] = list(expected_cols)
-            feats = _align_by_feature_names(feats, expected_cols)
-            debug["action"] = "aligned_by_feature_names"
-            debug["expected_n_features"] = int(len(expected_cols))
-        else:
-            expected_n = _infer_expected_n_features(model)
+
+        # ===== feature_names_in_ が取れない場合（旧モデル互換） =====
+        if not expected_cols:
+            expected_n = int(_infer_expected_n_features(model) or 0)
             debug["expected_n_features"] = int(expected_n)
+
+            # 14列旧モデル：列名が分からなくても固定スキーマで整形して落ちにくくする
+            if expected_n == 14:
+                base_cols = _legacy_14_cols()
+                df = feats.copy().reindex(columns=base_cols)
+                for c in base_cols:
+                    df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+                proba = np.asarray(model.predict_proba(df), dtype=float)
+                if proba.ndim == 1:
+                    proba = np.vstack([1.0 - proba, proba]).T
+                if proba.shape[1] == 1:
+                    proba = np.hstack([1.0 - proba, proba])
+
+                debug["action"] = "predicted_legacy14_no_feature_names"
+                return proba, False, debug
+
+            # 列数が分かる場合：不一致なら bypass
             if expected_n > 0 and int(feats.shape[1]) != int(expected_n):
                 debug["action"] = "feature_count_mismatch_bypass"
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+            # 列名も列数も問題なければそのまま実行（落ちたら例外でbypass）
+            proba = np.asarray(model.predict_proba(feats), dtype=float)
+            if proba.ndim == 1:
+                proba = np.vstack([1.0 - proba, proba]).T
+            if proba.shape[1] == 1:
+                proba = np.hstack([1.0 - proba, proba])
+
+            debug["action"] = "predicted_no_feature_names"
+            return proba, False, debug
+
+        # ===== feature_names_in_ が取れた場合（最新35列モデルをここで安定化） =====
+        expected_cols = [str(c) for c in list(expected_cols)]
+        debug["expected_cols"] = list(expected_cols)
+        debug["expected_n_features"] = int(len(expected_cols))
+
+        # 不足列・余計列の把握
+        orig_cols = [str(c) for c in list(feats.columns)]
+        missing = [c for c in expected_cols if c not in feats.columns]
+        extra = [c for c in orig_cols if c not in expected_cols]
+        debug["missing_cols"] = list(missing)
+        debug["extra_cols"] = list(extra)
+
+        df = feats.copy()
+
+        cat_cols = {"Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "Version"}
+
+        # 不足列を追加
+        for c in missing:
+            if c in cat_cols:
+                dv = _default_known_category_from_model(model, c)
+                df[c] = "__MISSING__" if dv is None else dv
+            else:
+                df[c] = np.nan
+
+        # 余計列は落とす
+        if extra:
+            df = df.drop(columns=[c for c in extra if c in df.columns], errors="ignore")
+
+        # 順序を expected_cols に合わせる
+        df = df.reindex(columns=expected_cols)
+
+        # 型の整形（35列はNaN残す／カテゴリは既知カテゴリに寄せる）
+        expected_n = int(len(expected_cols))
+        if expected_n <= 20:
+            # 念のため：feature_names_in_ があっても旧モデルっぽいなら数値モデル互換で0埋め
+            for c in expected_cols:
+                df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            debug["action"] = "aligned_legacy_numeric_by_feature_names"
+        else:
+            for c in expected_cols:
+                if c in cat_cols:
+                    s = df[c].astype("object")
+
+                    def _fix_cat(v):
+                        if v is None:
+                            dv = _default_known_category_from_model(model, c)
+                            return "__MISSING__" if dv is None else dv
+                        if isinstance(v, float) and np.isnan(v):
+                            dv = _default_known_category_from_model(model, c)
+                            return "__MISSING__" if dv is None else dv
+                        if isinstance(v, str) and v.strip() == "":
+                            dv = _default_known_category_from_model(model, c)
+                            return "__MISSING__" if dv is None else dv
+                        return v
+
+                    df[c] = s.apply(_fix_cat)
+                else:
+                    df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+            debug["action"] = "aligned_expected_cols_35"
+
         # 4) predict_proba 実行
-        proba = np.asarray(model.predict_proba(feats), dtype=float)
+        proba = np.asarray(model.predict_proba(df), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
         if proba.shape[1] == 1:
@@ -1995,6 +2120,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
+
 
 
 def _unwrap_estimator_for_classes(model: Any) -> Any:
@@ -2232,28 +2358,22 @@ def _normalize_winlose(x: Any) -> str:
 def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     learn_log から学習データを作る（推論側の9特徴量に揃える版）
-    - y: Win=1 / Lose=0
-    - X columns (logic_main と同一):
-        Sigma, BandWidth, BW_Change, RSI, Vol_Change, Rise_Score, Drop_Score, BTC_Ret, BTC_Vol
 
-    注意:
-    - learn_log に BandWidth/BW_Change/Vol_Change/BTC_Ret の元データが無いので、現時点では 0.0 固定（暫定）
-    - Side と ScoreSigma から Rise_Score/Drop_Score を作る
-    - BTC_1h_Change から BTC_Vol を作る（既存の簡易実装と整合）
+    ★方針（あなたの要望で統一）
+    - 空白セル（"" / None / NaN）がある行は学習に使わない（埋めない）
+      ※判定対象は必須列（required_cols）
+    - Win/Lose が未確定の行は学習に使わない
     """
     info: Dict[str, Any] = {
-        "mode": "aligned_to_inference_9_features",
+        "policy": "drop_any_blank_in_required_cols",
         "required_cols": ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"],
         "missing_cols": [],
         "rows_total": 0,
         "rows_labeled": 0,
+        "rows_skipped_blank_required": 0,
+        "rows_skipped_nan_after_numeric": 0,
         "rows_used": 0,
         "feature_columns": ["Sigma", "BandWidth", "BW_Change", "RSI", "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol"],
-        "notes": [
-            "BandWidth/BW_Change/Vol_Change/BTC_Ret are set to 0.0 (learn_log has no raw inputs).",
-            "Rise_Score/Drop_Score derived from ScoreSigma + Side.",
-            "BTC_Vol derived from abs(BTC_1h_Change)/4.0.",
-        ],
     }
 
     if df is None or df.empty:
@@ -2261,12 +2381,10 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
 
     info["rows_total"] = int(len(df))
 
-    # 必須列チェック
     needed = ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
     missing = [c for c in needed if c not in df.columns]
     info["missing_cols"] = list(missing)
     if missing:
-        # ここで空を返すことで /train 側が not enough labeled samples などで安全に落ちる
         return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
     df2 = df.copy()
@@ -2278,31 +2396,46 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     if df2.empty:
         return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
+    # 空白判定
+    def _is_blank(v) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, float) and np.isnan(v):
+            return True
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        return False
+
+    # ★必須列に空白がある行は除外（埋めない）
+    required_cols = ["Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
+    blank_mask = df2[required_cols].applymap(_is_blank).any(axis=1)
+    info["rows_skipped_blank_required"] = int(blank_mask.sum())
+    df2 = df2[~blank_mask].copy()
+    if df2.empty:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
     y = (df2["__winlose__"] == "Win").astype(int).to_numpy()
 
-    # 数値化
-    score = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    sigma = pd.to_numeric(df2["VolSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    rsi = pd.to_numeric(df2["RSI"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(50.0)
-    btc1h = pd.to_numeric(df2["BTC_1h_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # 数値化（埋めない）
+    score = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    sigma = pd.to_numeric(df2["VolSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    rsi = pd.to_numeric(df2["RSI"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    btc1h = pd.to_numeric(df2["BTC_1h_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     side = df2["Side"].astype(str).fillna("").str.upper()
-    
-    # Rise/Drop は Side で振り分け（LONG/SHORT だけでなく BUY/SELL も吸収）
     is_long = side.str.contains("LONG") | side.str.contains("BUY")
     is_short = side.str.contains("SHORT") | side.str.contains("SELL")
-    
-    rise_score = np.where(is_long, score, 0.0)
-    drop_score = np.where(is_short, score, 0.0)
 
+    rise_score = np.where(is_long, score, np.nan)
+    drop_score = np.where(is_short, score, np.nan)
 
-    # 推論側の9特徴量へ揃える（learn_log に列があれば実値を使う。無ければ従来通り0/代替値）
-    bw = pd.to_numeric(df2.get("BandWidth", 0.0), errors="coerce")
-    bw_ch = pd.to_numeric(df2.get("BW_Change", 0.0), errors="coerce")
-    vol_ch = pd.to_numeric(df2.get("Vol_Change", 0.0), errors="coerce")
+    # optional列：列が無い場合は 0.0（列があるのに空白なら NaN→行ごと除外）
+    bw = pd.to_numeric(df2.get("BandWidth", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    bw_ch = pd.to_numeric(df2.get("BW_Change", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    vol_ch = pd.to_numeric(df2.get("Vol_Change", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    btc_ret_series = pd.to_numeric(df2.get("BTC_Ret", df2.get("BTC_1h_Change", 0.0)), errors="coerce")
-    btc_vol_series = pd.to_numeric(df2.get("BTC_Vol", (btc1h.abs() / 4.0)), errors="coerce")
+    btc_ret_series = pd.to_numeric(df2.get("BTC_Ret", df2.get("BTC_1h_Change", np.nan)), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    btc_vol_series = pd.to_numeric(df2.get("BTC_Vol", (btc1h.abs() / 4.0)), errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
@@ -2314,10 +2447,18 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "Drop_Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
         "BTC_Ret": btc_ret_series.astype(float),
         "BTC_Vol": btc_vol_series.astype(float),
-    }, index=df2.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    }, index=df2.index).replace([np.inf, -np.inf], np.nan)
+
+    # ★NaN が残る行は学習に使わない（=欠損は埋めない）
+    valid = ~X.isna().any(axis=1)
+    info["rows_skipped_nan_after_numeric"] = int((~valid).sum())
+
+    X = X[valid].copy()
+    y = y[valid.to_numpy()]
 
     info["rows_used"] = int(len(X))
     return X, y, info
+
 
 
 # ==========================================
