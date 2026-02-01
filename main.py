@@ -2355,6 +2355,7 @@ def _normalize_winlose(x: Any) -> str:
         return "Lose"
     return ""
 
+
 def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     learn_log から学習データを作る（推論側の9特徴量に揃える版）
@@ -2426,16 +2427,37 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     is_long = side.str.contains("LONG") | side.str.contains("BUY")
     is_short = side.str.contains("SHORT") | side.str.contains("SELL")
 
-    rise_score = np.where(is_long, score, np.nan)
-    drop_score = np.where(is_short, score, np.nan)
+    # ★重要：反対側は NaN ではなく 0.0（仕様上の定義）にする
+    rise_score = np.where(is_long, score, 0.0)
+    drop_score = np.where(is_short, score, 0.0)
 
-    # optional列：列が無い場合は 0.0（列があるのに空白なら NaN→行ごと除外）
-    bw = pd.to_numeric(df2.get("BandWidth", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
-    bw_ch = pd.to_numeric(df2.get("BW_Change", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
-    vol_ch = pd.to_numeric(df2.get("Vol_Change", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    # optional列：列が無い場合でも必ず Series を作る（astypeで落ちないように）
+    if "BandWidth" in df2.columns:
+        bw = pd.to_numeric(df2["BandWidth"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    else:
+        bw = pd.Series(0.0, index=df2.index)
 
-    btc_ret_series = pd.to_numeric(df2.get("BTC_Ret", df2.get("BTC_1h_Change", np.nan)), errors="coerce").replace([np.inf, -np.inf], np.nan)
-    btc_vol_series = pd.to_numeric(df2.get("BTC_Vol", (btc1h.abs() / 4.0)), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if "BW_Change" in df2.columns:
+        bw_ch = pd.to_numeric(df2["BW_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    else:
+        bw_ch = pd.Series(0.0, index=df2.index)
+
+    if "Vol_Change" in df2.columns:
+        vol_ch = pd.to_numeric(df2["Vol_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    else:
+        vol_ch = pd.Series(0.0, index=df2.index)
+
+    # BTC_Ret：列が無ければ BTC_1h_Change を使う（requiredなので基本は存在）
+    if "BTC_Ret" in df2.columns:
+        btc_ret_series = pd.to_numeric(df2["BTC_Ret"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    else:
+        btc_ret_series = btc1h.copy()
+
+    # BTC_Vol：列が無ければ abs(BTC_1h_Change)/4.0
+    if "BTC_Vol" in df2.columns:
+        btc_vol_series = pd.to_numeric(df2["BTC_Vol"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    else:
+        btc_vol_series = (btc1h.abs() / 4.0)
 
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
@@ -2458,6 +2480,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
 
     info["rows_used"] = int(len(X))
     return X, y, info
+
 
 
 
