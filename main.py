@@ -4233,64 +4233,78 @@ def ai_smoke():
 
     重要：
     /ai_smoke は「本番モデルが要求する特徴量スキーマ」でテストする。
-    そうしないと feature mismatch (9 vs 14) が発生し、bypass を誘発する。
+    14固定を廃止し、モデルの feature_names_in_（= 35等）に自動追従させる。
     """
-    # train_report.json の feature_columns と同順を想定（14列）
-    feats = pd.DataFrame([{
-        "EntryPrice": 0.0,
-        "ScoreSigma": 0.0,
-        "VolSigma": 0.0,
-        "TP": 0.0,
-        "SL": 0.0,
-        "TP_Pct": 0.0,
-        "SL_Pct": 0.0,
-        "Leverage": 10.0,
-        "Reserved1": 0.0,
-        "Reserved2": 0.0,
-        "Reserved3": 0.0,
-        "Reserved4": 0.0,
-        "BTC_1h_Change": 0.0,
-        "RSI": 50.0,
-    }])
 
     proba = None
     bypassed = True
     dbg = {"info": "init"}
-
-    try:
-        proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
-    except Exception as e:
-        # safe_predict_proba 自体が例外でも 200 で返す（落とさない）
-        dbg = {"error": f"{type(e).__name__}: {e}"}
-        proba = None
-        bypassed = True
-
-
     score = None
+
     try:
+        # 1) モデルが要求する列を取得（feature_names_in_ 優先）
+        expected_cols = extract_feature_names(ai_model)
+        expected_cols = [str(c) for c in (expected_cols or [])]
+
+        # 2) 期待列が取れない場合は fallback（= 35想定の安全側）
+        if not expected_cols:
+            expected_cols = [
+                "EntryPrice", "ScoreSigma", "VolSigma", "Sigma", "TP", "SL", "TP_Pct", "SL_Pct",
+                "Leverage", "Reserved1", "Reserved2", "Reserved3", "Reserved4", "BTC_1h_Change",
+                "BTC_Calm", "RSI", "BandWidth", "BW_Change", "Vol_Change", "Rise_Score", "Drop_Score",
+                "BTC_Ret", "BTC_Vol", "market_ai_score", "Symbol", "Side", "SignalType", "MarketTag",
+                "BTC_Mode", "Version", "time_hour", "time_day_of_week", "time_month",
+                "time_hour_sin", "time_hour_cos",
+            ]
+
+        # 3) smoke 用 1行データを「期待列で」作る
+        row = {}
+        for c in expected_cols:
+            if c in ("Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "Version"):
+                row[c] = "DUMMY"
+            elif c == "RSI":
+                row[c] = 50.0
+            elif c == "Leverage":
+                row[c] = 10.0
+            elif c == "BTC_Calm":
+                row[c] = 1.0
+            else:
+                row[c] = 0.0
+
+        feats = pd.DataFrame([row], columns=expected_cols)
+
+        # 4) 推論
+        proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
+
+        # 5) score 抽出
         if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[0] > 0 and proba.shape[1] > 0:
             pos_idx = _pick_positive_class_index(ai_model, proba)
             s = float(proba[0][pos_idx])
-    
+
             if isinstance(dbg, dict):
                 dbg["pos_class_index"] = int(pos_idx)
+                dbg["classes_"] = []
                 try:
                     m = _unwrap_estimator_for_classes(ai_model)
                     dbg["classes_"] = [str(c) for c in list(getattr(m, "classes_", []))]
                 except Exception:
-                    dbg["classes_"] = []
-    
+                    pass
+
+                dbg["expected_cols"] = list(expected_cols)
+                dbg["expected_n_features"] = int(len(expected_cols))
+                dbg["input_n_features"] = int(feats.shape[1])
+
             if np.isfinite(s):
                 score = s
             else:
                 bypassed = True
                 if isinstance(dbg, dict):
                     dbg["score_error"] = "non_finite"
+
     except Exception as e:
         bypassed = True
-        if isinstance(dbg, dict):
-            dbg["score_error"] = f"{type(e).__name__}: {e}"
-
+        dbg = {"error": f"{type(e).__name__}: {e}"}
+        proba = None
 
     return jsonify({
         "ok": True,
@@ -4300,6 +4314,7 @@ def ai_smoke():
         "debug": dbg,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
+
 
 
 
