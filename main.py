@@ -1878,6 +1878,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         # ★追加：NaN原因特定用（常にキーを持たせる）
         "nan_cols": None,
         "nan_n_cols": None,
+        "alias_renamed": None,
     }
 
     try:
@@ -1950,7 +1951,44 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             debug["expected_cols"] = list(expected_cols)
             debug["expected_n_features"] = int(len(expected_cols))
 
+            # 列名揺れ吸収（スペース/アンダースコアの違い等）→ その後に expected_cols に整列
+            try:
+                rename_map = {}
+                if isinstance(feats, pd.DataFrame):
+                    feats_cols = set(str(c) for c in feats.columns)
+            
+                    for c in expected_cols:
+                        if c in feats_cols:
+                            continue
+            
+                        # 基本： "Rise Score" ↔ "Rise_Score" など
+                        candidates = [
+                            c.replace("_", " "),
+                            c.replace(" ", "_"),
+                        ]
+            
+                        # 追加：BandWidth 系のよくある揺れ
+                        if c == "BandWidth":
+                            candidates += ["Bandwidth", "Band_Width", "Band Width"]
+                        elif c == "Bandwidth":
+                            candidates += ["BandWidth", "Band_Width", "Band Width"]
+            
+                        for cand in candidates:
+                            if cand in feats_cols:
+                                rename_map[cand] = c
+                                feats_cols.remove(cand)
+                                feats_cols.add(c)
+                                break
+            
+                    if rename_map:
+                        feats = feats.rename(columns=rename_map)
+                        debug["alias_renamed"] = dict(rename_map)
+            
+            except Exception:
+                pass
+            
             feats = _align_by_feature_names(feats, expected_cols)
+
             debug["action"] = "aligned_by_feature_names"
         else:
             expected_n = _infer_expected_n_features(model)
