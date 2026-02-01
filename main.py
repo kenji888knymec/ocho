@@ -4225,6 +4225,37 @@ def ai_health():
 
     return jsonify(resp), 200
 
+
+def extract_feature_names(model):
+    """モデルが要求する特徴量名(feature_names_in_)を可能なら返す。無理なら空リスト。"""
+    if model is None:
+        return []
+
+    # まず model 自体
+    fn = getattr(model, "feature_names_in_", None)
+    if fn is not None:
+        try:
+            return [str(x) for x in list(fn)]
+        except Exception:
+            return []
+
+    # Pipeline などで最後の推定器に付くケース
+    try:
+        if hasattr(model, "named_steps") and isinstance(model.named_steps, dict) and len(model.named_steps) > 0:
+            last = list(model.named_steps.values())[-1]
+            fn2 = getattr(last, "feature_names_in_", None)
+            if fn2 is not None:
+                return [str(x) for x in list(fn2)]
+    except Exception:
+        pass
+
+    return []
+
+
+# 互換：過去コードが extract_feature_names を呼ぶ場合に備える（どっちでも動く）
+extract_feature_names = extract_feature_names
+
+
 @app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
     """
