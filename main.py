@@ -4312,8 +4312,8 @@ def extract_feature_names(model):
     return []
 
 
-# 互換：過去コードが extract_feature_names を呼ぶ場合に備える（どっちでも動く）
-extract_feature_names = extract_feature_names
+
+
 
 
 @app.route("/ai_smoke", methods=["GET"])
@@ -4365,7 +4365,56 @@ def ai_smoke():
         feats = pd.DataFrame([row], columns=expected_cols)
 
         # 4) 推論
-        proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
+        # latest9: modelが9特徴なら、rowから9特徴を再構築して渡す
+        _feats_in = feats
+    
+        try:
+            exp_n = int(getattr(ai_model, "n_features_in_", -1))
+        except Exception:
+            exp_n = -1
+    
+        if exp_n == 9:
+            def _sf(v):
+                try:
+                    if v is None:
+                        return 0.0
+                    if isinstance(v, str) and v.strip() == "":
+                        return 0.0
+                    return float(v)
+                except Exception:
+                    return 0.0
+    
+            def _rg(key, default=0.0):
+                try:
+                    return _sf(row.get(key, default))
+                except Exception:
+                    return _sf(default)
+    
+            btc_ret_val = _rg("BTC_Ret", _rg("BTC_1h_Change", 0.0))
+            btc_vol_val = _rg("BTC_Vol", _rg("BTC_VolSigma", 0.0))
+    
+            cols9 = [
+                "Sigma", "BandWidth", "BW_Change", "RSI",
+                "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol",
+            ]
+
+            _feats_in = pd.DataFrame([{
+                "Sigma": _rg("Dynamic_Sigma", _rg("Sigma", 0.0)),
+                "BandWidth": _rg("BandWidth", 0.0),
+                "BW_Change": _rg("BW_Change", 0.0),
+                "RSI": _rg("RSI", 0.0),
+                "Vol_Change": _rg("Vol_Change", 0.0),
+                "Rise_Score": _rg("Rise_Score", 0.0),
+                "Drop_Score": _rg("Drop_Score", 0.0),
+                "BTC_Ret": btc_ret_val,
+                "BTC_Vol": btc_vol_val,
+            }], columns=cols9)
+
+    
+        # ↓ ここだけ「2つ目の引数」を _feats_in にする（左辺はあなたの元のまま）
+        proba, bypassed, dbg = safe_predict_proba(ai_model, _feats_in)
+    
+
 
         # 5) score 抽出
         if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[0] > 0 and proba.shape[1] > 0:
@@ -4383,8 +4432,23 @@ def ai_smoke():
 
                 dbg["expected_cols"] = list(expected_cols)
                 dbg["expected_n_features"] = int(len(expected_cols))
-                dbg["input_n_features"] = int(feats.shape[1])
+                try:
+                    dbg["input_n_features"] = int(_feats_in.shape[1]) if _feats_in is not None else None
+                except Exception:
+                    dbg["input_n_features"] = None
+                
+                # あると便利（任意だけどおすすめ）
+                try:
+                    dbg["model_n_features_in_"] = int(getattr(ai_model, "n_features_in_", -1))
+                except Exception:
+                    dbg["model_n_features_in_"] = -1
+                # 実際に推論に渡した列名（原因調査がラクになる）
+                try:
+                    dbg["input_cols"] = list(_feats_in.columns) if _feats_in is not None else None
+                except Exception:
+                    dbg["input_cols"] = None
 
+            
             if np.isfinite(s):
                 score = s
             else:
