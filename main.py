@@ -3149,10 +3149,10 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> pd.DataFrame:
-                # モデル(train_report.json)が期待する14列に合わせる（列名・列数を固定）
-                # ['EntryPrice','ScoreSigma','VolSigma','TP','SL','TP_Pct','SL_Pct','Leverage',
-                #  'Reserved1','Reserved2','Reserved3','Reserved4','BTC_1h_Change','RSI']
-            
+                # 目的：
+                # - 9特徴量モデル / 14特徴量モデル / latest(35特徴量pipeline) のどれでも推論できる入力行を作る
+                # - model_for_sym.feature_names_in_ がある場合は「その列だけ」を返して列ズレ/列数ズレを防ぐ
+
                 def _f(key: str, default: float = 0.0) -> float:
                     try:
                         if hasattr(row, "get"):
@@ -3162,74 +3162,132 @@ def logic_main(force: bool = False):
                                 v = row[key]
                             else:
                                 v = default
-            
+
                         if v is None or v == "":
                             return float(default)
-            
+
                         if isinstance(v, str):
                             vv = v.strip().replace(",", "")
                             if vv.endswith("%"):
                                 vv = vv[:-1]
                                 return float(vv) / 100.0
                             return float(vv)
-            
+
                         return float(v)
                     except Exception:
                         return float(default)
-            
-                # 現在価格（推論時の入力の中心）：
-                # row から Close/close/c/EntryPrice/Entry を拾う
+
+                def _s(key: str, default: str = "") -> str:
+                    try:
+                        if hasattr(row, "get"):
+                            v = row.get(key, default)
+                        else:
+                            if hasattr(row, "index") and key in row.index:
+                                v = row[key]
+                            else:
+                                v = default
+                        if v is None:
+                            return str(default)
+                        return str(v)
+                    except Exception:
+                        return str(default)
+
+                side_u = str(side).upper().strip()
+                if side_u not in ("LONG", "SHORT"):
+                    side_u = "LONG"
+
+                # 現在価格
                 cp = _f("Close", _f("close", _f("c", _f("EntryPrice", _f("Entry", 0.0)))))
-            
-                # 追加しておくと安全：cp が 0 のままになった場合のフォールバック
                 if cp == 0.0:
-                    # close_now がスコープにある場合だけ拾う（無ければ except で無害に通る）
                     try:
                         cp = float(close_now)
                     except Exception:
                         pass
-            
-                # sigma（推論時にTP/SLを作るために使う）
+
+                # sigma
                 sig = _f("Dynamic_Sigma", _f("VolSigma", 0.0))
-            
-                # ScoreSigma：既存の sig_score を優先し、無ければ row から拾う
+
+                # ScoreSigma
                 try:
                     score_sigma = float(sig_score) if (sig_score is not None and sig_score != "") else _f("ScoreSigma", 0.0)
                 except Exception:
                     score_sigma = _f("ScoreSigma", 0.0)
-            
-                # TP/SL を推論時に計算（rowには通常入っていないため）
+
+                # TP/SL
                 tp_mult = 3.8
                 sl_mult = 1.5
-            
-                if str(side).upper() == "LONG":
+                if side_u == "LONG":
                     tp = cp * (1.0 + sig * tp_mult)
                     sl = cp * (1.0 - sig * sl_mult)
                 else:
                     tp = cp * (1.0 - sig * tp_mult)
                     sl = cp * (1.0 + sig * sl_mult)
-            
-                # 比率（%ではなく 0.0058 のような比率）に統一
+
                 tp_pct = abs((tp - cp) / cp) if cp != 0 else 0.0
                 sl_pct = abs((sl - cp) / cp) if cp != 0 else 0.0
-            
-                # レバレッジ：0埋め回避（銘柄ルールで決め打ち）
+
+                # レバレッジ
                 try:
                     lev = float(MAX_LEV_5X if sym_code in MAX_LEV_5X_SYMBOLS else DEFAULT_LEV)
                 except Exception:
                     lev = 10.0
-            
-                # BTC_1h_Change：rowに無ければ btc_ret を使う
+
+                # BTC_1h_Change / BTC_Ret
                 try:
                     _btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
                 except Exception:
                     _btc_ret_f = 0.0
                 btc_1h_change = _f("BTC_1h_Change", _btc_ret_f)
-            
-                # RSI：rowに無ければ 50（中立）を入れる（0固定は張り付き要因になりやすい）
+
+                # BTC_Vol
+                try:
+                    _btc_vol_f = float(btc_vol) if (btc_vol is not None and btc_vol != "") else _f("BTC_Vol", 0.0)
+                except Exception:
+                    _btc_vol_f = _f("BTC_Vol", 0.0)
+
+                # RSI
                 rsi = _f("RSI", 50.0)
-            
-                return pd.DataFrame([{
+
+                # 9特徴量モデル向け（現行GCSモデルで多いセット）
+                sigma9 = _f("Sigma", _f("Dynamic_Sigma", sig))
+                bw9 = _f("BandWidth", 0.0)
+                bwc9 = _f("BW_Change", 0.0)
+                volc9 = _f("Vol_Change", 0.0)
+                rise9 = _f("Rise_Score", 0.0)
+                drop9 = _f("Drop_Score", 0.0)
+                btc_ret9 = _f("BTC_Ret", _btc_ret_f)
+                btc_vol9 = _f("BTC_Vol", _btc_vol_f)
+
+                # latest pipeline(35特徴量) が来ても通るように、追加列も用意（あっても9/14モデルには無害）
+                try:
+                    btc_mode_s = str(btc_mode)
+                except Exception:
+                    btc_mode_s = _s("BTC_Mode", "")
+
+                try:
+                    btc_calm_f = 1.0 if bool(BTC_CALM) else 0.0
+                except Exception:
+                    btc_calm_f = 0.0
+
+                try:
+                    market_ai_score_f = float((row.get("market_ai_score", 0.0) if hasattr(row, "get") else 0.0) or 0.0)
+                except Exception:
+                    market_ai_score_f = 0.0
+
+                try:
+                    sym_s = str(sym_code)
+                except Exception:
+                    sym_s = _s("Symbol", "")
+
+                version_s = ""
+                try:
+                    version_s = str(MODEL_VERSION or "")
+                except Exception:
+                    version_s = ""
+
+                # “全部入り”の1行（ここから必要列だけ切り出して返す）
+                row_out = {
+                    # --- 14列（従来互換） ---
                     "EntryPrice": float(cp),
                     "ScoreSigma": float(score_sigma),
                     "VolSigma": float(sig),
@@ -3244,7 +3302,64 @@ def logic_main(force: bool = False):
                     "Reserved4": 0.0,
                     "BTC_1h_Change": float(btc_1h_change),
                     "RSI": float(rsi),
-                }])
+
+                    # --- 9列（現行モデル互換） ---
+                    "Sigma": float(sigma9),
+                    "BandWidth": float(bw9),
+                    "BW_Change": float(bwc9),
+                    "Vol_Change": float(volc9),
+                    "Rise_Score": float(rise9),
+                    "Drop_Score": float(drop9),
+                    "BTC_Ret": float(btc_ret9),
+                    "BTC_Vol": float(btc_vol9),
+
+                    # --- latest pipeline 用（文字列/補助列） ---
+                    "Symbol": sym_s,
+                    "Side": side_u,
+                    "SignalType": _s("SignalType", ""),
+                    "MarketTag": _s("MarketTag", ""),
+                    "BTC_Mode": btc_mode_s,
+                    "BTC_Calm": float(btc_calm_f),
+                    "market_ai_score": float(market_ai_score_f),
+                    "Version": version_s,
+                }
+
+                df_all = pd.DataFrame([row_out])
+
+                # 1) feature_names_in_ があれば、その列だけ返す（最も安全）
+                exp_cols = None
+                try:
+                    exp_cols = list(getattr(model_for_sym, "feature_names_in_", None) or [])
+                except Exception:
+                    exp_cols = None
+
+                if exp_cols:
+                    str_cols = {"Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "Version"}
+                    for c in exp_cols:
+                        if c not in df_all.columns:
+                            df_all[c] = "" if c in str_cols else 0.0
+                    return df_all[exp_cols]
+
+                # 2) feature_names_in_ が無いモデル向け：列数だけ合わせて返す
+                try:
+                    exp_n = int(getattr(model_for_sym, "n_features_in_", 0) or 0)
+                except Exception:
+                    exp_n = 0
+
+                if exp_n == 9:
+                    cols9 = ["Sigma", "BandWidth", "BW_Change", "RSI", "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol"]
+                    for c in cols9:
+                        if c not in df_all.columns:
+                            df_all[c] = 0.0
+                    return df_all[cols9]
+
+                cols14 = ["EntryPrice", "ScoreSigma", "VolSigma", "TP", "SL", "TP_Pct", "SL_Pct", "Leverage",
+                          "Reserved1", "Reserved2", "Reserved3", "Reserved4", "BTC_1h_Change", "RSI"]
+                for c in cols14:
+                    if c not in df_all.columns:
+                        df_all[c] = 0.0
+                return df_all[cols14]
+
 
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
