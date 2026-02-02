@@ -2277,7 +2277,8 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "rows_skipped_blank_required": 0,
         "rows_skipped_nan_after_numeric": 0,
         "rows_used": 0,
-        "feature_columns": ["Sigma", "BandWidth", "BW_Change", "RSI", "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol"],
+        # NOTE: ここはモデルの feature_names_in_ と一致させる（スペース入り）
+        "feature_columns": ["Sigma", "BandWidth", "BW Change", "RSI", "Vol Change", "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"],
     }
 
     if df is None or df.empty:
@@ -2330,48 +2331,39 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     is_long = side.str.contains("LONG") | side.str.contains("BUY")
     is_short = side.str.contains("SHORT") | side.str.contains("SELL")
 
-    # 反対側は NaN ではなく 0.0（仕様上の定義）
+    # 反対側は 0.0（仕様上の定義）
     rise_score = np.where(is_long, score, 0.0)
     drop_score = np.where(is_short, score, 0.0)
 
     # optional列：列が無い場合でも必ず Series を作る（astypeで落ちないように）
-    if "BandWidth" in df2.columns:
-        bw = pd.to_numeric(df2["BandWidth"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    else:
-        bw = pd.Series(0.0, index=df2.index)
+    # NOTE: learn_log 側の列名が "BW Change" / "Vol Change" 等かもしれないので両対応
+    def _opt_num(col_candidates, default_series):
+        for col in col_candidates:
+            if col in df2.columns:
+                return pd.to_numeric(df2[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        return default_series
 
-    if "BW_Change" in df2.columns:
-        bw_ch = pd.to_numeric(df2["BW_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    else:
-        bw_ch = pd.Series(0.0, index=df2.index)
+    bw = _opt_num(["BandWidth", "Band Width"], pd.Series(0.0, index=df2.index))
+    bw_ch = _opt_num(["BW Change", "BW_Change", "BW Change "], pd.Series(0.0, index=df2.index))
+    vol_ch = _opt_num(["Vol Change", "Vol_Change", "Vol Change "], pd.Series(0.0, index=df2.index))
 
-    if "Vol_Change" in df2.columns:
-        vol_ch = pd.to_numeric(df2["Vol_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    else:
-        vol_ch = pd.Series(0.0, index=df2.index)
+    # BTC Ret：列が無ければ BTC_1h_Change
+    btc_ret_series = _opt_num(["BTC Ret", "BTC_Ret"], btc1h.copy())
 
-    # BTC_Ret：列が無ければ BTC_1h_Change を使う（requiredなので基本は存在）
-    if "BTC_Ret" in df2.columns:
-        btc_ret_series = pd.to_numeric(df2["BTC_Ret"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    else:
-        btc_ret_series = btc1h.copy()
+    # BTC Vol：列が無ければ abs(BTC_1h_Change)/4.0
+    btc_vol_series = _opt_num(["BTC Vol", "BTC_Vol"], (btc1h.abs() / 4.0))
 
-    # BTC_Vol：列が無ければ abs(BTC_1h_Change)/4.0
-    if "BTC_Vol" in df2.columns:
-        btc_vol_series = pd.to_numeric(df2["BTC_Vol"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    else:
-        btc_vol_series = (btc1h.abs() / 4.0)
-
+    # NOTE: ここも列名をモデルの feature_names_in_ と一致させる（スペース入り）
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
         "BandWidth": bw.astype(float),
-        "BW_Change": bw_ch.astype(float),
+        "BW Change": bw_ch.astype(float),
         "RSI": rsi.astype(float),
-        "Vol_Change": vol_ch.astype(float),
-        "Rise_Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
-        "Drop_Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
-        "BTC_Ret": btc_ret_series.astype(float),
-        "BTC_Vol": btc_vol_series.astype(float),
+        "Vol Change": vol_ch.astype(float),
+        "Rise Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
+        "Drop Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
+        "BTC Ret": btc_ret_series.astype(float),
+        "BTC Vol": btc_vol_series.astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan)
 
     # NaN が残る行は学習に使わない（=欠損は埋めない）
@@ -2383,6 +2375,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
 
     info["rows_used"] = int(len(X))
     return X, y, info
+
 def _gcs_upload_from(src_path: str, uri: str) -> Tuple[bool, str]:
     """
     src_path のファイルを gs://bucket/path/to.obj にアップロードする。
