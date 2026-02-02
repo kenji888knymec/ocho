@@ -3701,16 +3701,16 @@ def logic_main(force: bool = False):
         except Exception:
             pass
         # --- DEBUG観測ここまで ---
-
-
+        
         sym = item["symbol"]
         ts_ms = item["time"]
 
         dt_str = normalize_dt_str(item["dt"].strftime("%Y-%m-%d %H:%M:%S"))
         dt_cell = "'" + dt_str
+        
 
-        if sym in last_candidate_records and last_candidate_records[sym] == ts_ms:
-            continue
+        # learn_log 側はシート側 dedup（learn_keys）で重複防止できる。
+        # last_candidate_records は Cloud Run のインスタンス残留で「永遠に0件」を起こし得るので使わない。
         if (now_jst - item["dt"]).total_seconds() > 3000:
             continue
 
@@ -3718,7 +3718,6 @@ def logic_main(force: bool = False):
         if k in learn_keys:
             continue
 
-        last_candidate_records[sym] = ts_ms
 
         tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
 
