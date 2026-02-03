@@ -4,7 +4,6 @@ import threading
 import hashlib
 import subprocess
 import re
-import json
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -42,55 +41,6 @@ except Exception as _e:
 # ==========================================
 app = Flask(__name__)
 app.url_map.strict_slashes = False  # /train と /train/ を両方受ける
-
-# ==========================================
-# Self diagnosis (/diag)
-# - Cloud Run の動作確認用（リビジョン/環境変数/モデル設定の見える化）
-# - Cloud Run 側で「認証必須」にしている前提なら、このエンドポイントも外部には公開されません
-# ==========================================
-def build_diag() -> dict:
-    # 既存 import 群を触らない（最小変更）ため、ここで import
-    import os
-    import sys
-    import platform
-    import time
-    import hashlib
-
-    def _sha(s: str) -> str:
-        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-
-    # 重要：秘密が混ざりうるものは「値そのもの」を返さない（長さ/ハッシュだけ返す）
-    def _safe_env(name: str) -> dict:
-        v = os.environ.get(name, "")
-        return {
-            "present": bool(v),
-            "len": len(v) if v is not None else 0,
-            "sha12": _sha(v) if v else "",
-        }
-
-    return {
-        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        # Cloud Run 標準環境変数（「今動いてる裏側」と一致確認するキー）
-        "k_service": os.environ.get("K_SERVICE", ""),
-        "k_revision": os.environ.get("K_REVISION", ""),
-        "k_configuration": os.environ.get("K_CONFIGURATION", ""),
-        "region": os.environ.get("REGION", ""),
-        # あなたの運用で重要な環境変数（値はそのまま出してOKなものだけ）
-        "model_version": os.environ.get("MODEL_VERSION", ""),
-        "model_gcs_uri": os.environ.get("MODEL_GCS_URI", ""),
-        "restart_ts": os.environ.get("RESTART_TS", ""),
-        "ai_th": os.environ.get("AI_TH", ""),
-        "e_th": os.environ.get("E_TH", ""),
-        "btc_side_filter": os.environ.get("BTC_SIDE_FILTER", ""),
-        # 秘密の可能性があるものはマスク
-        "discord_webhook_url": _safe_env("DISCORD_WEBHOOK_URL"),
-    }
-
-@app.route("/diag", methods=["GET"])
-def diag():
-    return jsonify(build_diag()), 200
 
 # --- ここから追記（診断用：必ず app 定義の直後） ---
 def _route_exists(path: str, method: str = "GET") -> bool:
@@ -151,39 +101,6 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
-# --- Range Mean Reversion (optional) ---
-RANGE_MR_ENABLE = (os.environ.get("RANGE_MR_ENABLE", "0").strip() == "1")
-RANGE_MR_RSI_OB = float(os.environ.get("RANGE_MR_RSI_OB", "70"))  # overbought
-RANGE_MR_RSI_OS = float(os.environ.get("RANGE_MR_RSI_OS", "30"))  # oversold
-RANGE_MR_BAND_TOUCH_EPS = float(os.environ.get("RANGE_MR_BAND_TOUCH_EPS", "0.0015"))  # 0.15%
-RANGE_MR_MAX_BW = float(os.environ.get("RANGE_MR_MAX_BW", "0.02"))  # BandWidth <= 2% の時だけ
-
-
-# --- Market Snapshot Logging (optional) ---
-MARKET_LOG_ENABLE = (os.environ.get("MARKET_LOG_ENABLE", "0").strip() == "1")
-MARKET_LOG_SHEET_NAME = os.environ.get("MARKET_LOG_SHEET_NAME", "market_log").strip() or "market_log"
-MARKET_LOG_MAX_ROWS_PER_RUN = int(float(os.environ.get("MARKET_LOG_MAX_ROWS_PER_RUN", "200") or "200"))
-MARKET_LOG_SAMPLE_EVERY_N = int(float(os.environ.get("MARKET_LOG_SAMPLE_EVERY_N", "1") or "1"))
-if MARKET_LOG_SAMPLE_EVERY_N < 1:
-    MARKET_LOG_SAMPLE_EVERY_N = 1
-if MARKET_LOG_MAX_ROWS_PER_RUN < 1:
-    MARKET_LOG_MAX_ROWS_PER_RUN = 1
-
-# --- Market Labeling (optional) ---
-MARKET_LABEL_ENABLE = (os.environ.get("MARKET_LABEL_ENABLE", "0").strip() == "1")
-MARKET_LABEL_SHEET_NAME = os.environ.get("MARKET_LABEL_SHEET_NAME", "market_label").strip() or "market_label"
-MARKET_LABEL_HORIZONS_MIN = [
-    int(x.strip())
-    for x in os.environ.get("MARKET_LABEL_HORIZONS_MIN", "60,120").split(",")
-    if x.strip().isdigit()
-]
-if not MARKET_LABEL_HORIZONS_MIN:
-    MARKET_LABEL_HORIZONS_MIN = [60, 120]
-MARKET_LABEL_MAX_PER_RUN = int(float(os.environ.get("MARKET_LABEL_MAX_PER_RUN", "200") or "200"))
-if MARKET_LABEL_MAX_PER_RUN < 1:
-    MARKET_LABEL_MAX_PER_RUN = 1
-MARKET_LABEL_RET_TH = float(os.environ.get("MARKET_LABEL_RET_TH", "0.0"))
-
 # Hyperliquid: 通常銘柄の表示レバ（基本10倍）
 # ※DEFAULT_LEV を正として一本化（環境変数 DEFAULT_LEV で変更可能）
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
@@ -218,352 +135,6 @@ MODEL_CACHE_TTL_SEC = int(float(os.environ.get("MODEL_CACHE_TTL_SEC", "3600")))
 ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
 AUTO_JUDGE_AFTER_RUN = os.environ.get("AUTO_JUDGE_AFTER_RUN", "0") == "1"
 FAIL_CLOSED_ON_AI_BYPASS = os.environ.get("FAIL_CLOSED_ON_AI_BYPASS", "1") == "1"
-
-# ==========================================================
-# Market AI Filter (optional)
-#  - GCS上の market_model_h60/h120 を読み込み、候補をフィルタする
-#  - ENABLE_MARKET_AI_FILTER=0 の間は「読み込み/採点しない」（運用を変えない）
-# ==========================================================
-def _env_float(name: str, default: str) -> float:
-    """
-    環境変数のfloat読み取りを安全化。
-    - "0.48" はそのまま
-    - "0,48" のような「小数点カンマ」を "0.48" に補正
-    """
-    s = os.environ.get(name, default)
-    s = (s or "").strip()
-
-    # 小数点カンマの補正（例: "0,48" -> "0.48"）
-    if ("," in s) and ("." not in s) and (s.count(",") == 1):
-        left, right = s.split(",", 1)
-        if left.isdigit() and right.isdigit() and 1 <= len(right) <= 6:
-            s = f"{left}.{right}"
-
-    return float(s)
-
-ENABLE_MARKET_AI_FILTER = (os.environ.get("ENABLE_MARKET_AI_FILTER", "0").strip() == "1")
-MARKET_MODELS_GCS_PREFIX = os.environ.get("MARKET_MODELS_GCS_PREFIX", "").strip()
-
-# どのモデルを使って判定するか
-#  - "h60"      : h60 だけで判定（まずはこれ推奨）
-#  - "h120"     : h120 だけで判定
-#  - "both_min" : min(h60,h120) で判定（両方必要）
-#  - "both_avg" : avg(h60,h120) で判定（両方必要）
-MARKET_AI_MODE = os.environ.get("MARKET_AI_MODE", "h60").strip().lower()
-
-# 単体URIで Market AI モデルを指したい場合（任意）
-# 例: gs://.../market_ai_btc_h60.pkl
-MARKET_AI_MODEL_URI = os.environ.get("MARKET_AI_MODEL_URI", "").strip()
-
-# しきい値（学習出力の threshold_pick を初期値に寄せる）
-MARKET_AI_TH_H60 = _env_float("MARKET_AI_TH_H60", "0.48")
-MARKET_AI_TH_H120 = _env_float("MARKET_AI_TH_H120", "0.99")
-
-# Marketモデルのキャッシュ（GCSアクセス抑制）
-MARKET_MODELS_CACHE_TTL_SEC = int(float(os.environ.get("MARKET_MODELS_CACHE_TTL_SEC", "3600") or "3600"))
-
-# 内部キャッシュ
-_market_models_lock = threading.Lock()
-_market_models_cache = {
-    "loaded_at": 0.0,
-    "cache_key": "",
-    "prefix": "",
-    "models": {},  # {"h60": model, "h120": model}
-    "meta": {},    # {"h60": {...}, "h120": {...}, "all": {...}}
-    "error": "",
-}
-
-
-def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
-    s2 = (gs_uri or "").strip()
-    if not s2.startswith("gs://"):
-        raise ValueError(f"invalid gs uri: {gs_uri}")
-    rest = s2[len("gs://"):]
-    parts = rest.split("/", 1)
-    bucket = parts[0]
-    path = parts[1] if len(parts) > 1 else ""
-    return bucket, path
-
-def _download_gcs_bytes(gs_uri: str) -> bytes:
-    from google.cloud import storage
-    bucket, path = _parse_gs_uri(gs_uri)
-    client = storage.Client()
-    b = client.bucket(bucket)
-    blob = b.blob(path)
-    return blob.download_as_bytes()
-
-def _load_joblib_from_gcs(gs_uri: str):
-    import io
-    raw = _download_gcs_bytes(gs_uri)
-    return joblib.load(io.BytesIO(raw))
-
-def get_market_models() -> Tuple[Dict[str, Any], Dict[str, Any], str]:
-    """
-    Market AI のモデル取得。
-    優先順位:
-      1) MARKET_AI_MODEL_URI が指定されていれば、それを MARKET_AI_MODE のキーにロード
-      2) それ以外は MARKET_MODELS_GCS_PREFIX 配下の固定名（market_model_h60.joblib 等）をロード
-    """
-    global _market_models_cache
-    now = time.time()
-
-    cache_key = f"{MARKET_MODELS_GCS_PREFIX}__{MARKET_AI_MODEL_URI}__{MARKET_AI_MODE}"
-    with _market_models_lock:
-        if (
-            _market_models_cache.get("models")
-            and _market_models_cache.get("cache_key") == cache_key
-            and (now - float(_market_models_cache.get("loaded_at", 0.0))) < float(MARKET_MODELS_CACHE_TTL_SEC)
-        ):
-            return dict(_market_models_cache["models"]), dict(_market_models_cache["meta"]), str(_market_models_cache.get("error", ""))
-
-    err = ""
-    models: Dict[str, Any] = {}
-    meta: Dict[str, Any] = {}
-
-    try:
-        # 1) 単体URI指定があればそれを優先
-        if MARKET_AI_MODEL_URI:
-            key = str(MARKET_AI_MODE or "h60")
-            models[key] = _load_joblib_from_gcs(MARKET_AI_MODEL_URI)
-
-        # 2) prefix もあれば従来どおり h60/h120 を補完ロード
-        if MARKET_MODELS_GCS_PREFIX:
-            prefix = MARKET_MODELS_GCS_PREFIX.rstrip("/")
-
-            if "h60" not in models:
-                models["h60"] = _load_joblib_from_gcs(f"{prefix}/market_model_h60.joblib")
-            if "h120" not in models:
-                models["h120"] = _load_joblib_from_gcs(f"{prefix}/market_model_h120.joblib")
-
-            try:
-                import json as _json
-                meta_h60 = _download_gcs_bytes(f"{prefix}/market_model_h60_meta.json")
-                meta_h120 = _download_gcs_bytes(f"{prefix}/market_model_h120_meta.json")
-                meta_all = _download_gcs_bytes(f"{prefix}/market_models_all_meta.json")
-                meta["h60"] = _json.loads(meta_h60.decode("utf-8"))
-                meta["h120"] = _json.loads(meta_h120.decode("utf-8"))
-                meta["all"] = _json.loads(meta_all.decode("utf-8"))
-            except Exception:
-                meta = {}
-
-        if (not models) and (not MARKET_MODELS_GCS_PREFIX) and (not MARKET_AI_MODEL_URI):
-            err = "MARKET_MODELS_GCS_PREFIX and MARKET_AI_MODEL_URI are both empty"
-
-    except Exception as e:
-        err = f"market models load failed: {type(e).__name__}: {e}"
-        models = {}
-        meta = {}
-
-    with _market_models_lock:
-        _market_models_cache["loaded_at"] = now
-        _market_models_cache["cache_key"] = cache_key
-        _market_models_cache["prefix"] = MARKET_MODELS_GCS_PREFIX
-        _market_models_cache["models"] = models
-        _market_models_cache["meta"] = meta
-        _market_models_cache["error"] = err
-
-    return dict(models), dict(meta), err
-
-
-def safe_market_predict_proba(model: Any, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
-    dbg: Dict[str, Any] = {}
-    try:
-        # 0) model が None の場合はバイパス
-        if model is None:
-            return None, True, {"error": "model_none"}
-
-        # wrapper(dict) の features を「期待列」として先に確保（feature_names_in_ が無いモデル対策）
-        expected_cols = None
-        if isinstance(model, dict):
-            feats_list = model.get("features", None)
-            if isinstance(feats_list, (list, tuple)) and len(feats_list) > 0:
-                expected_cols = [str(x) for x in list(feats_list)]
-                dbg["expected_from_wrapper"] = len(expected_cols)
-
-            # 重要：wrapper の中身(estimator)を取り出す（dict のままだと predict_proba が無い）
-            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
-                if k in model:
-                    model = model[k]
-                    dbg["unwrap"] = f"dict:{k}"
-                    break
-
-        # list/tuple wrapper 対応
-        if isinstance(model, (tuple, list)) and len(model) >= 1:
-            model = model[0]
-            dbg["unwrap"] = "list0"
-
-        # unwrap した結果でも predict_proba が無いならバイパス
-        if not hasattr(model, "predict_proba"):
-            dbg["error"] = f"model_type={type(model)} has no predict_proba"
-            return None, True, dbg
-
-        # 1) feats を DataFrame に整形
-        if feats is None:
-            df = pd.DataFrame([{}])
-        elif isinstance(feats, pd.DataFrame):
-            df = feats.copy()
-        else:
-            df = pd.DataFrame(feats)
-
-        df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-        # bool → int（BTC_Calm など）
-        for c in df.columns:
-            if df[c].dtype == bool:
-                df[c] = df[c].astype(int)
-
-        # 2) 期待列の決定（model.feature_names_in_ があれば優先、無ければ wrapper features）
-        expected = getattr(model, "feature_names_in_", None)
-        if expected is not None:
-            expected_cols = [str(x) for x in list(expected)]
-            dbg["expected_from_model"] = len(expected_cols)
-
-        # 3) 列を期待列に合わせる（不足列は 0 で追加、余分列は捨てる）
-        if expected_cols is not None:
-            exp = [str(x) for x in expected_cols]
-            for c in exp:
-                if c not in df.columns:
-                    df[c] = 0.0
-
-            extra = [c for c in df.columns if c not in exp]
-            if extra:
-                dbg["dropped_cols"] = extra
-
-            df = df[exp]
-            dbg["aligned_cols"] = list(df.columns)
-
-        # 4) predict_proba
-        proba = model.predict_proba(df)
-        return proba, False, dbg
-
-    except Exception as e:
-        dbg["error"] = f"{type(e).__name__}: {e}"
-        return None, True, dbg
-
-
-
-def _market_feats_from_row(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> pd.DataFrame:
-    close_now = float(row.get("Close", 0.0))
-    sigma_now = float(row.get("Dynamic_Sigma", row.get("Sigma", 0.0)))
-    bw = float(row.get("BandWidth", 0.0))
-    bw_chg = float(row.get("BW_Change", 0.0))
-    rsi = float(row.get("RSI", 50.0))
-    vol_chg = float(row.get("Vol_Change", 0.0))
-    rise = float(row.get("Rise_Score", 0.0))
-    drop = float(row.get("Drop_Score", 0.0))
-    upper2 = float(row.get("Upper2", 0.0))
-    lower2 = float(row.get("Lower2", 0.0))
-
-    m = str(btc_mode or "").strip()
-    return pd.DataFrame([{
-        "Close": close_now,
-        "Sigma": sigma_now,
-        "BandWidth": bw,
-        "BW_Change": bw_chg,
-        "RSI": rsi,
-        "Vol_Change": vol_chg,
-        "Rise_Score": rise,
-        "Drop_Score": drop,
-        "BTC_Ret": float(btc_ret),
-        "BTC_Vol": float(btc_vol),
-        "BTC_Mode": m,
-        "BTC_Calm": int(bool(btc_calm)),
-        "Upper2": upper2,
-        "Lower2": lower2,
-        "BTC_Mode_Up": int(m == "Up"),
-        "BTC_Mode_Down": int(m == "Down"),
-        "BTC_Mode_Side": int(m == "Side"),
-        "BTC_Mode_Other": int(m not in ["Up", "Down", "Side"]),
-    }])
-
-def eval_market_ai(row: pd.Series, btc_mode: str, btc_calm: bool, btc_ret: float, btc_vol: float) -> Tuple[Optional[float], bool, Dict[str, Any]]:
-    dbg: Dict[str, Any] = {
-        "enabled": bool(ENABLE_MARKET_AI_FILTER),
-        "mode": str(MARKET_AI_MODE),
-        "prefix": str(MARKET_MODELS_GCS_PREFIX),
-    }
-
-    models, meta, err = get_market_models()
-    dbg["load_error"] = err
-    if not models:
-        dbg["bypassed"] = True
-        return None, True, dbg
-
-    feats = _market_feats_from_row(row, btc_mode, btc_calm, btc_ret, btc_vol)
-
-    p60 = None
-    p120 = None
-
-    proba60, by60, dbg60 = safe_market_predict_proba(models.get("h60"), feats)
-    proba120, by120, dbg120 = safe_market_predict_proba(models.get("h120"), feats)
-    dbg["dbg_h60"] = dbg60
-    dbg["dbg_h120"] = dbg120
-
-    if not by60 and proba60 is not None:
-        try:
-            idx60 = _pick_positive_class_index(models.get("h60"), proba60, prefer_label=1)
-            p60 = float(proba60[0][idx60])
-            if isinstance(dbg60, dict):
-                dbg60["proba_idx"] = int(idx60)
-                try:
-                    m60 = _unwrap_estimator_for_classes(models.get("h60"))
-                    dbg60["classes"] = list(getattr(m60, "classes_", []))
-                except Exception:
-                    pass
-        except Exception:
-            p60 = None
-    
-    if not by120 and proba120 is not None:
-        try:
-            idx120 = _pick_positive_class_index(models.get("h120"), proba120, prefer_label=1)
-            p120 = float(proba120[0][idx120])
-            if isinstance(dbg120, dict):
-                dbg120["proba_idx"] = int(idx120)
-                try:
-                    m120 = _unwrap_estimator_for_classes(models.get("h120"))
-                    dbg120["classes"] = list(getattr(m120, "classes_", []))
-                except Exception:
-                    pass
-        except Exception:
-            p120 = None
-
-
-    dbg["p60"] = p60
-    dbg["p120"] = p120
-
-    mode = str(MARKET_AI_MODE or "h60").lower()
-
-    score_agg: Optional[float] = None
-    passed = True
-
-    if mode == "h120":
-        score_agg = p120
-        passed = (p120 is None) or (float(p120) >= float(MARKET_AI_TH_H120))
-    elif mode == "both_min":
-        if (p60 is None) or (p120 is None):
-            score_agg = None
-            passed = True
-        else:
-            score_agg = float(min(float(p60), float(p120)))
-            passed = (float(p60) >= float(MARKET_AI_TH_H60)) and (float(p120) >= float(MARKET_AI_TH_H120))
-    elif mode == "both_avg":
-        if (p60 is None) or (p120 is None):
-            score_agg = None
-            passed = True
-        else:
-            score_agg = float((float(p60) + float(p120)) / 2.0)
-            passed = (float(p60) >= float(MARKET_AI_TH_H60)) and (float(p120) >= float(MARKET_AI_TH_H120))
-    else:
-        score_agg = p60
-        passed = (p60 is None) or (float(p60) >= float(MARKET_AI_TH_H60))
-
-    dbg["score_agg"] = score_agg
-    dbg["passed"] = bool(passed)
-    dbg["th_h60"] = float(MARKET_AI_TH_H60)
-    dbg["th_h120"] = float(MARKET_AI_TH_H120)
-
-    return score_agg, bool(passed), dbg
-
 
 # 60本取れないケースを安定運用で捌くための最低本数（rolling20 + 参照(-6) を考慮）
 MIN_BARS = int(float(os.environ.get("MIN_BARS", "30")))
@@ -641,49 +212,6 @@ EXPECTED_HEADERS_LEARN = [
     "MarketTag", "BTC_Mode", "BTC_1h_Change", "RSI", "Note",
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "Win/Lose", "HoldMin",
 ]
-
-# learn_log の末尾に追加したい “学習用特徴量列”（既存列は一切ズラさない）
-EXTRA_HEADERS_LEARN = ["BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
-    "market_ai_score",
-    "market_ai_pass",
-    "market_ai_debug",
-]
-
-
-MARKET_LOG_HEADERS: List[str] = [
-    "Datetime(SymbolTime_JST)",
-    "Symbol",
-    "Close",
-    "Sigma",
-    "BandWidth",
-    "BW_Change",
-    "RSI",
-    "Vol_Change",
-    "Rise_Score",
-    "Drop_Score",
-    "BTC_Ret",
-    "BTC_Vol",
-    "BTC_Mode",
-    "BTC_Calm",
-    "Upper2",
-    "Lower2",
-    "Version",
-    "SignalType",
-    "Note",
-]
-
-MARKET_LABEL_HEADERS: List[str] = [
-    "Datetime(SymbolTime_JST)",
-    "Symbol",
-    "HorizonMin",
-    "Close",
-    "FutureClose",
-    "Ret",
-    "LabelUp",
-    "Version",
-    "Note",
-]
-
 
 TABLE_FIELDS = [
     "Time", "Symbol", "Direction", "EntryPrice", "Score", "Sigma", "Group",
@@ -819,28 +347,15 @@ def send_discord_message(text: str):
         print("[DBG] discord webhook url empty or placeholder")
         return
 
-    # 集計用：通知文のどこにLONG/SHORTがあっても拾えるようにする
-    side = "-"
-    if "LONG" in text:
-        side = "LONG"
-    elif "SHORT" in text:
-        side = "SHORT"
-
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
-    for idx, chunk in enumerate(chunks, start=1):
+    for chunk in chunks:
         try:
-            # 送信内容の「先頭1行」だけログに出す（ログ肥大を防ぐ）
-            head = chunk.replace("\r", "").split("\n", 1)[0][:200]
-            print(f"[SEND] discord side={side} chunk={idx}/{len(chunks)} head={head}")
-
             r = http.post(discord_webhook_url, json={"content": chunk}, timeout=10)
             print(f"[DBG] discord status={r.status_code}")
             if r.status_code >= 300:
                 print(f"[DBG] discord body={r.text[:200]}")
         except Exception as e:
             print(f"[ERR] discord webhook post: {e}")
-
-
 
 def get_sheet_service():
     now = time.time()
@@ -854,32 +369,6 @@ def get_sheet_service():
     _sheet_service_cache["ts"] = now
     return svc
 
-def sheets_execute_with_retry(req, max_retries: int = 6, base_sleep: float = 2.0, max_sleep: float = 30.0):
-    """
-    Google Sheets API の execute を 429/5xx のときだけリトライする。
-    ログは増やさない（成功すれば何も出さない）。
-    """
-    import random
-    for attempt in range(max_retries + 1):
-        try:
-            return req.execute()
-        except HttpError as e:
-            status = None
-            # googleapiclient の HttpError は resp.status に入っていることが多い
-            if hasattr(e, "resp") and hasattr(e.resp, "status"):
-                status = e.resp.status
-
-            # 429: rate limit / 5xx: transient
-            if status in (429, 500, 502, 503, 504) and attempt < max_retries:
-                sleep_sec = min(max_sleep, base_sleep * (2 ** attempt))
-                # ジッター（同時リトライ衝突を避ける）
-                time.sleep(sleep_sec + random.uniform(0.0, 0.7))
-                continue
-
-            # リトライ対象外 or リトライしきったら上に投げる（/judge が catch して Discord 通知する）
-            raise
-
-
 def _normalize_headers(headers: List[Any]) -> List[str]:
     hs = [("" if h is None else str(h)).strip() for h in headers]
     while hs and hs[-1] == "":
@@ -887,21 +376,12 @@ def _normalize_headers(headers: List[Any]) -> List[str]:
     return hs
 
 def _build_headers_map(headers: List[str]) -> Dict[str, int]:
-    """
-    ヘッダー名 -> 列index の辞書を作る。
-    同名ヘッダーが複数ある場合は「左側（最初の列）」を優先する。
-    ※重複列が残っているシートで、書き込み先が右側にズレる事故を防ぐ。
-    """
     m: Dict[str, int] = {}
     for i, h in enumerate(headers):
         key = ("" if h is None else str(h)).strip()
-        if key == "":
-            continue
-        if key in m:
-            continue  # 既に登録済みなら上書きしない（左側優先）
-        m[key] = i
+        if key != "":
+            m[key] = i
     return m
-
 
 def _resolve_col_idx(headers_map: Dict[str, int], field: str) -> int:
     for cand in FIELD_ALIASES.get(field, [field]):
@@ -982,11 +462,6 @@ def get_sheet_colcount(sheet_name: str) -> Optional[int]:
     return fs if fs > 0 else None
 
 def read_header_row(sheet_name: str) -> List[str]:
-    """
-    ヘッダー1行目を読む。
-    そのため、直近キャッシュがあればキャッシュを返して「空扱い」を避ける。
-    """
-    now = time.time()
     try:
         service = get_sheet_service()
         rng = f"{sheet_name}!A1:{HEADER_COL_END}1"
@@ -994,12 +469,6 @@ def read_header_row(sheet_name: str) -> List[str]:
         raw = (res.get("values", [[]]) or [[]])[0]
         return _normalize_headers(raw)
     except Exception as e:
-        cached = _sheet_header_cache.get(sheet_name, {})
-        ts = float(cached.get("ts", 0.0))
-        cached_headers = cached.get("headers", [])
-        if cached_headers and (now - ts) <= HEADER_TTL_SEC:
-            print(f"[WARN] read_header_row failed (use cache): sheet={sheet_name} err={e}")
-            return cached_headers
         print(f"[WARN] read_header_row failed: sheet={sheet_name} err={e}")
         return []
 
@@ -1044,41 +513,21 @@ def ensure_learn_headers() -> bool:
     ensure_sheet_exists(LEARN_SHEET_NAME, min_rows=5000, min_cols=max(32, HEADER_LEN_LEARN, 40))
     current = read_header_row(LEARN_SHEET_NAME)
 
-    # 1) 先頭（EXPECTED_HEADERS_LEARN）は厳密に守る
-    # 2) それ以降（trailing）は既存を保持（ai_debug 等があっても壊さない）
-    # 3) さらに末尾に、追加列（EXTRA_HEADERS_LEARN）が無ければ “追記のみ” する
+    if current[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN:
+        return True
+
+    if not AUTO_FIX_HEADERS:
+        return not STRICT_HEADER_CHECK
+
     trailing = []
-    if current and len(current) > len(EXPECTED_HEADERS_LEARN):
+    if len(current) > len(EXPECTED_HEADERS_LEARN):
         trailing = current[len(EXPECTED_HEADERS_LEARN):]
 
-    base_headers = EXPECTED_HEADERS_LEARN + trailing
-    missing_extra = [h for h in EXTRA_HEADERS_LEARN if h not in base_headers]
-    new_headers = base_headers + missing_extra
-
-    prefix_ok = bool(current) and (current[:len(EXPECTED_HEADERS_LEARN)] == EXPECTED_HEADERS_LEARN)
-
-    # 直す必要なし
-    if prefix_ok and not missing_extra:
-        return True
-
-    # AUTO_FIX_HEADERS=0 の場合：旧挙動に合わせて、prefix mismatch は STRICT_HEADER_CHECK で判断
-    if not AUTO_FIX_HEADERS:
-        if not prefix_ok:
-            return (not STRICT_HEADER_CHECK)
-        # prefix はOKだが追加列が無いだけ：運用は継続できる
-        print(f"[WARN] learn_log missing extra headers (AUTO_FIX_HEADERS=0): {missing_extra}")
-        return True
-
-    # AUTO_FIX_HEADERS=1 の場合：安全に修復（既存 trailing を保持しつつ、末尾に不足分だけ追記）
-    if not current:
-        print("[FIX] learn_log header is empty. Writing base + extras.")
-    elif not prefix_ok:
-        print("[FIX] learn_log header mismatch. Rewriting with expected prefix (preserve trailing if any).")
-    else:
-        print("[FIX] learn_log missing extra headers. Appending at end:", missing_extra)
-
-    write_header_row(LEARN_SHEET_NAME, new_headers)
-    return True
+    new_headers = list(EXPECTED_HEADERS_LEARN) + trailing
+    ok = write_header_row(LEARN_SHEET_NAME, new_headers)
+    if ok:
+        print("[CFG] learn_log headers fixed (preserve trailing headers).")
+    return ok
 
 def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
     max_i = len(headers) if limit is None else int(limit)
@@ -1093,19 +542,11 @@ def _find_first_blank_index(headers: List[str], limit: Optional[int]) -> int:
 def ensure_table_headers() -> bool:
     ensure_sheet_exists(MAIN_SHEET_NAME, min_rows=20000, min_cols=max(HEADER_LEN_TABLE, 40))
 
-    headers, colcount, _ok = get_headers_and_len(MAIN_SHEET_NAME)
-
-    # ★超重要★
-    if not headers:
-        msg = "[WARN] table header unavailable (empty). Skip AUTO_FIX/check to avoid corruption. sheet=table"
-        print(msg)
-        return (not STRICT_HEADER_CHECK)
-
+    headers = read_header_row(MAIN_SHEET_NAME)
+    colcount = get_sheet_colcount(MAIN_SHEET_NAME)
     hm = _build_headers_map(headers)
-    updated = False
 
     if AUTO_FIX_HEADERS:
-        # 1) alias がある列を canonical にリネーム（同じ列位置）
         for canonical in TABLE_REQUIRED_FIELDS:
             if canonical in hm:
                 continue
@@ -1113,18 +554,16 @@ def ensure_table_headers() -> bool:
                 if alias in hm:
                     idx = int(hm[alias])
                     if str(alias).strip() != canonical:
-                        if update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical):
-                            updated = True
-                            headers[idx] = canonical
-                            hm = _build_headers_map(headers)
+                        update_single_cell(MAIN_SHEET_NAME, idx, 1, canonical)
                     break
 
-        # 2) まだ無い必須列は blank に入れる（headers が取れている時だけ）
-        limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
+        headers = read_header_row(MAIN_SHEET_NAME)
+        hm = _build_headers_map(headers)
         for canonical in TABLE_REQUIRED_FIELDS:
             if canonical in hm:
                 continue
 
+            limit = int(colcount) if isinstance(colcount, int) and colcount > 0 else len(headers)
             blank_idx = _find_first_blank_index(headers, limit)
             if blank_idx == -1:
                 msg = f"[WARN] table missing required col '{canonical}' and no blank header cell. Please add a blank column."
@@ -1132,16 +571,12 @@ def ensure_table_headers() -> bool:
                 send_discord_message(msg)
                 return False
 
-            if update_single_cell(MAIN_SHEET_NAME, blank_idx, 1, canonical):
-                updated = True
-                if blank_idx >= len(headers):
-                    headers = headers + [""] * (blank_idx + 1 - len(headers))
-                headers[blank_idx] = canonical
-                hm = _build_headers_map(headers)
+            update_single_cell(MAIN_SHEET_NAME, blank_idx, 1, canonical)
+            headers = read_header_row(MAIN_SHEET_NAME)
+            hm = _build_headers_map(headers)
 
-        if updated:
-            _invalidate_sheet_caches(MAIN_SHEET_NAME)
-
+    headers = read_header_row(MAIN_SHEET_NAME)
+    hm = _build_headers_map(headers)
     missing = [f for f in TABLE_REQUIRED_FIELDS if _resolve_col_idx(hm, f) == -1]
     if missing:
         msg = f"[WARN] table headers still missing: {missing}"
@@ -1150,55 +585,6 @@ def ensure_table_headers() -> bool:
         return (not STRICT_HEADER_CHECK)
 
     return True
-
-
-def ensure_market_log_headers() -> bool:
-    """
-    market_log シートを用意し、1行目ヘッダーを MARKET_LOG_HEADERS に揃える
-    """
-    try:
-        ok_sheet = ensure_sheet_exists(
-            MARKET_LOG_SHEET_NAME,
-            min_rows=200,
-            min_cols=len(MARKET_LOG_HEADERS),
-        )
-        if not ok_sheet:
-            return False
-
-        hdr = read_header_row(MARKET_LOG_SHEET_NAME)
-        if hdr == MARKET_LOG_HEADERS:
-            return True
-
-        write_header_row(MARKET_LOG_SHEET_NAME, MARKET_LOG_HEADERS)
-        return True
-    except Exception as e:
-        print("[WARN] ensure_market_log_headers failed:", e)
-        return False
-
-
-def ensure_market_label_headers() -> bool:
-    """
-    market_label シートを用意し、1行目ヘッダーを MARKET_LABEL_HEADERS に揃える
-    """
-    try:
-        ok_sheet = ensure_sheet_exists(
-            MARKET_LABEL_SHEET_NAME,
-            min_rows=200,
-            min_cols=len(MARKET_LABEL_HEADERS),
-        )
-        if not ok_sheet:
-            return False
-
-        hdr = read_header_row(MARKET_LABEL_SHEET_NAME)
-        if hdr == MARKET_LABEL_HEADERS:
-            return True
-
-        write_header_row(MARKET_LABEL_SHEET_NAME, MARKET_LABEL_HEADERS)
-        return True
-    except Exception as e:
-        print("[WARN] ensure_market_label_headers failed:", e)
-        return False
-
 
 def get_headers_and_len(sheet_name: str) -> Tuple[List[str], Optional[int], bool]:
     now = time.time()
@@ -1243,94 +629,6 @@ def _compute_out_len(sheet_name: str, headers: List[str], colcount: Optional[int
         return None
     return need_len
 
-def _to_sheet_cell(v: Any) -> Any:
-    """
-    Google Sheets API の body に入れて安全な型へ寄せる。
-    - numpy scalar は Python の int/float に変換
-    - dict/list/tuple/set/ndarray は JSON 文字列へ
-    - Timestamp/datetime は ISO 文字列へ
-    """
-    import json
-
-    try:
-        import numpy as np
-    except Exception:
-        np = None  # type: ignore
-
-    try:
-        import pandas as pd
-    except Exception:
-        pd = None  # type: ignore
-
-    def _jsonable(x: Any) -> Any:
-        if x is None:
-            return None
-
-        if np is not None:
-            try:
-                if isinstance(x, np.integer):
-                    return int(x)
-                if isinstance(x, np.floating):
-                    return float(x)
-                if isinstance(x, np.ndarray):
-                    return [_jsonable(y) for y in x.tolist()]
-            except Exception:
-                pass
-
-        if pd is not None:
-            try:
-                if isinstance(x, pd.Timestamp):
-                    return x.isoformat()
-            except Exception:
-                pass
-
-        try:
-            from datetime import datetime
-            if isinstance(x, datetime):
-                return x.isoformat()
-        except Exception:
-            pass
-
-        if isinstance(x, dict):
-            return {str(k): _jsonable(val) for k, val in x.items()}
-        if isinstance(x, (list, tuple, set)):
-            return [_jsonable(y) for y in x]
-
-        if isinstance(x, (str, int, float, bool)):
-            return x
-
-        return str(x)
-
-    if v is None:
-        return ""
-
-    if np is not None:
-        try:
-            if isinstance(v, np.integer):
-                return int(v)
-            if isinstance(v, np.floating):
-                return float(v)
-            if isinstance(v, np.ndarray):
-                return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
-        except Exception:
-            pass
-
-    if pd is not None:
-        try:
-            if isinstance(v, pd.Timestamp):
-                return v.isoformat()
-        except Exception:
-            pass
-
-    if isinstance(v, (dict, list, tuple, set)):
-        return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
-
-    if isinstance(v, (str, int, float, bool)):
-        return v
-
-    return str(v)
-
-
 def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_values: List[Any]) -> List[Any]:
     hm = _build_headers_map(headers)
     out = [""] * out_len
@@ -1339,9 +637,8 @@ def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_v
         if col == -1:
             continue
         if 0 <= col < out_len:
-            out[col] = _to_sheet_cell(v)
+            out[col] = v
     return out
-
 
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
     headers, colcount, ok = get_headers_and_len(sheet_name)
@@ -1461,54 +758,32 @@ def build_exchange() -> ccxt.Exchange:
     })
 
     # === 反映確認用の目印（これがログに出ない＝このコードがCloud Runで動いていない） ===
-    print("[DBG] build_exchange:v3_urls_harden_compat")
+    print("[DBG] build_exchange:v2_urls_harden_traceback")
 
-    def _harden_okx_urls(exch: ccxt.Exchange) -> None:
-        """
-        ccxt の OKX 実装差（urls/api が str / dict / None）に備えて、
-        None/空 を確実に潰す。
-        """
+    # ---- urls の None/空を潰す（apiがdict前提の実装にも寄せる）----
+    try:
         base = "https://www.okx.com"
 
-        # urls が dict でない場合は「空dict」にせず、fresh から回復を試みる
-        urls = getattr(exch, "urls", None)
+        urls = getattr(exchange, "urls", None)
         if not isinstance(urls, dict):
-            fresh = ccxt.okx({
-                "enableRateLimit": True,
-                "timeout": 10000,
-                "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
-            })
-            fresh_urls = getattr(fresh, "urls", None)
-            if isinstance(fresh_urls, dict):
-                urls = dict(fresh_urls)
-                exch.urls = urls
-            else:
-                urls = {}
-                exch.urls = urls
+            exchange.urls = {}
+            urls = exchange.urls
 
         api = urls.get("api")
+        print(f"[DBG] okx.urls(before)={repr(urls)}")
 
-        # 1) api が None/空文字 → base
-        if api is None or (isinstance(api, str) and not api.strip()):
-            urls["api"] = base
+        # api を dict に寄せる（okx実装の多くはdict前提）
+        if not isinstance(api, dict):
+            api = {}
+        urls["api"] = api
 
-        # 2) api が str → trim
-        elif isinstance(api, str):
-            urls["api"] = api.strip()
+        # NoneType + str の主因になりやすいキーを確実に埋める
+        for k in ("rest", "public", "private", "ws"):
+            v = api.get(k)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                api[k] = base
 
-        # 3) api が dict → rest/public/private/ws を埋める
-        elif isinstance(api, dict):
-            for k in ("rest", "public", "private", "ws"):
-                v = api.get(k)
-                if v is None or (isinstance(v, str) and not v.strip()):
-                    api[k] = base
-            urls["api"] = api
-
-        # 4) それ以外 → base
-        else:
-            urls["api"] = base
-
-        # urls 直下も参照され得るキーを保険で埋める
+        # 念のため：urls直下の参照され得るキーも埋める（実装差異対策）
         for k in ("www", "doc"):
             v = urls.get(k)
             if v is None or (isinstance(v, str) and not v.strip()):
@@ -1516,21 +791,12 @@ def build_exchange() -> ccxt.Exchange:
 
         print(f"[DBG] okx.urls(after)={repr(urls)}")
 
-    # まず urls を硬化
-    try:
-        _harden_okx_urls(exchange)
     except Exception as e:
         import traceback
         print(f"[WARN] okx urls harden failed: {e}")
         print(traceback.format_exc())
 
-    # ccxt バージョンと defaultType をログに残す
-    try:
-        print(f"[DBG] ccxt_version={getattr(ccxt, '__version__', 'unknown')} OKX_DEFAULT_TYPE={OKX_DEFAULT_TYPE}")
-    except Exception:
-        pass
-
-    # 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）
+    # ---- 重要：初期化に失敗した exchange をキャッシュしない（TTL中ずっと死ぬのを防ぐ）----
     load_ok = True
     try:
         exchange.load_markets()
@@ -1544,39 +810,14 @@ def build_exchange() -> ccxt.Exchange:
         print(f"[WARN] okx.urls(dump)={repr(getattr(exchange, 'urls', None))}")
         print(f"[WARN] okx.options(dump)={repr(getattr(exchange, 'options', None))}")
 
-        # NoneType + str 系（今回の症状）だけは fresh 作り直し→hardening→再試行を1回だけやる
-        msg = str(e)
-        if ("unsupported operand type" in msg) or ("NoneType" in msg and "+" in msg):
-            try:
-                fresh = ccxt.okx({
-                    "enableRateLimit": True,
-                    "timeout": 10000,
-                    "options": {"defaultType": (OKX_DEFAULT_TYPE or "swap")},
-                })
-                exchange = fresh
-                _harden_okx_urls(exchange)
-
-                exchange.load_markets()
-                mk = getattr(exchange, "markets", None) or {}
-                load_ok = True
-                print(f"[OKX] load_markets retry ok: markets={len(mk)}")
-            except Exception as e2:
-                load_ok = False
-                import traceback
-                print(f"[WARN] okx.load_markets retry failed: {e2}")
-                print(traceback.format_exc())
-
     if load_ok:
         _exchange_cache["ex"] = exchange
         _exchange_cache["ts"] = now
     else:
-        _exchange_cache.pop("ex", None)
-        _exchange_cache.pop("ts", None)
         print("[WARN] build_exchange: not caching exchange due to init failure")
 
     _symbol_resolve_cache.clear()
     return exchange
-
 
 
 
@@ -1743,15 +984,9 @@ def _mutex_write(value: str):
         body={"values": [[value]]},
     ).execute()
 
-def acquire_run_mutex(ttl_sec: Optional[int] = None) -> Tuple[bool, str]:
+def acquire_run_mutex() -> Tuple[bool, str]:
     if not RUN_MUTEX_ENABLED:
         return True, ""
-
-    # ttl_sec が渡されたらそれを優先。未指定なら従来どおり RUN_MUTEX_TTL_SEC
-    try:
-        effective_ttl = int(ttl_sec) if ttl_sec is not None else int(RUN_MUTEX_TTL_SEC)
-    except Exception:
-        effective_ttl = int(RUN_MUTEX_TTL_SEC)
 
     token = f"{int(time.time())}|{_INSTANCE_ID}"
     try:
@@ -1763,7 +998,7 @@ def acquire_run_mutex(ttl_sec: Optional[int] = None) -> Tuple[bool, str]:
             except Exception:
                 ts = 0
 
-            if ts > 0 and (time.time() - ts) <= effective_ttl:
+            if ts > 0 and (time.time() - ts) <= RUN_MUTEX_TTL_SEC:
                 return False, ""
 
         _mutex_write(token)
@@ -1775,7 +1010,6 @@ def acquire_run_mutex(ttl_sec: Optional[int] = None) -> Tuple[bool, str]:
     except Exception as e:
         print(f"[WARN] acquire_run_mutex failed (fallback allow): {e}")
         return True, ""
-
 
 def release_run_mutex(token: str):
     if not RUN_MUTEX_ENABLED:
@@ -1854,19 +1088,13 @@ def _infer_expected_n_features(model) -> int:
         return -1
 
 def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
-    """
-    expected_cols の順に揃えるが、欠損は0埋めしない。
-    - 元に列が無い場合は NaN を入れる（= 欠損として扱い、上流でFAIL_CLOSEDにする）
-    - 数値列は to_numeric(errors="coerce") で NaN になり得る（これも欠損扱い）
-    """
     aligned = pd.DataFrame(index=feats.index)
     for col in expected_cols:
         if col in feats.columns:
-            aligned[col] = pd.to_numeric(feats[col], errors="coerce")
+            aligned[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0.0)
         else:
-            aligned[col] = np.nan
+            aligned[col] = 0.0
     return aligned
-
 
 def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
     debug: Dict[str, Any] = {
@@ -1875,20 +1103,16 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         "input_n_features": -1,
         "action": "none",
         "error": "",
-        # ★追加：NaN原因特定用（常にキーを持たせる）
-        "nan_cols": None,
-        "nan_n_cols": None,
-        "alias_renamed": None,
     }
 
     try:
-        # 0) model が None の場合は即バイパス（FAIL_CLOSED: ニュートラル）
+        # 0) model が None の場合は即バイパス
         if model is None:
             debug["action"] = "model_none_bypass"
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-
-        # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
+        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
+        #    （ここがないと 'dict' object has no attribute predict_proba になります）
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
@@ -1907,89 +1131,22 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             print(f"[AI] safe_predict_proba fallback: {debug['error']}")
             return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 2) feats の整形（0埋めしない）
+        # 2) feats の整形
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
-        # inf は NaN にする（fillna(0.0) はしない）
-        feats = feats.replace([np.inf, -np.inf], np.nan)
+        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         debug["input_n_features"] = int(feats.shape[1])
 
-        # 14列モデルに対して列順だけ固定したい場合（0埋めはしない）
-        FEATURE_COLUMNS_14 = [
-            "EntryPrice",
-            "ScoreSigma",
-            "VolSigma",
-            "TP",
-            "SL",
-            "TP_Pct",
-            "SL_Pct",
-            "Leverage",
-            "Reserved1",
-            "Reserved2",
-            "Reserved3",
-            "Reserved4",
-            "BTC_1h_Change",
-            "RSI",
-        ]
-        try:
-            if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
-                expected_n = int(getattr(model, "n_features_in_", 0) or 0)
-                if expected_n == 14:
-                    # 列順は固定するが、足りない列は NaN のまま（=欠損扱い）
-                    feats = feats.reindex(columns=FEATURE_COLUMNS_14)
-                    debug["input_n_features"] = int(feats.shape[1])
-        except Exception:
-            pass
-
-        # 3) 特徴量の整合（feature_names_in_ に追従）
+        # 3) 特徴量の整合
         expected_cols = _extract_feature_names(model)
         if expected_cols:
-            expected_cols = [str(c) for c in list(expected_cols)]
             debug["expected_cols"] = list(expected_cols)
-            debug["expected_n_features"] = int(len(expected_cols))
-
-            # 列名揺れ吸収（スペース/アンダースコアの違い等）→ その後に expected_cols に整列
-            try:
-                rename_map = {}
-                if isinstance(feats, pd.DataFrame):
-                    feats_cols = set(str(c) for c in feats.columns)
-            
-                    for c in expected_cols:
-                        if c in feats_cols:
-                            continue
-            
-                        # 基本： "Rise Score" ↔ "Rise_Score" など
-                        candidates = [
-                            c.replace("_", " "),
-                            c.replace(" ", "_"),
-                        ]
-            
-                        # 追加：BandWidth 系のよくある揺れ
-                        if c == "BandWidth":
-                            candidates += ["Bandwidth", "Band_Width", "Band Width"]
-                        elif c == "Bandwidth":
-                            candidates += ["BandWidth", "Band_Width", "Band Width"]
-            
-                        for cand in candidates:
-                            if cand in feats_cols:
-                                rename_map[cand] = c
-                                feats_cols.remove(cand)
-                                feats_cols.add(c)
-                                break
-            
-                    if rename_map:
-                        feats = feats.rename(columns=rename_map)
-                        debug["alias_renamed"] = dict(rename_map)
-            
-            except Exception:
-                pass
-            
             feats = _align_by_feature_names(feats, expected_cols)
-
             debug["action"] = "aligned_by_feature_names"
+            debug["expected_n_features"] = int(len(expected_cols))
         else:
             expected_n = _infer_expected_n_features(model)
             debug["expected_n_features"] = int(expected_n)
@@ -1998,16 +1155,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 4) predict_proba の直前で NaN を検知したら FAIL_CLOSED（その判定だけ bypass）
-        if isinstance(feats, pd.DataFrame) and feats.isna().any().any():
-            nan_cols = [c for c in feats.columns if feats[c].isna().any()]
-            debug["action"] = "nan_input_fail_closed_bypass"
-            debug["error"] = "input contains NaN (missing features); bypassed"
-            debug["nan_cols"] = nan_cols
-            debug["nan_n_cols"] = int(len(nan_cols))
-            return np.array([[0.5, 0.5]], dtype=float), True, debug
-
-        # 5) predict_proba 実行
+        # 4) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -2022,73 +1170,6 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba fallback: {debug['error']}")
         return np.array([[0.5, 0.5]], dtype=float), True, debug
-
-
-
-
-
-def _unwrap_estimator_for_classes(model: Any) -> Any:
-    """
-    safe_predict_proba と同様に、model が dict/list/tuple のラッパーなら中身(estimator)を取り出す。
-    classes_ を参照できる形に寄せるための補助。
-    """
-    try:
-        if isinstance(model, dict):
-            for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
-                if k in model:
-                    return model[k]
-        if isinstance(model, (tuple, list)) and len(model) >= 1:
-            return model[0]
-    except Exception:
-        pass
-    return model
-
-
-def _pick_positive_class_index(model: Any, proba: Optional[np.ndarray], prefer_label: Any = 1) -> int:
-    """
-    predict_proba の「どの列が陽性（勝ち）」かを classes_ から決める。
-    - prefer_label を最優先（通常は 1）
-    - classes_ が取れない場合は、2値なら 1 列目、それ以外は 0 列目
-    """
-    try:
-        m = _unwrap_estimator_for_classes(model)
-    except Exception:
-        m = model
-
-    # classes_ 優先
-    try:
-        classes = getattr(m, "classes_", None)
-        if classes is not None:
-            cls_list = list(classes)
-
-            # prefer_label を最優先（数値/文字列どちらも拾う）
-            if prefer_label in cls_list:
-                return int(cls_list.index(prefer_label))
-
-            cls_str = [str(c) for c in cls_list]
-            if str(prefer_label) in cls_str:
-                return int(cls_str.index(str(prefer_label)))
-
-            # 代表的な文字列ラベルも保険で拾う
-            low = [s.strip().lower() for s in cls_str]
-            if "win" in low:
-                return int(low.index("win"))
-            if "true" in low:
-                return int(low.index("true"))
-            if "1" in low:
-                return int(low.index("1"))
-    except Exception:
-        pass
-
-    # fallback（2値なら 1 を優先）
-    try:
-        if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[1] > 1:
-            return 1
-    except Exception:
-        pass
-
-    return 0
-
 
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
@@ -2226,12 +1307,10 @@ def _sheet_rows_as_df(sheet_name: str, lookback_rows: int) -> pd.DataFrame:
 
     start_row = max(2, last_row - int(lookback_rows) + 1)
     rng = f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}"
-    req = service.spreadsheets().values().get(
+    res = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
         range=rng,
-    )
-    res = sheets_execute_with_retry(req)
-
+    ).execute()
 
     rows = res.get("values", []) or []
     if not rows:
@@ -2264,21 +1343,26 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     learn_log から学習データを作る（推論側の9特徴量に揃える版）
 
     方針（統一）:
-    - 空白セル（"" / None / NaN）がある行は学習に使わない（埋めない）
-      ※判定対象は必須列（required_cols）
+    - 必須列（required_cols）に空白セル（"" / None / NaN）がある行は学習に使わない（埋めない）
     - Win/Lose が未確定の行は学習に使わない
+    - optional列（BandWidth等）は learn_log 側に存在しても学習では参照しない
+      （optional列の空白が原因で大量に行が落ちるのを防ぐ）
     """
     info: Dict[str, Any] = {
-        "policy": "drop_any_blank_in_required_cols",
+        "policy": "drop_blank_in_required_cols_only_ignore_optional_sheet_cols",
         "required_cols": ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"],
         "missing_cols": [],
         "rows_total": 0,
         "rows_labeled": 0,
         "rows_skipped_blank_required": 0,
-        "rows_skipped_nan_after_numeric": 0,
         "rows_used": 0,
-        # NOTE: ここはモデルの feature_names_in_ と一致させる（スペース入り）
+        # NOTE: モデルの feature_names_in_ と一致させる（スペース入り）
         "feature_columns": ["Sigma", "BandWidth", "BW Change", "RSI", "Vol Change", "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"],
+        "notes": [
+            "optional columns in learn_log are ignored for training to avoid dropping many rows due to blanks.",
+            "BandWidth/BW Change/Vol Change/BTC Ret are fixed to 0.0 for training.",
+            "Rise/Drop derived from ScoreSigma + Side. BTC Vol derived from abs(BTC_1h_Change)/4.0.",
+        ],
     }
 
     if df is None or df.empty:
@@ -2301,27 +1385,24 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     if df2.empty:
         return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
-    # 空白判定
-    def _is_blank(v) -> bool:
-        if v is None:
-            return True
-        if isinstance(v, float) and (v != v):  # NaN
-            return True
-        if isinstance(v, str) and v.strip() == "":
-            return True
-        return False
-
-    # 必須列に空白がある行は除外（埋めない）
+    # 必須列の空白行を除外（埋めない）
     required_cols = ["Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
-    blank_mask = df2[required_cols].applymap(_is_blank).any(axis=1)
-    info["rows_skipped_blank_required"] = int(blank_mask.sum())
-    df2 = df2[~blank_mask].copy()
+    tmp = df2[required_cols].copy()
+
+    blank = tmp.isna()
+    for c in required_cols:
+        blank[c] = blank[c] | tmp[c].astype(str).str.strip().eq("")
+
+    blank_mask_any = blank.any(axis=1)
+    info["rows_skipped_blank_required"] = int(blank_mask_any.sum())
+
+    df2 = df2[~blank_mask_any].copy()
     if df2.empty:
         return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
     y = (df2["__winlose__"] == "Win").astype(int).to_numpy()
 
-    # 数値化（埋めない）
+    # 数値化（必須列は空白行を落としているので、ここで大量NaNにならない前提）
     score = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     sigma = pd.to_numeric(df2["VolSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     rsi = pd.to_numeric(df2["RSI"], errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -2335,47 +1416,29 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     rise_score = np.where(is_long, score, 0.0)
     drop_score = np.where(is_short, score, 0.0)
 
-    # optional列：列が無い場合でも必ず Series を作る（astypeで落ちないように）
-    # NOTE: learn_log 側の列名が "BW Change" / "Vol Change" 等かもしれないので両対応
-    def _opt_num(col_candidates, default_series):
-        for col in col_candidates:
-            if col in df2.columns:
-                return pd.to_numeric(df2[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        return default_series
-
-    bw = _opt_num(["BandWidth", "Band Width"], pd.Series(0.0, index=df2.index))
-    bw_ch = _opt_num(["BW Change", "BW_Change", "BW Change "], pd.Series(0.0, index=df2.index))
-    vol_ch = _opt_num(["Vol Change", "Vol_Change", "Vol Change "], pd.Series(0.0, index=df2.index))
-
-    # BTC Ret：列が無ければ BTC_1h_Change
-    btc_ret_series = _opt_num(["BTC Ret", "BTC_Ret"], btc1h.copy())
-
-    # BTC Vol：列が無ければ abs(BTC_1h_Change)/4.0
-    btc_vol_series = _opt_num(["BTC Vol", "BTC_Vol"], (btc1h.abs() / 4.0))
-
-    # NOTE: ここも列名をモデルの feature_names_in_ と一致させる（スペース入り）
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
-        "BandWidth": bw.astype(float),
-        "BW Change": bw_ch.astype(float),
+        "BandWidth": 0.0,
+        "BW Change": 0.0,
         "RSI": rsi.astype(float),
-        "Vol Change": vol_ch.astype(float),
+        "Vol Change": 0.0,
         "Rise Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
         "Drop Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
-        "BTC Ret": btc_ret_series.astype(float),
-        "BTC Vol": btc_vol_series.astype(float),
+        "BTC Ret": 0.0,
+        "BTC Vol": (btc1h.abs() / 4.0).astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan)
 
     # NaN が残る行は学習に使わない（=欠損は埋めない）
     valid = ~X.isna().any(axis=1)
-    info["rows_skipped_nan_after_numeric"] = int((~valid).sum())
-
     X = X[valid].copy()
     y = y[valid.to_numpy()]
 
     info["rows_used"] = int(len(X))
     return X, y, info
 
+# ==========================================
+# GCS Upload (Unified Tuple Return)
+# ==========================================
 def _gcs_upload_from(src_path: str, uri: str) -> Tuple[bool, str]:
     """
     src_path のファイルを gs://bucket/path/to.obj にアップロードする。
@@ -2824,20 +1887,8 @@ def self_heal_prerequisites() -> Tuple[bool, str]:
         ok_lock = ensure_sheet_exists(RUN_MUTEX_SHEET, min_rows=50, min_cols=5)
         ok_learn = ensure_learn_headers()
         ok_table = ensure_table_headers()
-
-        ok_market_log = True
-        if MARKET_LOG_ENABLE:
-            ok_market_log = ensure_market_log_headers()
-
-        ok_market_label = True
-        if MARKET_LABEL_ENABLE:
-            ok_market_label = ensure_market_label_headers()
-
-        ok_all = bool(ok_lock and ok_learn and ok_table and ok_market_log and ok_market_label)
-        return ok_all, (
-            f"lock={ok_lock} learn={ok_learn} table={ok_table} "
-            f"market_log={ok_market_log} market_label={ok_market_label}"
-        )
+        ok_all = bool(ok_lock and ok_learn and ok_table)
+        return ok_all, f"lock={ok_lock} learn={ok_learn} table={ok_table}"
     except Exception as e:
         return False, f"self_heal failed: {e}"
 
@@ -2949,24 +2000,10 @@ def logic_main(force: bool = False):
     pending_candidates: List[Dict[str, Any]] = []
     pending_alerts: List[Dict[str, Any]] = []
 
-    # ----------------------------------------------------------
-    # Market snapshot logging buffers (optional)
-    # ----------------------------------------------------------
-    market_log_rows: List[List[Any]] = []
-    market_log_count = 0
-
     for symbol in symbols:
         try:
             ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
             if not ohlcv or len(ohlcv) < MIN_BARS:
-                # RUN_DEBUG=1 のときだけ、スキップ理由をログに出す（通常運用は汚さない）
-                try:
-                    _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
-                    if _rd in ("1", "true", "yes", "on"):
-                        _n = 0 if not ohlcv else len(ohlcv)
-                        print(f"[DBG_OHLCV] symbol={symbol} n={_n} MIN_BARS={MIN_BARS}", flush=True)
-                except Exception:
-                    pass
                 continue
 
             df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
@@ -3000,113 +2037,17 @@ def logic_main(force: bool = False):
             else:
                 vol_ratio_val = vol_now / vol_ma20
 
-            # ----------------------------------------------------------
-            # Market snapshot logging (optional): market_log に全局面スナップショットを貯める
-            # ----------------------------------------------------------
-            if MARKET_LOG_ENABLE:
-                try:
-                    take = True
-                    if MARKET_LOG_SAMPLE_EVERY_N > 1:
-                        take = ((market_log_count % MARKET_LOG_SAMPLE_EVERY_N) == 0)
-
-                    if take and (len(market_log_rows) < MARKET_LOG_MAX_ROWS_PER_RUN):
-                        # Time（ms想定）
-                        time_ms = safe_float(row.get("Time", 0.0), 0.0)
-                        if time_ms > 0.0:
-                            dt_jst = datetime.fromtimestamp(
-                                time_ms / 1000.0,
-                                tz=timezone.utc,
-                            ).astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            dt_jst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-
-                        # ここで row から安全に値を取る（未定義変数を参照しない）
-                        close_now = safe_float(row.get("Close", 0.0), 0.0)
-                        sigma_now = safe_float(row.get("Dynamic_Sigma", row.get("Sigma", 0.0)), 0.0)
-                        bw_val = safe_float(row.get("BandWidth", 0.0), 0.0)
-                        rsi_now = safe_float(row.get("RSI", 50.0), 50.0)
-                        rise_val = safe_float(row.get("Rise_Score", 0.0), 0.0)
-                        drop_val = safe_float(row.get("Drop_Score", 0.0), 0.0)
-                        upper2_val = safe_float(row.get("Upper2", 0.0), 0.0)
-                        lower2_val = safe_float(row.get("Lower2", 0.0), 0.0)
-
-                        bw_change_val = safe_float(row.get("BW_Change", 0.0), 0.0)
-
-                        vol_change_df = row.get("Vol_Change", None)
-                        vol_change_val = safe_float(vol_change_df, default=vol_ratio_val) if (vol_change_df is not None) else vol_ratio_val
-
-
-                        market_row = [
-                            dt_jst,                    # Time_JST
-                            symbol,                    # Symbol
-                            close_now,                 # Close
-                            sigma_now,                 # Sigma
-                            bw_val,                    # BandWidth
-                            bw_change_val,             # BW_Change
-                            rsi_now,                   # RSI
-                            vol_change_val,            # Vol_Change
-                            rise_val,                  # Rise_Score
-                            drop_val,                  # Drop_Score
-                            safe_float(btc_ret, 0.0),  # BTC_1h_Change
-                            safe_float(btc_vol, 0.0),  # BTC_1h_Vol
-                            btc_mode,                  # BTC_Mode
-                            bool(BTC_CALM),            # BTC_Calm
-                            upper2_val,                # Upper2
-                            lower2_val,                # Lower2
-                            VERSION,                   # Version
-                            "SNAPSHOT",                # Type
-                            "",                        # Note
-                        ]
-                        market_log_rows.append(market_row)
-                except Exception as e:
-                    print("[WARN] market_log snapshot failed:", e)
-
-
-            market_log_count += 1
-
             is_buy = False
             is_sell = False
             signal_type = ""
 
-            # ----------------------------------------------------------
-            # Range Mean Reversion (optional)
-            #  - BTC_CALM（レンジ寄り）かつ BandWidth が狭い時だけ
-            #  - Upper2タッチ + RSI OB => SHORT
-            #  - Lower2タッチ + RSI OS => LONG
-            # ----------------------------------------------------------
-            mr_short = False
-            mr_long = False
-            try:
-                if RANGE_MR_ENABLE and BTC_CALM:
-                    close_now = safe_float(row.get("Close", 0.0), 0.0)
-                    rsi_now = safe_float(row.get("RSI", 50.0), 50.0)
-                    upper2 = safe_float(row.get("Upper2", 0.0), 0.0)
-                    lower2 = safe_float(row.get("Lower2", 0.0), 0.0)
-                    bw = safe_float(row.get("BandWidth", 999.0), 999.0)
-
-                    if bw <= RANGE_MR_MAX_BW:
-                        eps = RANGE_MR_BAND_TOUCH_EPS
-
-                        # SHORT: upper band touch + RSI overbought
-                        if (upper2 > 0.0) and (close_now >= upper2 * (1.0 - eps)) and (rsi_now >= RANGE_MR_RSI_OB):
-                            mr_short = True
-
-                        # LONG: lower band touch + RSI oversold
-                        if (lower2 > 0.0) and (close_now <= lower2 * (1.0 + eps)) and (rsi_now <= RANGE_MR_RSI_OS):
-                            mr_long = True
-            except Exception as e:
-                print("[WARN] RANGE_MR check failed:", e)
-
-            # 既存のσ候補 + MR候補（MRでも既存フローのAI評価・ログ記録に乗せる）
-            short_by_sigma = (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT
-            long_by_sigma = (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG
-
-            if short_by_sigma or (mr_short and ALLOW_SHORT):
+            if (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT:
                 is_sell = True
-                signal_type = "RANGE_MR" if (mr_short and not short_by_sigma) else "SHORT"
-            elif long_by_sigma or (mr_long and ALLOW_LONG):
-                is_buy = True
-                signal_type = "RANGE_MR" if (mr_long and not long_by_sigma) else "LONG"
+                signal_type = "SHORT"
+            elif (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG:
+                if row["Close"] > df.iloc[-6]["Close"]:
+                    is_buy = True
+                    signal_type = "LONG"
 
             if not (is_buy or is_sell):
                 continue
@@ -3142,207 +2083,31 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> pd.DataFrame:
-                """推論入力の特徴量を「そのモデルが期待する列」に合わせて作る。
+                rise = sig_score if side == "LONG" else 0.0
+                drop = sig_score if side == "SHORT" else 0.0
+                return pd.DataFrame([{
+                    "Sigma": float(row["Dynamic_Sigma"]),
+                    "BandWidth": float(row["BandWidth"]),
+                    "BW_Change": float(row["BW_Change"]),
+                    "RSI": float(row["RSI"]),
+                    "Vol_Change": float(row["Vol_Change"]),
+                    "Rise_Score": float(rise),
+                    "Drop_Score": float(drop),
+                    "BTC_Ret": float(btc_ret),
+                    "BTC_Vol": float(btc_vol),
+                }])
 
-                方針:
-                - model_for_sym.feature_names_in_ があれば、それを最優先（列名/順序を一致させる）
-                - 無い場合は n_features_in_ に応じて 9/10/14 の既知フォールバック
-                - 欠損は NaN にしない（safe_predict_proba が NaN 検出で bypass しがちなため）
-                - Pipeline(35列など) / LogisticRegression(9列など) どちらでも動くことを狙う
-                """
-
-                def _f(key: str, default: float = 0.0) -> float:
-                    try:
-                        if hasattr(row, "get"):
-                            v = row.get(key, default)
-                        else:
-                            if hasattr(row, "index") and key in row.index:
-                                v = row[key]
-                            else:
-                                v = default
-
-                        if v is None or v == "":
-                            return float(default)
-
-                        if isinstance(v, str):
-                            vv = v.strip().replace(",", "")
-                            if vv.endswith("%"):
-                                vv = vv[:-1]
-                                return float(vv) / 100.0
-                            return float(vv)
-
-                        return float(v)
-                    except Exception:
-                        return float(default)
-
-                # 現在価格（推論時の入力の中心）
-                cp = _f("Close", _f("close", _f("c", _f("EntryPrice", _f("Entry", 0.0)))))
-
-                if cp == 0.0:
-                    try:
-                        cp = float(close_now)
-                    except Exception:
-                        pass
-
-                # sigma（TP/SL用 & モデルの Sigma/VolSigma 用）
-                sig = _f("Dynamic_Sigma", _f("VolSigma", _f("Sigma", 0.0)))
-
-                # ScoreSigma：既存の sig_score を優先
-                try:
-                    score_sigma = float(sig_score) if (sig_score is not None and sig_score != "") else _f("ScoreSigma", 0.0)
-                except Exception:
-                    score_sigma = _f("ScoreSigma", 0.0)
-
-                # TP/SL を推論時に計算
-                tp_mult = 3.8
-                sl_mult = 1.5
-
-                if str(side).upper() == "LONG":
-                    tp = cp * (1.0 + sig * tp_mult)
-                    sl = cp * (1.0 - sig * sl_mult)
-                else:
-                    tp = cp * (1.0 - sig * tp_mult)
-                    sl = cp * (1.0 + sig * sl_mult)
-
-                tp_pct = abs((tp - cp) / cp) if cp != 0 else 0.0
-                sl_pct = abs((sl - cp) / cp) if cp != 0 else 0.0
-
-                # レバレッジ（0埋め回避）
-                try:
-                    lev = float(MAX_LEV_5X if sym_code in MAX_LEV_5X_SYMBOLS else DEFAULT_LEV)
-                except Exception:
-                    lev = 10.0
-
-                # BTC_1h_Change：rowに無ければ btc_ret
-                try:
-                    _btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
-                except Exception:
-                    _btc_ret_f = 0.0
-                btc_1h_change = _f("BTC_1h_Change", _btc_ret_f)
-
-                # BTC_Ret / BTC_Vol
-                try:
-                    btc_ret_f = float(btc_ret) if (btc_ret is not None and btc_ret != "") else 0.0
-                except Exception:
-                    btc_ret_f = 0.0
-                try:
-                    btc_vol_f = float(btc_vol) if (btc_vol is not None and btc_vol != "") else 0.0
-                except Exception:
-                    btc_vol_f = 0.0
-
-                # RSI：無ければ 50（中立）
-                rsi = _f("RSI", 50.0)
-
-                # learn系（9列モデルなどが使う）
-                band_width = _f("BandWidth", 0.0)
-                bw_change = _f("BW_Change", 0.0)
-                vol_change = _f("Vol_Change", 0.0)
-                rise_score = _f("Rise_Score", 0.0)
-                drop_score = _f("Drop_Score", 0.0)
-
-                # Pipeline(35列など)で要求されがちな追加項目（無いものは「中立寄り」に）
-                btc_calm_val = 1.0 if bool(BTC_CALM) else 0.0
-
-                base_map = {
-                    # 14列の基本
-                    "EntryPrice": float(cp),
-                    "ScoreSigma": float(score_sigma),
-                    "VolSigma": float(sig),
-                    "Sigma": float(sig),
-                    "TP": float(tp),
-                    "SL": float(sl),
-                    "TP_Pct": float(tp_pct),
-                    "SL_Pct": float(sl_pct),
-                    "Leverage": float(lev),
-                    "Reserved1": 0.0,
-                    "Reserved2": 0.0,
-                    "Reserved3": 0.0,
-                    "Reserved4": 0.0,
-                    "BTC_1h_Change": float(btc_1h_change),
-                    "RSI": float(rsi),
-
-                    # 9列モデル系
-                    "BandWidth": float(band_width),
-                    "BW_Change": float(bw_change),
-                    "Vol_Change": float(vol_change),
-                    "Rise_Score": float(rise_score),
-                    "Drop_Score": float(drop_score),
-                    "BTC_Ret": float(btc_ret_f),
-                    "BTC_Vol": float(btc_vol_f),
-
-                    # 10列/35列 Pipeline 系（カテゴリ列は文字で渡す）
-                    "BTC_Calm": float(btc_calm_val),
-                    "Symbol": str(sym_code),
-                    "Side": str(side).upper(),
-                    "SignalType": str(side).upper(),
-                    "BTC_Mode": str(btc_mode),
-                    "MarketTag": str(btc_mode),
-                    "Version": str(os.environ.get("MODEL_VERSION", "")),
-                    "market_ai_score": 0.0,
-                }
-
-                expected_cols = getattr(model_for_sym, "feature_names_in_", None)
-
-                if expected_cols is None:
-                    nfi = getattr(model_for_sym, "n_features_in_", None)
-                    if nfi == 9:
-                        expected_cols = ["Sigma","BandWidth","BW_Change","RSI","Vol_Change","Rise_Score","Drop_Score","BTC_Ret","BTC_Vol"]
-                    elif nfi == 10:
-                        expected_cols = ["ScoreSigma","VolSigma","RSI","BTC_1h_Change","Leverage","Side","BTC_Mode","SignalType","MarketTag","BTC_Calm"]
-                    else:
-                        expected_cols = ["EntryPrice","ScoreSigma","VolSigma","TP","SL","TP_Pct","SL_Pct","Leverage","Reserved1","Reserved2","Reserved3","Reserved4","BTC_1h_Change","RSI"]
-
-                expected_cols = list(expected_cols)
-
-                out = {}
-                for c in expected_cols:
-                    if c in base_map:
-                        out[c] = base_map[c]
-                        continue
-
-                    # row に同名があれば拾う（数値化できるものだけ）
-                    try:
-                        if hasattr(row, "get"):
-                            if c in row:
-                                out[c] = _f(c, 0.0)
-                                continue
-                        if hasattr(row, "index") and c in row.index:
-                            out[c] = _f(c, 0.0)
-                            continue
-                    except Exception:
-                        pass
-
-                    # 文字列カテゴリっぽい列は空文字で埋める（NaN回避）
-                    if c in ("Symbol","Side","SignalType","MarketTag","BTC_Mode","Version"):
-                        out[c] = str(base_map.get(c, ""))
-                    else:
-                        out[c] = 0.0
-
-                return pd.DataFrame([out], columns=expected_cols)
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
                 if bypass_x:
                     return None, True, (dbg_x or {})
-            
                 try:
-                    pos_idx = _pick_positive_class_index(model_for_sym, proba_x)
-                    s = float(proba_x[0][pos_idx])
-            
-                    if isinstance(dbg_x, dict):
-                        dbg_x["pos_class_index"] = int(pos_idx)
-                        try:
-                            m = _unwrap_estimator_for_classes(model_for_sym)
-                            dbg_x["classes_"] = [str(c) for c in list(getattr(m, "classes_", []))]
-                        except Exception:
-                            dbg_x["classes_"] = []
+                    s = float(proba_x[0][1])
                 except Exception:
                     return None, True, {"error": "proba_parse_failed"}
-            
                 if not np.isfinite(s):
                     return None, True, {"error": "non_finite_score"}
-            
                 return float(s), False, (dbg_x or {})
-
 
             # base 採点
             score_b, bypass_b, dbg_b = _score_side(base_side)
@@ -3408,7 +2173,7 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
-                        # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
+            # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
             if bypassed:
                 if FAIL_CLOSED_ON_AI_BYPASS:
                     ai_pass = False
@@ -3419,30 +2184,9 @@ def logic_main(force: bool = False):
             else:
                 ai_pass = (float(ai_score) >= float(ai_th_used))
 
-            # ----------------------------------------------------------
-            # Market AI Filter (optional)
-            #  - ENABLE_MARKET_AI_FILTER=1 のときだけ採点して ai_pass に合成する
-            # ----------------------------------------------------------
-            market_ai_score = None
-            market_ai_pass = True
-            market_ai_debug: Dict[str, Any] = {"enabled": False, "skipped": True, "reason": "ENABLE_MARKET_AI_FILTER=0"}
 
-            if ENABLE_MARKET_AI_FILTER:
-                try:
-                    market_ai_score, market_ai_pass, market_ai_debug = eval_market_ai(
-                        row=row,
-                        btc_mode=btc_mode,
-                        btc_calm=bool(BTC_CALM),
-                        btc_ret=float(btc_ret),
-                        btc_vol=float(btc_vol),
-                    )
-                except Exception as e:
-                    market_ai_score = None
-                    market_ai_pass = True  # 失敗時はバイパス（運用を壊さない）
-                    market_ai_debug = {"enabled": True, "bypassed": True, "error": f"{type(e).__name__}: {e}"}
 
-            # 合成（Market AI が有効な時だけ効かせる）
-            ai_pass_effective = bool(ai_pass) and (bool(market_ai_pass) if ENABLE_MARKET_AI_FILTER else True)
+
 
             item = {
                 "symbol": symbol.replace("/USDT", ""),
@@ -3455,64 +2199,22 @@ def logic_main(force: bool = False):
                 "rsi": float(row["RSI"]),
                 "type": signal_type,
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
-
-                # 既存AI
                 "ai_score": ai_score,
-                "ai_pass": bool(ai_pass_effective),
+                "ai_pass": bool(ai_pass),
                 "ai_debug": dbg,
-
-                # Market AI（追加）
-                "market_ai_score": market_ai_score,
-                "market_ai_pass": bool(market_ai_pass),
-                "market_ai_debug": market_ai_debug,
-
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
-
-                # --- 学習用特徴量（learn_log に保存） ---
-                "BandWidth": safe_float(row.get("BandWidth", 0.0), 0.0),
-                "BW_Change": safe_float(row.get("BW_Change", 0.0), 0.0),
-                "Vol_Change": safe_float(row.get("Vol_Change", 0.0), 0.0),
-                "BTC_Ret": safe_float(btc_ret, 0.0),
-                "BTC_Vol": safe_float(btc_vol, 0.0),
             }
 
-            # ★追加：RUN_DEBUG=1 のときだけ、この候補が alert にならない理由を1行で確定する
-            try:
-                _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
-                if _rd in ('1','true','yes','on'):
-                    _will_alert = bool(ai_pass_effective and BTC_CALM and (item.get('score', 0.0) >= ALERT_SIGMA))
-                    print(
-                        f"[AI_DECIDE] sym={item.get('symbol')} side={item.get('type')} "
-                        f"btc_mode={btc_mode} ALLOW_LONG={ALLOW_LONG} ALLOW_SHORT={ALLOW_SHORT} "
-                        f"ai_score={ai_score} ai_th={ai_th_used} ai_pass={ai_pass} "
-                        f"market_ai_pass={market_ai_pass} ai_pass_effective={ai_pass_effective} "
-                        f"BTC_CALM={BTC_CALM} score={item.get('score')} ALERT_SIGMA={ALERT_SIGMA} "
-                        f"will_alert={_will_alert}",
-                        flush=True,
-                    )
-            except Exception:
-                pass
 
             pending_candidates.append(item)
 
-            if ai_pass_effective and BTC_CALM and item["score"] >= ALERT_SIGMA:
+            if ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
                 pending_alerts.append(item)
 
         except Exception as e:
             print(f"[ERR] {symbol} fetch/compute: {e}")
             continue
-
-    # ----------------------------------------------------------
-    # flush market_log rows (append)
-    # ----------------------------------------------------------
-    if MARKET_LOG_ENABLE:
-        try:
-            if market_log_rows:
-                append_rows_to_sheet(MARKET_LOG_SHEET_NAME, market_log_rows, MARKET_LOG_HEADERS)
-                print(f"[MARKET_LOG] appended {len(market_log_rows)} rows to {MARKET_LOG_SHEET_NAME}")
-        except Exception as e:
-            print("[WARN] market_log append failed:", e)
 
     def calc_tp_sl(item):
         tp_mult = 3.8
@@ -3538,8 +2240,6 @@ def logic_main(force: bool = False):
     # 基本は「実シートのヘッダー」に合わせる（列ズレ防止）
     # もし取得できなければ EXPECTED を使う
     learn_fields = list(learn_headers) if (learn_headers and len(learn_headers) > 0) else list(EXPECTED_HEADERS_LEARN)
-
-
     
     # ai_debug 列の存在確認（大文字小文字ゆれ対応）
     ai_debug_field = ""
@@ -3553,157 +2253,19 @@ def logic_main(force: bool = False):
     if ai_debug_field:
         if all(str(x).strip().lower() != "ai_debug" for x in (learn_fields or [])):
             learn_fields.append(ai_debug_field)
-            
     
-    # 列名→index（小文字化して揺れに強くする）
-    # 同名列があっても「最初（左側）」を優先して固定する（右側に上書きしない）
-    learn_idx: Dict[str, int] = {}
-    for i, h in enumerate(learn_fields):
-        key = str(h).strip().lower()
-        if key and (key not in learn_idx):
-            learn_idx[key] = i
-
-    def _cell_json(v: Any) -> str:
-        """
-        Google Sheets の values.append は「文字列/数値/真偽/空」しか安全に入らない。
-        dict/list/tuple/ndarray は JSON 文字列化して入れる。
-        ※ numpy の int64/float64 が混ざると json.dumps が落ちるので、先に Python 素の型へ変換する。
-        """
-        import json
-
-        try:
-            import numpy as np
-        except Exception:
-            np = None  # type: ignore
-
-        try:
-            import pandas as pd
-        except Exception:
-            pd = None  # type: ignore
-
-        def _jsonable(x: Any) -> Any:
-            # None
-            if x is None:
-                return None
-
-            # numpy scalar / ndarray
-            if np is not None:
-                try:
-                    if isinstance(x, np.integer):
-                        return int(x)
-                    if isinstance(x, np.floating):
-                        return float(x)
-                    if isinstance(x, np.ndarray):
-                        return [_jsonable(y) for y in x.tolist()]
-                except Exception:
-                    pass
-
-            # pandas Timestamp
-            if pd is not None:
-                try:
-                    if isinstance(x, pd.Timestamp):
-                        return x.isoformat()
-                except Exception:
-                    pass
-
-            # datetime (念のため)
-            try:
-                from datetime import datetime
-                if isinstance(x, datetime):
-                    return x.isoformat()
-            except Exception:
-                pass
-
-            # dict / list / tuple / set
-            if isinstance(x, dict):
-                return {str(k): _jsonable(val) for k, val in x.items()}
-            if isinstance(x, (list, tuple, set)):
-                return [_jsonable(y) for y in x]
-
-            # 素の JSON 型
-            if isinstance(x, (str, int, float, bool)):
-                return x
-
-            # その他（最後は文字列化）
-            return str(x)
-
-        if v is None:
-            return ""
-
-        # dict/list/tuple/set/ndarray は JSON 化
-        if isinstance(v, (dict, list, tuple, set)) or (np is not None and isinstance(v, np.ndarray)):
-            return json.dumps(_jsonable(v), ensure_ascii=False, separators=(",", ":"))
-
-        # numpy scalar は素の型へ
-        if np is not None:
-            try:
-                if isinstance(v, np.integer):
-                    return str(int(v))
-                if isinstance(v, np.floating):
-                    return str(float(v))
-            except Exception:
-                pass
-
-        return str(v)
-
-
     candidate_rows: List[List[Any]] = []
 
 
-    # ==========================================================
-    # DEBUG: candidates が 0 になる理由を内訳で出す（最小ログ）
-    # ==========================================================
-    drop_reason = {
-        "ai_pass_false": 0,
-        "market_ai_pass_false": 0,
-        "btc_calm_false": 0,
-        "score_lt_alert_sigma": 0,
-        "ev_filtered": 0,
-        "passed_to_pending_alerts": 0,
-    }
-
     for item in pending_candidates:
-        # --- DEBUG観測（ロジックは変えない）---
-        try:
-            _ai_pass = bool(item.get("ai_pass", False))
-            _market_pass = bool(item.get("market_ai_pass", True))
-            _score = float(item.get("score", 0.0))
-            _ev_pass = True
-            try:
-                exp_ret = item.get("exp_ret", None)
-                if exp_ret is None:
-                    exp_ret = item.get("Reserved2", None)
-                if exp_ret is not None:
-                    _ev_pass = float(exp_ret) >= float(E_TH)
-            except Exception:
-                _ev_pass = True
-        
-            if not _ai_pass:
-                drop_reason["ai_pass_false"] += 1
-            if ENABLE_MARKET_AI_FILTER and (not _market_pass):
-                drop_reason["market_ai_pass_false"] += 1
-            if not BTC_CALM:
-                drop_reason["btc_calm_false"] += 1
-            if _score < float(ALERT_SIGMA):
-                drop_reason["score_lt_alert_sigma"] += 1
-            if not _ev_pass:
-                drop_reason["ev_filtered"] += 1
-        
-            if _ai_pass and (bool(_market_pass) if ENABLE_MARKET_AI_FILTER else True) and BTC_CALM and (_score >= float(ALERT_SIGMA)) and _ev_pass:
-                drop_reason["passed_to_pending_alerts"] += 1
-        except Exception:
-            pass
-        # --- DEBUG観測ここまで ---
-        
         sym = item["symbol"]
         ts_ms = item["time"]
 
         dt_str = normalize_dt_str(item["dt"].strftime("%Y-%m-%d %H:%M:%S"))
         dt_cell = "'" + dt_str
-        
 
-        # learn_log 側はシート側 dedup（learn_keys）で重複防止できる。
-        # last_candidate_records は Cloud Run のインスタンス残留で「永遠に0件」を起こし得るので使わない。
+        if sym in last_candidate_records and last_candidate_records[sym] == ts_ms:
+            continue
         if (now_jst - item["dt"]).total_seconds() > 3000:
             continue
 
@@ -3711,6 +2273,7 @@ def logic_main(force: bool = False):
         if k in learn_keys:
             continue
 
+        last_candidate_records[sym] = ts_ms
 
         tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
 
@@ -3738,14 +2301,6 @@ def logic_main(force: bool = False):
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
 
-        # ★追加：RUN_DEBUG=1 のときだけ、候補(CANDIDATE)側のAI判定行を Cloud Runログに出す
-        try:
-            _rd = str(os.environ.get("RUN_DEBUG", "0")).strip().lower()
-            if _rd in ("1", "true", "yes", "on"):
-                print(f"[AI_LINE] sym={sym} dt={dt_str} {note_str}", flush=True)
-        except Exception:
-            pass
-
 
         ai_debug_label = derive_ai_debug(
             btc_mode=btc_mode,
@@ -3753,36 +2308,16 @@ def logic_main(force: bool = False):
             side=("LONG" if item["is_buy"] else "SHORT"),
         )
 
-        # --- Reserved1/Reserved2: Reserved1=AI(%) / Reserved2=E(Expected Value) ---
-        _ai_raw = item.get("ai_score", None)
-        try:
-            _p_win = float(_ai_raw) if (_ai_raw is not None and _ai_raw != "") else 0.5
-        except Exception:
-            _p_win = 0.5
-        
-        try:
-            _exp_ret = (_p_win * float(tp_pct)) - ((1.0 - _p_win) * float(sl_pct))
-        except Exception:
-            _exp_ret = 0.0
-        
-        try:
-            _ai_pct = round(float(_ai_raw) * 100.0, 4) if (_ai_raw is not None and _ai_raw != "") else 0.0
-        except Exception:
-            _ai_pct = 0.0
-        
-        _e_val = round(float(_exp_ret), 6)
-        
         row_out = [
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, _ai_pct, _e_val, bool(item["ai_pass"]), bool(BTC_CALM),
+            DEFAULT_LEV, 0, 0, bool(item["ai_pass"]), bool(BTC_CALM),
             VERSION, item["type"], 0, 0,
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
             "", "", "", "", "", "", ""
         ]
-
 
         # ai_debug 列が存在する場合は「末尾append」ではなく、その列位置に代入する（列ズレ防止）
         if ai_debug_field:
@@ -3800,28 +2335,6 @@ def logic_main(force: bool = False):
 
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
-
-        # --- 列名で差し込む（列ズレしない） ---
-        feature_values = {
-            # 既存の学習用特徴量
-            "bandwidth": safe_float(item.get("BandWidth", ""), ""),
-            "bw_change": safe_float(item.get("BW_Change", ""), ""),
-            "vol_change": safe_float(item.get("Vol_Change", ""), ""),
-            "btc_ret": safe_float(item.get("BTC_Ret", ""), ""),
-            "btc_vol": safe_float(item.get("BTC_Vol", ""), ""),
-
-            # Market AI（learn_log に表示・追跡したい列）
-            "market_ai_score": "" if (item.get("market_ai_score", None) is None) else safe_float(item.get("market_ai_score"), ""),
-            "market_ai_pass": "" if (item.get("market_ai_pass", None) is None) else bool(item.get("market_ai_pass")),
-            "market_ai_debug": _cell_json(item.get("market_ai_debug", "")),
-        }
-
-        for col_lower, val in feature_values.items():
-            idx = learn_idx.get(str(col_lower).strip().lower())
-            if idx is not None:
-                row_out[idx] = val
-
-
 
         candidate_rows.append(row_out)
 
@@ -3944,16 +2457,6 @@ def logic_main(force: bool = False):
         append_rows_to_sheet(MAIN_SHEET_NAME, alert_rows, TABLE_FIELDS)
 
     elapsed = time.time() - start
-    print(
-        "[DBG] drop_reason "
-        f"ai_pass_false={drop_reason['ai_pass_false']} "
-        f"market_ai_pass_false={drop_reason['market_ai_pass_false']} "
-        f"btc_calm_false={drop_reason['btc_calm_false']} "
-        f"score_lt_alert_sigma={drop_reason['score_lt_alert_sigma']} "
-        f"ev_filtered={drop_reason['ev_filtered']} "
-        f"passed_to_pending_alerts={drop_reason['passed_to_pending_alerts']}"
-    )
-
     print(f"[RUN] done alerts={count} candidates={len(candidate_rows)} elapsed={elapsed:.2f}s")
     print(f"[DBG] pending_candidates={len(pending_candidates)} pending_alerts={len(pending_alerts)} "
           f"BTC_CALM={BTC_CALM} btc_mode={btc_mode} median_sigma={median_sigma} btc_ok={btc_ok}")
@@ -4358,180 +2861,51 @@ def ai_health():
     return jsonify(resp), 200
 
 
-def extract_feature_names(model):
-    """モデルが要求する特徴量名(feature_names_in_)を可能なら返す。無理なら空リスト。"""
-    if model is None:
-        return []
-
-    # まず model 自体
-    fn = getattr(model, "feature_names_in_", None)
-    if fn is not None:
-        try:
-            return [str(x) for x in list(fn)]
-        except Exception:
-            return []
-
-    # Pipeline などで最後の推定器に付くケース
-    try:
-        if hasattr(model, "named_steps") and isinstance(model.named_steps, dict) and len(model.named_steps) > 0:
-            last = list(model.named_steps.values())[-1]
-            fn2 = getattr(last, "feature_names_in_", None)
-            if fn2 is not None:
-                return [str(x) for x in list(fn2)]
-    except Exception:
-        pass
-
-    return []
-
-
-
-
-
 
 @app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
     """
     - safe_predict_proba が bypass / None / 形不正でも 500 を出さない
     - score は取れれば返す。取れなければ None のまま返す
-
-    重要：
-    /ai_smoke は「本番モデルが要求する特徴量スキーマ」でテストする。
-    14固定を廃止し、モデルの feature_names_in_（= 35等）に自動追従させる。
     """
+    feats = pd.DataFrame([{
+        "Sigma": 0.001,
+        "BandWidth": 0.01,
+        "BW_Change": 0.0,
+        "RSI": 50.0,
+        "Vol_Change": 0.0,
+        "Rise_Score": 0.0,
+        "Drop_Score": 0.0,
+        "BTC_Ret": 0.0,
+        "BTC_Vol": 0.0,
+    }])
 
     proba = None
     bypassed = True
     dbg = {"info": "init"}
-    score = None
 
     try:
-        # 1) モデルが要求する列を取得（feature_names_in_ 優先）
-        expected_cols = extract_feature_names(ai_model)
-        expected_cols = [str(c) for c in (expected_cols or [])]
+        proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
+    except Exception as e:
+        # safe_predict_proba 自体が例外でも 200 で返す（落とさない）
+        dbg = {"error": f"{type(e).__name__}: {e}"}
+        proba = None
+        bypassed = True
 
-        # 2) 期待列が取れない場合は fallback（= 35想定の安全側）
-        if not expected_cols:
-            expected_cols = [
-                "EntryPrice", "ScoreSigma", "VolSigma", "Sigma", "TP", "SL", "TP_Pct", "SL_Pct",
-                "Leverage", "Reserved1", "Reserved2", "Reserved3", "Reserved4", "BTC_1h_Change",
-                "BTC_Calm", "RSI", "BandWidth", "BW_Change", "Vol_Change", "Rise_Score", "Drop_Score",
-                "BTC_Ret", "BTC_Vol", "market_ai_score", "Symbol", "Side", "SignalType", "MarketTag",
-                "BTC_Mode", "Version", "time_hour", "time_day_of_week", "time_month",
-                "time_hour_sin", "time_hour_cos",
-            ]
-
-        # 3) smoke 用 1行データを「期待列で」作る
-        row = {}
-        for c in expected_cols:
-            if c in ("Symbol", "Side", "SignalType", "MarketTag", "BTC_Mode", "Version"):
-                row[c] = "DUMMY"
-            elif c == "RSI":
-                row[c] = 50.0
-            elif c == "Leverage":
-                row[c] = 10.0
-            elif c == "BTC_Calm":
-                row[c] = 1.0
-            else:
-                row[c] = 0.0
-
-        feats = pd.DataFrame([row], columns=expected_cols)
-
-        # 4) 推論
-        # latest9: modelが9特徴なら、rowから9特徴を再構築して渡す
-        _feats_in = feats
-    
-        try:
-            exp_n = int(getattr(ai_model, "n_features_in_", -1))
-        except Exception:
-            exp_n = -1
-    
-        if exp_n == 9:
-            def _sf(v):
-                try:
-                    if v is None:
-                        return 0.0
-                    if isinstance(v, str) and v.strip() == "":
-                        return 0.0
-                    return float(v)
-                except Exception:
-                    return 0.0
-    
-            def _rg(key, default=0.0):
-                try:
-                    return _sf(row.get(key, default))
-                except Exception:
-                    return _sf(default)
-    
-            btc_ret_val = _rg("BTC_Ret", _rg("BTC_1h_Change", 0.0))
-            btc_vol_val = _rg("BTC_Vol", _rg("BTC_VolSigma", 0.0))
-    
-            cols9 = [
-                "Sigma", "BandWidth", "BW_Change", "RSI",
-                "Vol_Change", "Rise_Score", "Drop_Score", "BTC_Ret", "BTC_Vol",
-            ]
-
-            _feats_in = pd.DataFrame([{
-                "Sigma": _rg("Dynamic_Sigma", _rg("Sigma", 0.0)),
-                "BandWidth": _rg("BandWidth", 0.0),
-                "BW_Change": _rg("BW_Change", 0.0),
-                "RSI": _rg("RSI", 0.0),
-                "Vol_Change": _rg("Vol_Change", 0.0),
-                "Rise_Score": _rg("Rise_Score", 0.0),
-                "Drop_Score": _rg("Drop_Score", 0.0),
-                "BTC_Ret": btc_ret_val,
-                "BTC_Vol": btc_vol_val,
-            }], columns=cols9)
-
-    
-        # ↓ ここだけ「2つ目の引数」を _feats_in にする（左辺はあなたの元のまま）
-        proba, bypassed, dbg = safe_predict_proba(ai_model, _feats_in)
-    
-
-
-        # 5) score 抽出
-        if proba is not None and hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[0] > 0 and proba.shape[1] > 0:
-            pos_idx = _pick_positive_class_index(ai_model, proba)
-            s = float(proba[0][pos_idx])
-
-            if isinstance(dbg, dict):
-                dbg["pos_class_index"] = int(pos_idx)
-                dbg["classes_"] = []
-                try:
-                    m = _unwrap_estimator_for_classes(ai_model)
-                    dbg["classes_"] = [str(c) for c in list(getattr(m, "classes_", []))]
-                except Exception:
-                    pass
-
-                dbg["expected_cols"] = list(expected_cols)
-                dbg["expected_n_features"] = int(len(expected_cols))
-                try:
-                    dbg["input_n_features"] = int(_feats_in.shape[1]) if _feats_in is not None else None
-                except Exception:
-                    dbg["input_n_features"] = None
-                
-                # あると便利（任意だけどおすすめ）
-                try:
-                    dbg["model_n_features_in_"] = int(getattr(ai_model, "n_features_in_", -1))
-                except Exception:
-                    dbg["model_n_features_in_"] = -1
-                # 実際に推論に渡した列名（原因調査がラクになる）
-                try:
-                    dbg["input_cols"] = list(_feats_in.columns) if _feats_in is not None else None
-                except Exception:
-                    dbg["input_cols"] = None
-
-            
+    score = None
+    try:
+        if proba is not None and len(proba) > 0 and len(proba[0]) > 1:
+            s = float(proba[0][1])
             if np.isfinite(s):
                 score = s
             else:
                 bypassed = True
                 if isinstance(dbg, dict):
                     dbg["score_error"] = "non_finite"
-
     except Exception as e:
         bypassed = True
-        dbg = {"error": f"{type(e).__name__}: {e}"}
-        proba = None
+        if isinstance(dbg, dict):
+            dbg["score_error"] = f"{type(e).__name__}: {e}"
 
     return jsonify({
         "ok": True,
@@ -4541,8 +2915,6 @@ def ai_smoke():
         "debug": dbg,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
-
-
 
 
 @app.route("/reload_model", methods=["POST", "GET"])
@@ -4717,172 +3089,6 @@ def run_process():
 
 
 
-@app.route("/label_market", methods=["GET", "POST"])
-def label_market_process():
-    """
-    market_log のスナップショットに対して、将来(H分後)の上昇/下落ラベルを market_label に追記する
-    - MARKET_LABEL_ENABLE=1 のときだけ動く
-    - 既にラベル済みの (Datetime, Symbol, HorizonMin) は重複追記しない
-    """
-    if not MARKET_LABEL_ENABLE:
-        return jsonify({"ok": True, "skipped": True, "reason": "MARKET_LABEL_ENABLE=0"})
-
-    if not _run_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "Busy: another run in progress"}), 429
-
-    mutex_token = None
-    try:
-        ok_pre, msg_pre = preflight_check()
-        if not ok_pre:
-            return jsonify({"ok": False, "error": msg_pre}), 500
-
-        ok_heal, msg_heal = self_heal_prerequisites()
-        if not ok_heal:
-            return jsonify({"ok": False, "error": msg_heal}), 500
-
-        okm, token = acquire_run_mutex()
-        if not okm:
-            return jsonify({"ok": False, "error": "run_mutex busy"}), 429
-        mutex_token = token
-
-
-        svc = get_sheet_service()
-
-        # 既存ラベルのキーを作る（重複防止：直近3000行）
-        label_keys: Set[str] = set()
-        try:
-            n_lbl = _get_row_count_cached(MARKET_LABEL_SHEET_NAME)
-            if n_lbl >= 2:
-                start_lbl = max(2, n_lbl - 3000 + 1)
-                end_col_lbl = col_to_a1(len(MARKET_LABEL_HEADERS) - 1)
-                rng_lbl = f"{MARKET_LABEL_SHEET_NAME}!A{start_lbl}:{end_col_lbl}{n_lbl}"
-                vals_lbl = svc.spreadsheets().values().get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=rng_lbl,
-                ).execute().get("values", [])
-                for r in vals_lbl:
-                    if len(r) < 3:
-                        continue
-                    k = f"{str(r[1]).strip()}|{str(r[0]).strip()}|{str(r[2]).strip()}"
-                    label_keys.add(k)
-        except Exception as e:
-            print("[WARN] label_keys preload failed:", e)
-
-        # market_log の直近を読む（最大1500行）
-        n_mkt = _get_row_count_cached(MARKET_LOG_SHEET_NAME)
-        if n_mkt < 2:
-            return jsonify({"ok": True, "labeled": 0, "reason": "market_log empty"})
-
-        start_mkt = max(2, n_mkt - 1500 + 1)
-        end_col_mkt = col_to_a1(len(MARKET_LOG_HEADERS) - 1)
-        rng_mkt = f"{MARKET_LOG_SHEET_NAME}!A{start_mkt}:{end_col_mkt}{n_mkt}"
-        vals_mkt = svc.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=rng_mkt,
-        ).execute().get("values", [])
-
-        now_jst = datetime.now(timezone(timedelta(hours=9)))
-        ex = build_exchange()
-
-        out_rows: List[List[Any]] = []
-        processed = 0
-
-        for r in vals_mkt:
-            if processed >= MARKET_LABEL_MAX_PER_RUN:
-                break
-            if len(r) < 3:
-                continue
-
-            dt_str = str(r[0]).strip()
-            sym = str(r[1]).strip()
-            close0 = safe_float(r[2], 0.0)
-            if not dt_str or not sym or close0 <= 0.0:
-                continue
-
-            try:
-                dt0 = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=timezone(timedelta(hours=9))
-                )
-            except Exception:
-                continue
-
-            for h in MARKET_LABEL_HORIZONS_MIN:
-                if processed >= MARKET_LABEL_MAX_PER_RUN:
-                    break
-
-                dt_target = dt0 + timedelta(minutes=int(h))
-                if now_jst < dt_target:
-                    continue  # まだ未来が来てない
-
-                k = f"{sym}|{dt_str}|{h}"
-                if k in label_keys:
-                    continue
-
-                try:
-                    candles = fetch_ohlcv_safe(ex, sym, timeframe="15m", limit=220)
-                    if not candles:
-                        continue
-
-                    target_ms = int(dt_target.astimezone(timezone.utc).timestamp() * 1000)
-                    future_close = None
-                    for c in candles:
-                        if len(c) < 5:
-                            continue
-                        ts = int(c[0])
-                        if ts >= target_ms:
-                            future_close = safe_float(c[4], 0.0)
-                            break
-                    if future_close is None or future_close <= 0.0:
-                        continue
-
-                    ret = (future_close - close0) / close0
-                    label_up = 1 if ret > MARKET_LABEL_RET_TH else 0
-
-                    out_rows.append([
-                        dt_str,
-                        sym,
-                        int(h),
-                        close0,
-                        future_close,
-                        ret,
-                        label_up,
-                        VERSION,
-                        "",
-                    ])
-                    label_keys.add(k)
-                    processed += 1
-
-                except Exception as e:
-                    print("[WARN] label calc failed:", sym, dt_str, h, e)
-                    continue
-
-        if out_rows:
-            append_rows_to_sheet(MARKET_LABEL_SHEET_NAME, out_rows, MARKET_LABEL_HEADERS)
-            print(f"[MARKET_LABEL] appended {len(out_rows)} rows to {MARKET_LABEL_SHEET_NAME}")
-
-        return jsonify({
-            "ok": True,
-            "labeled": len(out_rows),
-            "scanned": len(vals_mkt),
-            "max_per_run": MARKET_LABEL_MAX_PER_RUN,
-            "horizons": MARKET_LABEL_HORIZONS_MIN,
-        })
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-    finally:
-        try:
-            if mutex_token:
-                release_run_mutex(mutex_token)
-        except Exception:
-            pass
-        try:
-            _run_lock.release()
-        except Exception:
-            pass
-
-
 @app.route("/judge", methods=["GET", "POST"])
 def judge_process():
     if not ENABLE_JUDGE:
@@ -4946,6 +3152,19 @@ def judge_process():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
