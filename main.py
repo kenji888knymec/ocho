@@ -262,7 +262,11 @@ EXPECTED_HEADERS_LEARN = [
     "AI_Pass", "BTC_Calm", "Version", "SignalType", "Reserved3", "Reserved4",
     "MarketTag", "BTC_Mode", "BTC_1h_Change", "RSI", "Note",
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "Win/Lose", "HoldMin",
+    # --- optional-but-we-want-to-always-write (for analysis/debug) ---
+    "BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
+    "market_ai_score", "market_ai_pass", "market_ai_debug",
 ]
+
 
 TABLE_FIELDS = [
     "Time", "Symbol", "Direction", "EntryPrice", "Score", "Sigma", "Group",
@@ -2422,6 +2426,28 @@ def logic_main(force: bool = False):
             side=("LONG" if item["is_buy"] else "SHORT"),
         )
 
+        # learn_log に「必ず書き戻す」列（BandWidth〜BTC_Vol、market_ai_*）を準備
+        def _f_or_blank(x):
+            try:
+                if x is None:
+                    return ""
+                v = float(x)
+                if not np.isfinite(v):
+                    return ""
+                return v
+            except Exception:
+                return ""
+
+        bw_val = _f_or_blank(row.get("BandWidth", ""))
+        bw_chg_val = _f_or_blank(row.get("BW_Change", ""))
+        vol_chg_val = _f_or_blank(row.get("Vol_Change", ""))
+        btc_ret_val = _f_or_blank(btc_ret)
+        btc_vol_val = _f_or_blank(btc_vol)
+
+        m_ai_score = row.get("market_ai_score", "")
+        m_ai_pass = row.get("market_ai_pass", "")
+        m_ai_debug = row.get("market_ai_debug", "")
+
         row_out = [
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
@@ -2430,8 +2456,15 @@ def logic_main(force: bool = False):
             VERSION, item["type"], 0, 0,
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
-            "", "", "", "", "", "", ""
+
+            # --- ここは「候補段階」なので基本空欄（後でDONE時に埋まる） ---
+            "", "", "", "", "", "", "",
+
+            # --- optional-but-we-want-to-always-write ---
+            bw_val, bw_chg_val, vol_chg_val, btc_ret_val, btc_vol_val,
+            m_ai_score, m_ai_pass, m_ai_debug,
         ]
+
 
         # ai_debug 列が存在する場合は「末尾append」ではなく、その列位置に代入する（列ズレ防止）
         if ai_debug_field:
