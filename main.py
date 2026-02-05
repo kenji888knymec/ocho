@@ -1397,26 +1397,31 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     """
     learn_log から学習データを作る（推論側の9特徴量に揃える版）
 
-    方針（統一）:
+    方針（統一 / NO IMPUTATION / NO GUESSING）:
     - 必須列（required_cols）に空白セル（"" / None / NaN）がある行は学習に使わない（埋めない）
     - Win/Lose が未確定の行は学習に使わない
-    - optional列（BandWidth等）は learn_log 側に存在しても学習では参照しない
-      （optional列の空白が原因で大量に行が落ちるのを防ぐ）
+    - BandWidth/BW_Change/Vol_Change/BTC_Ret/BTC_Vol は learn_log の実値のみ使う
+      （0固定・推測生成は一切しない）
     """
     info: Dict[str, Any] = {
-        "policy": "drop_blank_in_required_cols_only_ignore_optional_sheet_cols",
-        "required_cols": ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"],
+        "policy": "drop_rows_with_any_blank_required_feature_no_imputation",
+        "required_cols": [
+            "Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI",
+            "BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
+        ],
         "missing_cols": [],
         "rows_total": 0,
         "rows_labeled": 0,
         "rows_skipped_blank_required": 0,
         "rows_used": 0,
         # NOTE: モデルの feature_names_in_ と一致させる（スペース入り）
-        "feature_columns": ["Sigma", "BandWidth", "BW Change", "RSI", "Vol Change", "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"],
+        "feature_columns": [
+            "Sigma", "BandWidth", "BW Change", "RSI", "Vol Change",
+            "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"
+        ],
         "notes": [
-            "optional columns in learn_log are ignored for training to avoid dropping many rows due to blanks.",
-            "BandWidth/BW Change/Vol Change/BTC Ret are fixed to 0.0 for training.",
-            "Rise/Drop derived from ScoreSigma + Side. BTC Vol derived from abs(BTC_1h_Change)/4.0.",
+            "NO IMPUTATION: rows with blank/non-numeric values in required features are dropped.",
+            "Rise/Drop are derived from ScoreSigma + Side (directional encoding).",
         ],
     }
 
@@ -1425,7 +1430,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
 
     info["rows_total"] = int(len(df))
 
-    needed = ["Win/Lose", "Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
+    needed = list(info["required_cols"])
     missing = [c for c in needed if c not in df.columns]
     info["missing_cols"] = list(missing)
     if missing:
@@ -1441,7 +1446,10 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
 
     # 必須列の空白行を除外（埋めない）
-    required_cols = ["Side", "ScoreSigma", "VolSigma", "RSI", "BTC_1h_Change"]
+    required_cols = [
+        "Side", "ScoreSigma", "VolSigma", "RSI",
+        "BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
+    ]
     tmp = df2[required_cols].copy()
 
     blank = tmp.isna()
@@ -1461,26 +1469,31 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     score = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     sigma = pd.to_numeric(df2["VolSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     rsi = pd.to_numeric(df2["RSI"], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    btc1h = pd.to_numeric(df2["BTC_1h_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    bw = pd.to_numeric(df2["BandWidth"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    bw_chg = pd.to_numeric(df2["BW_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    vol_chg = pd.to_numeric(df2["Vol_Change"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    btc_ret = pd.to_numeric(df2["BTC_Ret"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    btc_vol = pd.to_numeric(df2["BTC_Vol"], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     side = df2["Side"].astype(str).fillna("").str.upper()
     is_long = side.str.contains("LONG") | side.str.contains("BUY")
     is_short = side.str.contains("SHORT") | side.str.contains("SELL")
 
-    # 反対側は 0.0（仕様上の定義）
+    # 反対側は 0.0（欠損埋めではなく方向エンコードの定義）
     rise_score = np.where(is_long, score, 0.0)
     drop_score = np.where(is_short, score, 0.0)
 
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
-        "BandWidth": 0.0,
-        "BW Change": 0.0,
+        "BandWidth": bw.astype(float),
+        "BW Change": bw_chg.astype(float),
         "RSI": rsi.astype(float),
-        "Vol Change": 0.0,
+        "Vol Change": vol_chg.astype(float),
         "Rise Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
         "Drop Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
-        "BTC Ret": 0.0,
-        "BTC Vol": (btc1h.abs() / 4.0).astype(float),
+        "BTC Ret": btc_ret.astype(float),
+        "BTC Vol": btc_vol.astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan)
 
     # NaN が残る行は学習に使わない（=欠損は埋めない）
@@ -1490,6 +1503,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
 
     info["rows_used"] = int(len(X))
     return X, y, info
+
 
 # ==========================================
 # GCS Upload (Unified Tuple Return)
