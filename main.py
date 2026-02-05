@@ -114,6 +114,57 @@ else:
     MAX_LEV_5X_SYMBOLS = set(HL_MAX5_SYMBOLS)
 
 
+# --- Guardrails (env configurable) ---
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name, "").strip()
+    if v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        print(f"[CFG] invalid {name}={v} -> default={default}")
+        return default
+
+def _parse_symbol_set(env_name: str) -> set:
+    raw = os.environ.get(env_name, "").strip()
+    if raw == "":
+        return set()
+    # ',' と '|' 両対応（空白も許容）
+    raw = raw.replace("|", ",").replace(" ", ",")
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+# 数値系（未設定ならフィルター無効：inf/-inf になる）
+VOLRATIO_MAX = _env_float("VOLRATIO_MAX", float("inf"))           # 例: 2.0
+RSI_SHORT_MIN = _env_float("RSI_SHORT_MIN", float("-inf"))        # 例: 20
+RSI_LONG_MAX = _env_float("RSI_LONG_MAX", float("inf"))           # 例: 45
+
+AI_PCT_MIN = _env_float("AI_PCT_MIN", float("-inf"))              # 未設定なら下限チェック無し（例: 62.7）
+AI_PCT_MAX = _env_float("AI_PCT_MAX", float("inf"))               # 例: 69.4（%）
+
+# 慎重銘柄だけ閾値を厳しく（未設定なら通常閾値を使う）
+VOLRATIO_MAX_CAUTION = _env_float("VOLRATIO_MAX_CAUTION", VOLRATIO_MAX)  # 例: 1.6
+AI_PCT_MAX_CAUTION = _env_float("AI_PCT_MAX_CAUTION", AI_PCT_MAX)        # 例: 67.5
+
+# リスト系（',' と '|' 両対応）
+SYMBOL_BLOCKLIST = _parse_symbol_set("SYMBOL_BLOCKLIST")
+SYMBOL_CAUTIONLIST = _parse_symbol_set("SYMBOL_CAUTIONLIST")
+
+print(
+    "[CFG] "
+    f"GUARDRAILS VOLRATIO_MAX={VOLRATIO_MAX} VOLRATIO_MAX_CAUTION={VOLRATIO_MAX_CAUTION} "
+    f"RSI_SHORT_MIN={RSI_SHORT_MIN} RSI_LONG_MAX={RSI_LONG_MAX} "
+    f"AI_PCT_MIN={AI_PCT_MIN} AI_PCT_MAX={AI_PCT_MAX} AI_PCT_MAX_CAUTION={AI_PCT_MAX_CAUTION} "
+    f"SYMBOL_BLOCKLIST={sorted(list(SYMBOL_BLOCKLIST))} "
+    f"SYMBOL_CAUTIONLIST={sorted(list(SYMBOL_CAUTIONLIST))}"
+)
+
+
+# --- Advanced toggles (SAFE DEFAULT: OFF) ---
+ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
+E_TH = float(os.environ.get("E_TH", "0.0"))
+
+
+
 # --- Advanced toggles (SAFE DEFAULT: OFF) ---
 ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
 E_TH = float(os.environ.get("E_TH", "0.0"))
@@ -2209,8 +2260,71 @@ def logic_main(force: bool = False):
 
             pending_candidates.append(item)
 
-            if ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
+            # ==========================================================
+            # Guardrails (env): table/Discord 採用の前に弾く
+            # ※learn_log 側の候補ログは残す（後で検証・学習に使える）
+            # ==========================================================
+            guard_ok = True
+            sym_u = str(item.get("symbol", "")).strip().upper()
+
+            # 1) 銘柄ブロック
+            if sym_u in SYMBOL_BLOCKLIST:
+                guard_ok = False
+                print(f"[GR] skip alert (blocklist) sym={sym_u}")
+
+            # 2) RSI ガード
+            if guard_ok:
+                try:
+                    rsi_v = float(item.get("rsi", 0.0))
+                    if bool(item.get("is_sell", False)) and (rsi_v < RSI_SHORT_MIN):
+                        guard_ok = False
+                        print(f"[GR] skip alert sym={sym_u} side=SHORT rsi={rsi_v:.2f} < {RSI_SHORT_MIN}")
+                    if bool(item.get("is_buy", False)) and (rsi_v > RSI_LONG_MAX):
+                        guard_ok = False
+                        print(f"[GR] skip alert sym={sym_u} side=LONG rsi={rsi_v:.2f} > {RSI_LONG_MAX}")
+                except Exception:
+                    pass
+
+            # 3) VolRatio 上限（慎重銘柄は別閾値）
+            if guard_ok:
+                vr = item.get("vol_ratio", "")
+                if vr != "":
+                    try:
+                        vr_f = float(vr)
+                        vr_max = VOLRATIO_MAX_CAUTION if (sym_u in SYMBOL_CAUTIONLIST) else VOLRATIO_MAX
+                        if vr_f > vr_max:
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} volratio={vr_f:.3f} > {vr_max}")
+                    except Exception:
+                        pass
+
+            # 4) AI% レンジ（下限/上限。慎重銘柄は上限を別閾値）
+            if guard_ok:
+                if item.get("ai_score", None) is not None:
+                    try:
+                        ai_pct = float(item["ai_score"]) * 100.0
+                        ai_max = AI_PCT_MAX_CAUTION if (sym_u in SYMBOL_CAUTIONLIST) else AI_PCT_MAX
+
+                        if ai_pct < AI_PCT_MIN:
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} ai_pct={ai_pct:.2f} < {AI_PCT_MIN}")
+
+                        if guard_ok and ai_pct > ai_max:
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} ai_pct={ai_pct:.2f} > {ai_max}")
+                    except Exception:
+                        pass
+
+            # 5) 慎重銘柄：AI bypass（fail-open等）では採用しない
+            #    ※bypassed 変数はこのスコープにある前提（現状コード通り）
+            if guard_ok:
+                if (sym_u in SYMBOL_CAUTIONLIST) and bypassed:
+                    guard_ok = False
+                    print(f"[GR] skip alert (caution + ai_bypassed) sym={sym_u}")
+
+            if guard_ok and ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
                 pending_alerts.append(item)
+
 
         except Exception as e:
             print(f"[ERR] {symbol} fetch/compute: {e}")
