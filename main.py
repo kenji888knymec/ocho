@@ -1156,6 +1156,7 @@ def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd
             aligned[col] = np.nan
     return aligned
 
+
 def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
     """
     方針：
@@ -1176,7 +1177,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
             debug["action"] = "model_none_bypass"
             return None, True, debug
 
-        # 1) wrapper を剥がす
+        # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
@@ -1188,6 +1189,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
+        # unwrap した結果でも predict_proba が無いならバイパス
         if not hasattr(model, "predict_proba"):
             debug["action"] = "no_predict_proba_bypass"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
@@ -1218,12 +1220,13 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return None, True, debug
 
-        # 4) 欠損があるなら予測しない（固定値で補完しない）
+        # ★欠損があるなら予測しない（固定値で補完しない）
         if feats.isna().any(axis=None):
             debug["action"] = "nan_input_bypass"
             debug["error"] = "input contains NaN; skip predict_proba"
             return None, True, debug
 
+        # 4) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1238,6 +1241,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
         debug["error"] = f"{type(e).__name__}: {e}"
         print(f"[AI] safe_predict_proba bypass: {debug['error']}")
         return None, True, debug
+
 
 
 
