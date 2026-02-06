@@ -1245,6 +1245,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
 
 
 
+
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
     """
     learn_log の ai_debug に入れる値を決める
