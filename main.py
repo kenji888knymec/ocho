@@ -1143,15 +1143,25 @@ def _infer_expected_n_features(model) -> int:
         return -1
 
 def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd.DataFrame:
+    """
+    方針：
+      - 欠損や変換不能は埋めない（NaNのまま）
+      - 期待列に無い列は作るが、中身は NaN（固定値0で埋めない）
+    """
     aligned = pd.DataFrame(index=feats.index)
     for col in expected_cols:
         if col in feats.columns:
-            aligned[col] = pd.to_numeric(feats[col], errors="coerce").fillna(0.0)
+            aligned[col] = pd.to_numeric(feats[col], errors="coerce")
         else:
-            aligned[col] = 0.0
+            aligned[col] = np.nan
     return aligned
 
-def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
+    """
+    方針：
+      - 欠損（NaN/Inf）が入力に残るなら predict_proba しない（bypass）
+      - bypass 時は proba=None を返す（固定値 0.5/0.5 を返さない）
+    """
     debug: Dict[str, Any] = {
         "expected_cols": None,
         "expected_n_features": -1,
@@ -1164,10 +1174,9 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         # 0) model が None の場合は即バイパス
         if model is None:
             debug["action"] = "model_none_bypass"
-            return np.array([[0.5, 0.5]], dtype=float), True, debug
+            return None, True, debug
 
-        # 1) 重要：model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
-        #    （ここがないと 'dict' object has no attribute predict_proba になります）
+        # 1) wrapper を剥がす
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
@@ -1179,20 +1188,19 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
-        # unwrap した結果でも predict_proba が無いならバイパス
         if not hasattr(model, "predict_proba"):
             debug["action"] = "no_predict_proba_bypass"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
-            print(f"[AI] safe_predict_proba fallback: {debug['error']}")
-            return np.array([[0.5, 0.5]], dtype=float), True, debug
+            print(f"[AI] safe_predict_proba bypass: {debug['error']}")
+            return None, True, debug
 
-        # 2) feats の整形
+        # 2) feats の整形（埋めない）
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
-        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
         # 3) 特徴量の整合
@@ -1208,9 +1216,14 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             if expected_n > 0 and int(feats.shape[1]) != int(expected_n):
                 debug["action"] = "feature_count_mismatch_bypass"
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
-                return np.array([[0.5, 0.5]], dtype=float), True, debug
+                return None, True, debug
 
-        # 4) predict_proba 実行
+        # 4) 欠損があるなら予測しない（固定値で補完しない）
+        if feats.isna().any(axis=None):
+            debug["action"] = "nan_input_bypass"
+            debug["error"] = "input contains NaN; skip predict_proba"
+            return None, True, debug
+
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1223,8 +1236,9 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
     except Exception as e:
         debug["action"] = "exception_bypass"
         debug["error"] = f"{type(e).__name__}: {e}"
-        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
-        return np.array([[0.5, 0.5]], dtype=float), True, debug
+        print(f"[AI] safe_predict_proba bypass: {debug['error']}")
+        return None, True, debug
+
 
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
@@ -2013,12 +2027,14 @@ def logic_main(force: bool = False):
 
     exchange = build_exchange()
 
+
     btc_mode = "Range"
-    btc_1h_change = 0.0
-    median_sigma = 0.0
-    btc_ret = 0.0
-    btc_vol = 0.0
+    btc_1h_change = np.nan
+    median_sigma = np.nan
+    btc_ret = np.nan
+    btc_vol = np.nan
     btc_ok = False
+
 
     try:
         btc_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=60)
@@ -2027,7 +2043,8 @@ def logic_main(force: bool = False):
 
         btc_df = pd.DataFrame(btc_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
         btc_df["Pct_Change"] = btc_df["Close"].pct_change(fill_method=None)
-        btc_df["Dynamic_Sigma"] = btc_df["Pct_Change"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
+        btc_df["Dynamic_Sigma"] = btc_df["Pct_Change"].rolling(20).std()
+
 
         median_sigma = float(btc_df["Dynamic_Sigma"].tail(20).median())
         btc_current = float(btc_df.iloc[-2]["Close"])
@@ -2077,18 +2094,26 @@ def logic_main(force: bool = False):
 
             df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
             df["Pct_Change"] = df["Close"].pct_change(fill_method=None)
-            df["Dynamic_Sigma"] = df["Pct_Change"].rolling(20).std().fillna(0.01).clip(lower=1e-4)
-
+            df["Dynamic_Sigma"] = df["Pct_Change"].rolling(20).std()
+            
             df["MA20"] = df["Close"].rolling(20).mean()
             df["Upper2"] = df["MA20"] + (2 * df["Close"] * df["Dynamic_Sigma"])
             df["Lower2"] = df["MA20"] - (2 * df["Close"] * df["Dynamic_Sigma"])
-            df["BandWidth"] = np.where(df["MA20"] != 0, (df["Upper2"] - df["Lower2"]) / df["MA20"], 0)
+            
+            # MA20==0 は計算不能なので「0固定」せず NaN にする
+            df["BandWidth"] = np.where(
+                df["MA20"].abs() > 1e-12,
+                (df["Upper2"] - df["Lower2"]) / df["MA20"],
+                np.nan,
+            )
 
-            df["BW_Change"] = df["BandWidth"].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
-            df["RSI"] = calculate_rsi(df["Close"]).replace([np.inf, -np.inf], np.nan).fillna(50)
-
+            
+            df["BW_Change"] = df["BandWidth"].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+            df["RSI"] = calculate_rsi(df["Close"]).replace([np.inf, -np.inf], np.nan)
+            
             v = pd.to_numeric(df["Volume"], errors="coerce").replace(0, np.nan)
-            df["Vol_Change"] = v.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0)
+            df["Vol_Change"] = v.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+
 
             df["Drop_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x < 0 else 0) / df["Dynamic_Sigma"]
             df["Rise_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x > 0 else 0) / df["Dynamic_Sigma"]
@@ -2096,6 +2121,46 @@ def logic_main(force: bool = False):
             df["Vol_MA20"] = pd.to_numeric(df["Volume"], errors="coerce").rolling(20).mean()
 
             row = df.iloc[-2]
+            
+            # 欠損・非finiteがある行は「補完せず」候補化しない（continue）
+            required_cols = [
+                "Dynamic_Sigma",
+                "BandWidth",
+                "BW_Change",
+                "RSI",
+                "Vol_Change",
+                "Pct_Change",
+            ]
+            
+            ok_row = True
+            for c in required_cols:
+                val = row.get(c, np.nan)
+                if pd.isna(val):
+                    ok_row = False
+                    break
+                try:
+                    fv = float(val)
+                    if not np.isfinite(fv):
+                        ok_row = False
+                        break
+                except Exception:
+                    ok_row = False
+                    break
+            
+            # Dynamic_Sigma は正（>0）である必要
+            if ok_row:
+                try:
+                    if float(row["Dynamic_Sigma"]) <= 0.0:
+                        ok_row = False
+                except Exception:
+                    ok_row = False
+            
+            if not ok_row:
+                continue
+
+
+
+            
             chg = safe_float(row.get("Pct_Change", None), default="")
             chg_pct_val = "" if chg == "" else (chg * 100.0)
 
@@ -2166,17 +2231,31 @@ def logic_main(force: bool = False):
                     "BTC_Vol": float(btc_vol),
                 }])
 
+
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
+            
+                # bypass なら予測しない（固定値判定もしない）
                 if bypass_x:
                     return None, True, (dbg_x or {})
+            
+                # 念のため：None は絶対にパースしない（事故率低下）
+                if proba_x is None:
+                    d = (dbg_x or {})
+                    if isinstance(d, dict):
+                        d["error"] = "no_proba"
+                    return None, True, d if isinstance(d, dict) else {"error": "no_proba"}
+            
                 try:
                     s = float(proba_x[0][1])
                 except Exception:
                     return None, True, {"error": "proba_parse_failed"}
+            
                 if not np.isfinite(s):
                     return None, True, {"error": "non_finite_score"}
+            
                 return float(s), False, (dbg_x or {})
+
 
             # base 採点
             score_b, bypass_b, dbg_b = _score_side(base_side)
@@ -3029,17 +3108,9 @@ def ai_smoke():
     - safe_predict_proba が bypass / None / 形不正でも 500 を出さない
     - score は取れれば返す。取れなければ None のまま返す
     """
-    feats = pd.DataFrame([{
-        "Sigma": 0.001,
-        "BandWidth": 0.01,
-        "BW_Change": 0.0,
-        "RSI": 50.0,
-        "Vol_Change": 0.0,
-        "Rise_Score": 0.0,
-        "Drop_Score": 0.0,
-        "BTC_Ret": 0.0,
-        "BTC_Vol": 0.0,
-    }])
+    # 固定値を入れない：欠損入力→safe_predict_proba が bypass できることを確認する
+    feats = pd.DataFrame([{}])
+
 
     proba = None
     bypassed = True
