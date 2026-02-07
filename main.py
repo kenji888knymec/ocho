@@ -2441,14 +2441,10 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
-            # ai_pass 判定（既存仕様：bypass時は fail-open/closed）
+            # ai_pass 判定（方針：bypass時は「予測しない」＝通知しない）
             if bypassed:
-                if FAIL_CLOSED_ON_AI_BYPASS:
-                    ai_pass = False
-                    print(f"[AI] bypassed -> FAIL-CLOSED in logic_main sym={sym_code}: {dbg}")
-                else:
-                    ai_pass = True
-                    print(f"[AI] bypassed -> FAIL-OPEN in logic_main sym={sym_code}: {dbg}")
+                ai_pass = False
+                print(f"[AI] bypassed -> SKIP (no alert) in logic_main sym={sym_code}: {dbg}")
             else:
                 ai_pass = (float(ai_score) >= float(ai_th_used))
 
@@ -2539,8 +2535,12 @@ def logic_main(force: bool = False):
                     guard_ok = False
                     print(f"[GR] skip alert (caution + ai_bypassed) sym={sym_u}")
 
-            if guard_ok and ai_pass and BTC_CALM and item["score"] >= ALERT_SIGMA:
+            # 重要：通知判定は「AI Pass を最終ゲート」にする（scoreは順位付け用に降格）
+            if guard_ok and ai_pass and BTC_CALM:
+                if float(item.get("score", 0.0)) < float(ALERT_SIGMA):
+                    print(f"[DBG] alert_by_ai sym={sym_u} score={float(item.get('score', 0.0)):.3f} < ALERT_SIGMA={ALERT_SIGMA} (score used only for ranking)")
                 pending_alerts.append(item)
+
 
 
         except Exception as e:
