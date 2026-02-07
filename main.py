@@ -1282,14 +1282,14 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 4) NaN が残っていたら「0埋めして予測を続行」
+        # 4) 方針：NaN が残っていたら「固定値で埋めずに予測しない（bypass）」
         if isinstance(feats, pd.DataFrame):
             if feats.shape[1] == 0:
-                debug["action"] = "empty_features_fallback"
+                debug["action"] = "empty_features_bypass"
                 debug["error"] = "no features after alignment"
-                return np.array([[0.5, 0.5]], dtype=float), True, debug
+                return None, True, debug
 
-            # inf も NaN 扱いにしてから 0 補完（replace → fillna）
+            # inf は NaN 扱い（ただし 0 埋めはしない）
             feats = feats.replace([np.inf, -np.inf], np.nan)
 
             mask = feats.isna()
@@ -1299,10 +1299,13 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
 
                 debug["nan_cols"] = nan_cols
                 debug["nan_n_cols"] = int(len(nan_cols))
-                debug["nan_filled"] = nan_cnt
-                debug["action"] = "nan_filled_zero"
+                debug["nan_cnt"] = nan_cnt
+                debug["nan_filled"] = 0
+                debug["action"] = "nan_input_bypass"
+                debug["error"] = "input contains NaN; skip predict_proba"
 
-                feats = feats.fillna(0.0)
+                return None, True, debug
+
 
         # 5) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
