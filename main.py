@@ -2702,10 +2702,72 @@ def logic_main(force: bool = False):
 
     if candidate_rows:
         append_rows_to_sheet(LEARN_SHEET_NAME, candidate_rows, learn_fields)
-
-
+    
+    # ===== DEBUG: observation only (no behavior change) =====
+    try:
+        _pc = pending_candidates or []
+        _pa = pending_alerts or []
+    
+        _cnt = {
+            "pending_candidates": int(len(_pc)),
+            "pending_alerts": int(len(_pa)),
+            "ai_missing": 0,          # ai_score が None
+            "ai_pass_true": 0,        # ai_pass が True
+            "ai_pass_false": 0,       # ai_pass が False/未設定
+            "score_ge_alert_sigma": 0,
+            "score_lt_alert_sigma": 0,
+            "volratio_over_max": 0,
+        }
+    
+        for _it in _pc:
+            if not isinstance(_it, dict):
+                continue
+    
+            _ai = _it.get("ai_score", None)
+            if _ai is None:
+                _cnt["ai_missing"] += 1
+    
+            if bool(_it.get("ai_pass", False)):
+                _cnt["ai_pass_true"] += 1
+            else:
+                _cnt["ai_pass_false"] += 1
+    
+            # score と ALERT_SIGMA（存在する時だけ観測）
+            try:
+                _sc = float(_it.get("score", float("nan")))
+                if np.isfinite(_sc):
+                    if _sc >= float(ALERT_SIGMA):
+                        _cnt["score_ge_alert_sigma"] += 1
+                    else:
+                        _cnt["score_lt_alert_sigma"] += 1
+            except Exception:
+                pass
+    
+            # vol_ratio 上限（存在する時だけ観測）
+            try:
+                _vr = _it.get("vol_ratio", None)
+                if _vr is not None and np.isfinite(float(_vr)):
+                    _sym_u = str(_it.get("symbol", "")).split("/")[0].split("-")[0].strip().upper()
+                    _vr_max = float(VOLRATIO_MAX_CAUTION) if (_sym_u in SYMBOL_CAUTIONLIST) else float(VOLRATIO_MAX)
+                    if float(_vr) > float(_vr_max):
+                        _cnt["volratio_over_max"] += 1
+            except Exception:
+                pass
+    
+        print(
+            f"[DBG] obs_summary "
+            f"candidates={_cnt['pending_candidates']} alerts={_cnt['pending_alerts']} "
+            f"BTC_CALM={BTC_CALM} btc_ok={btc_ok} btc_mode={btc_mode} "
+            f"AI_TH={AI_TH} ALERT_SIGMA={ALERT_SIGMA} VOLRATIO_MAX={VOLRATIO_MAX} "
+            f"cnt={_cnt}"
+        )
+    except Exception as _e:
+        print(f"[DBG] obs_summary_failed: {_e}")
+    # ===== /DEBUG =====
+    
     # いったんスコア順に並べる（ここではまだ上位制限しない）
     filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
+
 
     count = 0
     alert_rows: List[List[Any]] = []
