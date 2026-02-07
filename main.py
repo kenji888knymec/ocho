@@ -1157,25 +1157,24 @@ def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd
     return aligned
 
 
-def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
-    """
-    方針：
-      - 欠損（NaN/Inf）が入力に残るなら predict_proba しない（bypass）
-      - bypass 時は proba=None を返す（固定値 0.5/0.5 を返さない）
-    """
+def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "expected_cols": None,
         "expected_n_features": -1,
         "input_n_features": -1,
         "action": "none",
         "error": "",
+        # NaN原因特定用（常にキーを持たせる）
+        "nan_cols": None,
+        "nan_n_cols": None,
+        "alias_renamed": None,
     }
 
     try:
-        # 0) model が None の場合は即バイパス
+        # 0) model が None の場合は即フォールバック（ニュートラル）
         if model is None:
-            debug["action"] = "model_none_bypass"
-            return None, True, debug
+            debug["action"] = "model_none_fallback"
+            return np.array([[0.5, 0.5]], dtype=float), True, debug
 
         # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
         if isinstance(model, dict):
@@ -1189,48 +1188,123 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
-        # unwrap した結果でも predict_proba が無いならバイパス
+        # unwrap した結果でも predict_proba が無いならフォールバック
         if not hasattr(model, "predict_proba"):
-            debug["action"] = "no_predict_proba_bypass"
+            debug["action"] = "no_predict_proba_fallback"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
-            print(f"[AI] safe_predict_proba bypass: {debug['error']}")
-            return None, True, debug
+            print(f"[AI] safe_predict_proba fallback: {debug['error']}")
+            return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # 2) feats の整形（埋めない）
+        # 2) feats の整形
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
+        # inf は NaN にする（このあと 0 埋めする）
         feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
-        # 3) 特徴量の整合
+        # 14列モデルに対して列順だけ固定したい場合
+        FEATURE_COLUMNS_14 = [
+            "EntryPrice",
+            "ScoreSigma",
+            "VolSigma",
+            "TP",
+            "SL",
+            "TP_Pct",
+            "SL_Pct",
+            "Leverage",
+            "Reserved1",
+            "Reserved2",
+            "Reserved3",
+            "Reserved4",
+            "BTC_1h_Change",
+            "RSI",
+        ]
+        try:
+            if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
+                expected_n = int(getattr(model, "n_features_in_", 0) or 0)
+                if expected_n == 14:
+                    feats = feats.reindex(columns=FEATURE_COLUMNS_14)
+                    debug["input_n_features"] = int(feats.shape[1])
+        except Exception:
+            pass
+
+        # 3) 特徴量の整合（feature_names_in_ に追従）
         expected_cols = _extract_feature_names(model)
         if expected_cols:
+            expected_cols = [str(c) for c in list(expected_cols)]
             debug["expected_cols"] = list(expected_cols)
+            debug["expected_n_features"] = int(len(expected_cols))
+
+            # 列名揺れ吸収（スペース/アンダースコアの違い等）
+            try:
+                rename_map = {}
+                if isinstance(feats, pd.DataFrame):
+                    feats_cols = set(str(c) for c in feats.columns)
+
+                    for c in expected_cols:
+                        if c in feats_cols:
+                            continue
+
+                        candidates = [
+                            c.replace("_", " "),
+                            c.replace(" ", "_"),
+                        ]
+
+                        if c == "BandWidth":
+                            candidates += ["Bandwidth", "Band_Width", "Band Width"]
+                        elif c == "Bandwidth":
+                            candidates += ["BandWidth", "Band_Width", "Band Width"]
+
+                        for cand in candidates:
+                            if cand in feats_cols:
+                                rename_map[cand] = c
+                                feats_cols.remove(cand)
+                                feats_cols.add(c)
+                                break
+
+                    if rename_map:
+                        feats = feats.rename(columns=rename_map)
+                        debug["alias_renamed"] = dict(rename_map)
+
+            except Exception:
+                pass
+
             feats = _align_by_feature_names(feats, expected_cols)
             debug["action"] = "aligned_by_feature_names"
-            debug["expected_n_features"] = int(len(expected_cols))
         else:
             expected_n = _infer_expected_n_features(model)
             debug["expected_n_features"] = int(expected_n)
             if expected_n > 0 and int(feats.shape[1]) != int(expected_n):
-                debug["action"] = "feature_count_mismatch_bypass"
+                debug["action"] = "feature_count_mismatch_fallback"
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
-                return None, True, debug
+                return np.array([[0.5, 0.5]], dtype=float), True, debug
 
-        # ★欠損があるなら 0 補完して続行する（予測を止めない）
-        nan_cnt = int(feats.isna().sum().sum())
-        if nan_cnt > 0:
-            # inf も NaN 扱いにしてから 0 補完（念のため）
-            feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        
-            debug["action"] = "nan_filled_zero"
-            debug["nan_filled"] = nan_cnt
+        # 4) NaN が残っていたら「0埋めして予測を続行」
+        if isinstance(feats, pd.DataFrame):
+            if feats.shape[1] == 0:
+                debug["action"] = "empty_features_fallback"
+                debug["error"] = "no features after alignment"
+                return np.array([[0.5, 0.5]], dtype=float), True, debug
 
+            # inf も NaN 扱いにしてから 0 補完（replace → fillna）
+            feats = feats.replace([np.inf, -np.inf], np.nan)
 
-        # 4) predict_proba 実行
+            mask = feats.isna()
+            if mask.any().any():
+                nan_cols = [c for c in feats.columns if mask[c].any()]
+                nan_cnt = int(mask.sum().sum())
+
+                debug["nan_cols"] = nan_cols
+                debug["nan_n_cols"] = int(len(nan_cols))
+                debug["nan_filled"] = nan_cnt
+                debug["action"] = "nan_filled_zero"
+
+                feats = feats.fillna(0.0)
+
+        # 5) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1241,14 +1315,10 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
         return proba, False, debug
 
     except Exception as e:
-        debug["action"] = "exception_bypass"
+        debug["action"] = "exception_fallback"
         debug["error"] = f"{type(e).__name__}: {e}"
-        print(f"[AI] safe_predict_proba bypass: {debug['error']}")
-        return None, True, debug
-
-
-
-
+        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
+        return np.array([[0.5, 0.5]], dtype=float), True, debug
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
     """
