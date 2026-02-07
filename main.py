@@ -1220,11 +1220,15 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return None, True, debug
 
-        # ★欠損があるなら予測しない（固定値で補完しない）
-        if feats.isna().any(axis=None):
-            debug["action"] = "nan_input_bypass"
-            debug["error"] = "input contains NaN; skip predict_proba"
-            return None, True, debug
+        # ★欠損があるなら 0 補完して続行する（予測を止めない）
+        nan_cnt = int(feats.isna().sum().sum())
+        if nan_cnt > 0:
+            # inf も NaN 扱いにしてから 0 補完（念のため）
+            feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        
+            debug["action"] = "nan_filled_zero"
+            debug["nan_filled"] = nan_cnt
+
 
         # 4) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
