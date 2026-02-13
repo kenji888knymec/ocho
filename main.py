@@ -133,6 +133,25 @@ def _parse_symbol_set(env_name: str) -> set:
     raw = raw.replace("|", ",").replace(" ", ",")
     return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
+def _parse_float_range(env_name: str):
+    raw = os.environ.get(env_name, "").strip()
+    if raw == "":
+        return None, None
+    # "0.005,0.006" / "0.005-0.006" / "0.005〜0.006" などを許容
+    s = raw.replace("〜", ",").replace("~", ",").replace("-", ",").replace("|", ",").replace(" ", ",")
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) < 2:
+        print(f"[CFG] invalid {env_name}={raw} -> disabled")
+        return None, None
+    try:
+        a = float(parts[0])
+        b = float(parts[1])
+        lo, hi = (a, b) if a <= b else (b, a)
+        return lo, hi
+    except Exception:
+        print(f"[CFG] invalid {env_name}={raw} -> disabled")
+        return None, None
+
 # 数値系（未設定ならフィルター無効：inf/-inf になる）
 VOLRATIO_MAX = _env_float("VOLRATIO_MAX", float("inf"))           # 例: 2.0
 RSI_SHORT_MIN = _env_float("RSI_SHORT_MIN", float("-inf"))        # 例: 20
@@ -149,14 +168,20 @@ AI_PCT_MAX_CAUTION = _env_float("AI_PCT_MAX_CAUTION", AI_PCT_MAX)        # 例: 
 SYMBOL_BLOCKLIST = _parse_symbol_set("SYMBOL_BLOCKLIST")
 SYMBOL_CAUTIONLIST = _parse_symbol_set("SYMBOL_CAUTIONLIST")
 
+# 追加: VolSigma 禁止レンジ（sigma がこの範囲なら alert 採用しない）
+# 例: VOLSIGMA_BAN_RANGE="0.005,0.006" （空なら無効）
+VOLSIGMA_BAN_MIN, VOLSIGMA_BAN_MAX = _parse_float_range("VOLSIGMA_BAN_RANGE")
+
 print(
     "[CFG] "
     f"GUARDRAILS VOLRATIO_MAX={VOLRATIO_MAX} VOLRATIO_MAX_CAUTION={VOLRATIO_MAX_CAUTION} "
     f"RSI_SHORT_MIN={RSI_SHORT_MIN} RSI_LONG_MAX={RSI_LONG_MAX} "
     f"AI_PCT_MIN={AI_PCT_MIN} AI_PCT_MAX={AI_PCT_MAX} AI_PCT_MAX_CAUTION={AI_PCT_MAX_CAUTION} "
     f"SYMBOL_BLOCKLIST={sorted(list(SYMBOL_BLOCKLIST))} "
-    f"SYMBOL_CAUTIONLIST={sorted(list(SYMBOL_CAUTIONLIST))}"
+    f"SYMBOL_CAUTIONLIST={sorted(list(SYMBOL_CAUTIONLIST))} "
+    f"VOLSIGMA_BAN_RANGE={VOLSIGMA_BAN_MIN}-{VOLSIGMA_BAN_MAX}"
 )
+
 
 
 # --- Advanced toggles (SAFE DEFAULT: OFF) ---
@@ -2477,6 +2502,7 @@ def logic_main(force: bool = False):
             # Guardrails (env): table/Discord 採用の前に弾く
             # ※learn_log 側の候補ログは残す（後で検証・学習に使える）
             # ==========================================================
+
             guard_ok = True
             sym_u = str(item.get("symbol", "")).strip().upper()
 
@@ -2497,6 +2523,33 @@ def logic_main(force: bool = False):
                         print(f"[GR] skip alert sym={sym_u} side=LONG rsi={rsi_v:.2f} > {RSI_LONG_MAX}")
                 except Exception:
                     pass
+
+            # 2.6) VolSigma（sigma）チェック
+            #      方針:
+            #        - sigma が取れない / 変換できない / NaN / inf の候補は「アラート採用しない」
+            #        - VOLSIGMA_BAN_RANGE が設定されている場合だけ、禁止レンジ内も「アラート採用しない」
+            if guard_ok:
+                try:
+                    vs_raw = item.get("sigma", None)
+                    if vs_raw is None or str(vs_raw).strip() == "":
+                        guard_ok = False
+                        print(f"[GR] skip alert sym={sym_u} vols=missing (no-signal)")
+                    else:
+                        vs = float(vs_raw)
+
+                        # NaN / inf を invalid 扱い
+                        if (vs != vs) or (vs == float("inf")) or (vs == float("-inf")):
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} vols=invalid (no-signal)")
+                        else:
+                            # 禁止レンジが有効な時だけ適用
+                            if (VOLSIGMA_BAN_MIN is not None) and (VOLSIGMA_BAN_MAX is not None):
+                                if float(VOLSIGMA_BAN_MIN) <= vs <= float(VOLSIGMA_BAN_MAX):
+                                    guard_ok = False
+                                    print(f"[GR] skip alert sym={sym_u} vols={vs:.6f} in [{VOLSIGMA_BAN_MIN},{VOLSIGMA_BAN_MAX}]")
+                except Exception:
+                    guard_ok = False
+                    print(f"[GR] skip alert sym={sym_u} vols=invalid (no-signal)")
 
             # 3) VolRatio 上限（慎重銘柄は別閾値）
             if guard_ok:
@@ -2535,11 +2588,12 @@ def logic_main(force: bool = False):
                     guard_ok = False
                     print(f"[GR] skip alert (caution + ai_bypassed) sym={sym_u}")
 
-            # 重要：通知判定は「AI Pass を最終ゲート」にする（scoreは順位付け用に降格）
+            # 重要：通知判定は「AI Pass」を最終ゲートにする（VolSigmaはランキング用で残す）
             if guard_ok and ai_pass and BTC_CALM:
                 if float(item.get("score", 0.0)) < float(ALERT_SIGMA):
-                    print(f"[DBG] alert_by_ai sym={sym_u} score={float(item.get('score', 0.0)):.3f} < ALERT_SIGMA={ALERT_SIGMA} (score used only for ranking)")
+                    print(f"[DBG] score below alert_sigma but still add. score={item.get('score')} alert_sigma={ALERT_SIGMA}")
                 pending_alerts.append(item)
+
 
 
 
