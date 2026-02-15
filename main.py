@@ -2614,8 +2614,8 @@ def logic_main(force: bool = False):
             continue
 
     def calc_tp_sl(item):
-        tp_mult = 3.8
-        sl_mult = 1.5
+        tp_mult = 3.5
+        sl_mult = 1.8
         cp = float(item["close"])
         sig = float(item["sigma"])
         if item["is_buy"]:
