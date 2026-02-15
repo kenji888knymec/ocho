@@ -1182,7 +1182,13 @@ def _align_by_feature_names(feats: pd.DataFrame, expected_cols: List[str]) -> pd
     return aligned
 
 
-def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Dict[str, Any]]:
+def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray], bool, Dict[str, Any]]:
+    """
+    安全な predict_proba ラッパー。
+    方針:
+      - 予測不能/不整合/NaN混入など「信用できない入力」は固定値で埋めずに bypass（予測しない）
+      - 返り値: (proba or None, bypassed, debug)
+    """
     debug: Dict[str, Any] = {
         "expected_cols": None,
         "expected_n_features": -1,
@@ -1192,14 +1198,16 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         # NaN原因特定用（常にキーを持たせる）
         "nan_cols": None,
         "nan_n_cols": None,
+        "nan_cnt": None,
+        "nan_filled": 0,
         "alias_renamed": None,
     }
 
     try:
-        # 0) model が None の場合は即フォールバック（ニュートラル）
+        # 0) model が None の場合は bypass（推測値で埋めない）
         if model is None:
-            debug["action"] = "model_none_fallback"
-            return np.array([[0.5, 0.5]], dtype=float), True, debug
+            debug["action"] = "model_none_bypass"
+            return None, True, debug
 
         # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
         if isinstance(model, dict):
@@ -1213,12 +1221,12 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
-        # unwrap した結果でも predict_proba が無いならフォールバック
+        # unwrap した結果でも predict_proba が無いなら bypass
         if not hasattr(model, "predict_proba"):
-            debug["action"] = "no_predict_proba_fallback"
+            debug["action"] = "no_predict_proba_bypass"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
-            print(f"[AI] safe_predict_proba fallback: {debug['error']}")
-            return np.array([[0.5, 0.5]], dtype=float), True, debug
+            print(f"[AI] safe_predict_proba bypass: {debug['error']}")
+            return None, True, debug
 
         # 2) feats の整形
         if feats is None:
@@ -1226,7 +1234,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
-        # inf は NaN にする（このあと 0 埋めする）
+        # inf は NaN にする（埋めずに bypass 判定へ）
         feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
@@ -1303,9 +1311,9 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
             expected_n = _infer_expected_n_features(model)
             debug["expected_n_features"] = int(expected_n)
             if expected_n > 0 and int(feats.shape[1]) != int(expected_n):
-                debug["action"] = "feature_count_mismatch_fallback"
+                debug["action"] = "feature_count_mismatch_bypass"
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
-                return np.array([[0.5, 0.5]], dtype=float), True, debug
+                return None, True, debug
 
         # 4) 方針：NaN が残っていたら「固定値で埋めずに予測しない（bypass）」
         if isinstance(feats, pd.DataFrame):
@@ -1314,7 +1322,6 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["error"] = "no features after alignment"
                 return None, True, debug
 
-            # inf は NaN 扱い（ただし 0 埋めはしない）
             feats = feats.replace([np.inf, -np.inf], np.nan)
 
             mask = feats.isna()
@@ -1328,9 +1335,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
                 debug["nan_filled"] = 0
                 debug["action"] = "nan_input_bypass"
                 debug["error"] = "input contains NaN; skip predict_proba"
-
                 return None, True, debug
-
 
         # 5) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
@@ -1343,10 +1348,11 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[np.ndarray, bool, Di
         return proba, False, debug
 
     except Exception as e:
-        debug["action"] = "exception_fallback"
+        debug["action"] = "exception_bypass"
         debug["error"] = f"{type(e).__name__}: {e}"
-        print(f"[AI] safe_predict_proba fallback: {debug['error']}")
-        return np.array([[0.5, 0.5]], dtype=float), True, debug
+        print(f"[AI] safe_predict_proba bypass: {debug['error']}")
+        return None, True, debug
+
 
 def derive_ai_debug(btc_mode: str, signal_type: str, side: str) -> str:
     """
@@ -2861,13 +2867,17 @@ def logic_main(force: bool = False):
 
         # --- Expected value filter (SAFE DEFAULT: OFF) ---
         if ENABLE_E_FILTER:
-            # p_win は AI score があればそれ、無ければ 0.5（最小安全実装）
-            p_win = 0.5 if (item.get("ai_score", None) is None) else float(item["ai_score"])
+            if item.get("ai_score", None) is None:
+                print(f"[EV] filtered sym={sym} reason=no_ai_score_for_ev")
+                continue
+        
+            p_win = float(item["ai_score"])
             exp_ret = (p_win * float(tp_pct)) - ((1.0 - p_win) * float(sl_pct))
-
+        
             if exp_ret < float(E_TH):
                 print(f"[EV] filtered sym={sym} exp_ret={exp_ret:.4f} < E_TH={E_TH}")
                 continue
+
 
         cp = float(item["close"])
         lev = DEFAULT_LEV
