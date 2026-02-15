@@ -2474,9 +2474,6 @@ def logic_main(force: bool = False):
                 ai_pass = (float(ai_score) >= float(ai_th_used))
 
 
-
-
-
             item = {
                 "symbol": symbol.replace("/USDT", ""),
                 "time": int(row["Time"]),
@@ -2493,10 +2490,19 @@ def logic_main(force: bool = False):
                 "ai_debug": dbg,
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
+            
+                # --- learn_log に書き戻したい値は item に持たせる（row参照を消す） ---
+                "BandWidth": float(row["BandWidth"]),
+                "BW_Change": float(row["BW_Change"]),
+                "Vol_Change": float(row["Vol_Change"]),
+                # market_ai_* は今このスニペット内で row に無いので、空で持たせる（将来拡張用）
+                "market_ai_score": "",
+                "market_ai_pass": "",
+                "market_ai_debug": "",
             }
-
-
+            
             pending_candidates.append(item)
+
 
             # ==========================================================
             # Guardrails (env): table/Discord 採用の前に弾く
@@ -2705,15 +2711,16 @@ def logic_main(force: bool = False):
             except Exception:
                 return ""
 
-        bw_val = _f_or_blank(row.get("BandWidth", ""))
-        bw_chg_val = _f_or_blank(row.get("BW_Change", ""))
-        vol_chg_val = _f_or_blank(row.get("Vol_Change", ""))
+        bw_val = _f_or_blank(item.get("BandWidth", ""))
+        bw_chg_val = _f_or_blank(item.get("BW_Change", ""))
+        vol_chg_val = _f_or_blank(item.get("Vol_Change", ""))
         btc_ret_val = _f_or_blank(btc_ret)
         btc_vol_val = _f_or_blank(btc_vol)
+        
+        m_ai_score = item.get("market_ai_score", "")
+        m_ai_pass = item.get("market_ai_pass", "")
+        m_ai_debug = item.get("market_ai_debug", "")
 
-        m_ai_score = row.get("market_ai_score", "")
-        m_ai_pass = row.get("market_ai_pass", "")
-        m_ai_debug = row.get("market_ai_debug", "")
 
         row_out = [
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
