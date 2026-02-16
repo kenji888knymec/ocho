@@ -164,6 +164,15 @@ AI_PCT_MAX = _env_float("AI_PCT_MAX", float("inf"))               # 例: 69.4（
 VOLRATIO_MAX_CAUTION = _env_float("VOLRATIO_MAX_CAUTION", VOLRATIO_MAX)  # 例: 1.6
 AI_PCT_MAX_CAUTION = _env_float("AI_PCT_MAX_CAUTION", AI_PCT_MAX)        # 例: 67.5
 
+# --- Side選択/荒れ相場ガード（最小差分） ---
+# flip（逆張り側）を採用するには、Baseより一定以上「確率が上」になっていることを要求（ノイズ反転を減らす）
+AI_SIDE_MARGIN = _env_float("AI_SIDE_MARGIN", 0.03)   # 例: 0.03 (=3%)
+
+# 荒れ相場（強トレンド/高ボラ）扱いの閾値（score=σ倍率、sigma=Dynamic_Sigma）
+# - この条件に入ったら flip（逆張り側）の採点をスキップ（=順張り側だけ評価）
+CRASH_SIGMA = _env_float("CRASH_SIGMA", 2.0)          # 例: 2.0
+CRASH_VOLSIGMA = _env_float("CRASH_VOLSIGMA", 0.0030) # 例: 0.0030
+
 # リスト系（',' と '|' 両対応）
 SYMBOL_BLOCKLIST = _parse_symbol_set("SYMBOL_BLOCKLIST")
 SYMBOL_CAUTIONLIST = _parse_symbol_set("SYMBOL_CAUTIONLIST")
@@ -177,10 +186,13 @@ print(
     f"GUARDRAILS VOLRATIO_MAX={VOLRATIO_MAX} VOLRATIO_MAX_CAUTION={VOLRATIO_MAX_CAUTION} "
     f"RSI_SHORT_MIN={RSI_SHORT_MIN} RSI_LONG_MAX={RSI_LONG_MAX} "
     f"AI_PCT_MIN={AI_PCT_MIN} AI_PCT_MAX={AI_PCT_MAX} AI_PCT_MAX_CAUTION={AI_PCT_MAX_CAUTION} "
+    f"AI_SIDE_MARGIN={AI_SIDE_MARGIN} "
+    f"CRASH_SIGMA={CRASH_SIGMA} CRASH_VOLSIGMA={CRASH_VOLSIGMA} "
     f"SYMBOL_BLOCKLIST={sorted(list(SYMBOL_BLOCKLIST))} "
     f"SYMBOL_CAUTIONLIST={sorted(list(SYMBOL_CAUTIONLIST))} "
     f"VOLSIGMA_BAN_RANGE={VOLSIGMA_BAN_MIN}-{VOLSIGMA_BAN_MAX}"
 )
+
 
 
 
@@ -2411,16 +2423,27 @@ def logic_main(force: bool = False):
             # base 採点
             score_b, bypass_b, dbg_b = _score_side(base_side)
 
-            # flip 採点（許可 & 有効のときだけ）
+            # Crash/Trend 判定：荒れ相場（強トレンド/高ボラ）では flip（逆張り側）を禁止する
+            crash_forbid_flip = False
+            try:
+                crash_forbid_flip = (float(sig_score) >= float(CRASH_SIGMA)) or (float(row["Dynamic_Sigma"]) >= float(CRASH_VOLSIGMA))
+            except Exception:
+                crash_forbid_flip = False
+
+            # flip 採点（許可 & 有効 & 荒れ相場でない時だけ）
             score_f = None
             bypass_f = True
             dbg_f: Dict[str, Any] = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
-            if AI_SIDE_SELECT and bool(flip_allowed):
+            if AI_SIDE_SELECT and bool(flip_allowed) and (not crash_forbid_flip):
                 score_f, bypass_f, dbg_f = _score_side(flip_side)
             else:
-                dbg_f = {"skipped": True, "reason": ("flip_not_allowed" if (not flip_allowed) else "AI_SIDE_SELECT=0")}
+                if crash_forbid_flip:
+                    dbg_f = {"skipped": True, "reason": "crash_forbid_flip"}
+                else:
+                    dbg_f = {"skipped": True, "reason": ("flip_not_allowed" if (not flip_allowed) else "AI_SIDE_SELECT=0")}
 
-            # 採用判定：採点できた方があれば「高い方」。両方bypassなら base 維持
+            # 採用判定：採点できた方があれば「高い方」。
+            # ただし flip を採用するには、Baseより AI_SIDE_MARGIN 以上よいことを要求（ノイズ反転を減らす）
             chosen_side = base_side
             chosen_score = None
 
@@ -2429,15 +2452,25 @@ def logic_main(force: bool = False):
                 chosen_score = float(score_b)
 
             if (not bypass_f) and (score_f is not None):
-                if (chosen_score is None) or (float(score_f) > float(chosen_score)):
+                if chosen_score is None:
                     chosen_side = flip_side
                     chosen_score = float(score_f)
+                else:
+                    if float(score_f) > (float(chosen_score) + float(AI_SIDE_MARGIN)):
+                        chosen_side = flip_side
+                        chosen_score = float(score_f)
 
             flipped = (chosen_side != base_side)
 
             # dbg は item["ai_debug"] に入れる前提
             dbg = {
                 "ai_side_select": bool(AI_SIDE_SELECT),
+                "ai_side_margin": float(AI_SIDE_MARGIN),
+                "crash_forbid_flip": bool(crash_forbid_flip),
+                "crash_sig_score": float(sig_score),
+                "crash_volsigma": float(row["Dynamic_Sigma"]),
+                "crash_sig_th": float(CRASH_SIGMA),
+                "crash_vol_th": float(CRASH_VOLSIGMA),
                 "base_side": base_side,
                 "flip_side": flip_side,
                 "flip_allowed": bool(flip_allowed),
@@ -2463,6 +2496,7 @@ def logic_main(force: bool = False):
                     is_buy = False
                     is_sell = True
                     signal_type = "SHORT"
+
 
             # bypassed / ai_score を確定
             if (chosen_score is not None) and np.isfinite(float(chosen_score)):
