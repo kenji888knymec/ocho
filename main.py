@@ -2582,6 +2582,12 @@ def logic_main(force: bool = False):
                 "ai_debug": dbg,
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
+
+                # ★追加（learn_log分析用）
+                "ai_proba_base": ai_proba_base_val,
+                "ai_proba_flip": ai_proba_flip_val,
+                "ai_proba_used": ai_proba_used_val,
+                "ai_margin": ai_margin_val,
             
                 # --- learn_log に書き戻したい値は item に持たせる（row参照を消す） ---
                 "BandWidth": float(row["BandWidth"]),
