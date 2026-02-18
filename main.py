@@ -2513,7 +2513,59 @@ def logic_main(force: bool = False):
             else:
                 ai_pass = (float(ai_score) >= float(ai_th_used))
 
+            # --- AI確率ログ（learn_log分析用）---
+            # 方針:
+            # - base/flip は _score_side() の結果（score_b / score_f）を使う
+            # - used は最終採用の chosen_score（= ai_score と同義）
+            # - 欠損やbypassは「補完せず」空欄 "" のまま残す
+            ai_proba_base_val = ""
+            ai_proba_flip_val = ""
+            ai_proba_used_val = ""
+            ai_margin_val = ""
+            
+            try:
+                if (not bool(bypass_b)) and (score_b is not None):
+                    sb = float(score_b)
+                    if np.isfinite(sb):
+                        ai_proba_base_val = sb
+            except Exception:
+                ai_proba_base_val = ""
+            
+            try:
+                if (not bool(bypass_f)) and (score_f is not None):
+                    sf = float(score_f)
+                    if np.isfinite(sf):
+                        ai_proba_flip_val = sf
+            except Exception:
+                ai_proba_flip_val = ""
+            
+            try:
+                if (not bool(bypassed)) and (chosen_score is not None):
+                    cs = float(chosen_score)
+                    if np.isfinite(cs):
+                        ai_proba_used_val = cs
+                elif (ai_score is not None):
+                    asv = float(ai_score)
+                    if np.isfinite(asv):
+                        ai_proba_used_val = asv
+            except Exception:
+                ai_proba_used_val = ""
+            
+            # margin = used - other（base/flipが両方あり、採用sideが判別できる時だけ）
+            try:
+                if (ai_proba_used_val != "") and (ai_proba_base_val != "") and (ai_proba_flip_val != ""):
+                    other = ""
+                    if str(chosen_side) == str(base_side):
+                        other = ai_proba_flip_val
+                    elif str(chosen_side) == str(flip_side):
+                        other = ai_proba_base_val
+            
+                    if other != "":
+                        ai_margin_val = float(ai_proba_used_val) - float(other)
+            except Exception:
+                ai_margin_val = ""            
 
+            
             item = {
                 "symbol": symbol.replace("/USDT", ""),
                 "time": int(row["Time"]),
@@ -2794,6 +2846,29 @@ def logic_main(force: bool = False):
                     row_out = row_out + [""] * (ai_debug_idx + 1 - len(row_out))
                 row_out[ai_debug_idx] = ai_debug_label
 
+        # ai_proba_* / ai_margin 列が存在する場合は、その列位置に代入する（列ズレ防止）
+        ai_proba_base_out = _f_or_blank(item.get("ai_proba_base", ""))
+        ai_proba_flip_out = _f_or_blank(item.get("ai_proba_flip", ""))
+        ai_proba_used_out = _f_or_blank(item.get("ai_proba_used", ""))
+        ai_margin_out = _f_or_blank(item.get("ai_margin", ""))
+        
+        for _col, _val in [
+            ("ai_proba_base", ai_proba_base_out),
+            ("ai_proba_flip", ai_proba_flip_out),
+            ("ai_proba_used", ai_proba_used_out),
+            ("ai_margin", ai_margin_out),
+        ]:
+            _idx = -1
+            for j, h in enumerate(learn_fields):
+                if str(h).strip().lower() == _col:
+                    _idx = j
+                    break
+            if _idx >= 0:
+                if len(row_out) <= _idx:
+                    row_out = row_out + [""] * (_idx + 1 - len(row_out))
+                row_out[_idx] = _val
+
+        
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
