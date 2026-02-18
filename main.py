@@ -2618,13 +2618,29 @@ def logic_main(force: bool = False):
             # 2) RSI ガード
             if guard_ok:
                 try:
-                    rsi_v = float(item.get("rsi", 0.0))
-                    if bool(item.get("is_sell", False)) and (rsi_v < RSI_SHORT_MIN):
+                    rsi_raw = item.get("rsi", None)
+                    
+                    # rsi が欠損/空/NaN/inf なら「推測で埋めずに」不採用
+                    if rsi_raw is None or str(rsi_raw).strip() == "":
                         guard_ok = False
-                        print(f"[GR] skip alert sym={sym_u} side=SHORT rsi={rsi_v:.2f} < {RSI_SHORT_MIN}")
-                    if bool(item.get("is_buy", False)) and (rsi_v > RSI_LONG_MAX):
-                        guard_ok = False
-                        print(f"[GR] skip alert sym={sym_u} side=LONG rsi={rsi_v:.2f} > {RSI_LONG_MAX}")
+                        print(f"[GR] skip alert sym={sym_u} rsi=missing (no-signal)")
+                    else:
+                        try:
+                            rsi_v = float(rsi_raw)
+                            if not np.isfinite(rsi_v):
+                                guard_ok = False
+                                print(f"[GR] skip alert sym={sym_u} rsi=invalid (no-signal)")
+                            else:
+                                if bool(item.get("is_sell", False)) and (rsi_v < RSI_SHORT_MIN):
+                                    guard_ok = False
+                                    print(f"[GR] skip alert sym={sym_u} side=SHORT rsi={rsi_v:.2f} < {RSI_SHORT_MIN}")
+                                if bool(item.get("is_buy", False)) and (rsi_v > RSI_LONG_MAX):
+                                    guard_ok = False
+                                    print(f"[GR] skip alert sym={sym_u} side=LONG rsi={rsi_v:.2f} > {RSI_LONG_MAX}")
+                        except Exception:
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} rsi=parse_failed (no-signal)")
+
                 except Exception:
                     pass
 
@@ -2694,8 +2710,17 @@ def logic_main(force: bool = False):
 
             # 重要：通知判定は「AI Pass」を最終ゲートにする（VolSigmaはランキング用で残す）
             if guard_ok and ai_pass and BTC_CALM:
-                if float(item.get("score", 0.0)) < float(ALERT_SIGMA):
-                    print(f"[DBG] score below alert_sigma but still add. score={item.get('score')} alert_sigma={ALERT_SIGMA}")
+
+                try:
+                    _sc_raw = item.get("score", None)
+                    if _sc_raw is not None and str(_sc_raw).strip() != "":
+                        _sc = float(_sc_raw)
+                        if np.isfinite(_sc) and (_sc < float(ALERT_SIGMA)):
+                            print(f"[DBG] score below alert_sigma but still add. score={_sc} alert_sigma={ALERT_SIGMA}")
+                except Exception:
+                    pass
+
+
                 pending_alerts.append(item)
 
 
@@ -2802,19 +2827,22 @@ def logic_main(force: bool = False):
             except Exception:
                 byp_f = ""
 
-            # 最終bypass（chosen_scoreが無い等）
-            try:
-                byp_all = "1" if bool(dbg.get("bypassed", False)) else "0"
-            except Exception:
-                byp_all = ""
-
             # flip側のスキップ理由（crash_forbid_flip / flip_not_allowed / AI_SIDE_SELECT=0 等）
             try:
                 _df = dbg.get("dbg_flip", {})
                 if isinstance(_df, dict):
                     flip_reason = str(_df.get("reason", "")) or ""
+                    if (not flip_reason) and bool(_df.get("skipped", False)):
+                        flip_reason = "skipped"
             except Exception:
                 flip_reason = ""
+
+        # 最終bypass は dbg ではなく item から推定（dbg にキーが無いので誤ログ防止）
+        # ai_score が None なら「最終採用スコア無し」＝bypassed扱い
+        try:
+            byp_all = "1" if (item.get("ai_score", None) is None) else "0"
+        except Exception:
+            byp_all = ""
 
         # note_str に短い理由コードを追記（挙動は変えない）
         note_str = (
@@ -2825,6 +2853,7 @@ def logic_main(force: bool = False):
             f"Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
+
 
 
 
