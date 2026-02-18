@@ -2777,18 +2777,55 @@ def logic_main(force: bool = False):
         chosen_side = ""
         score_b = ""
         score_f = ""
+
+        # ★追加：空欄理由（flipが空の理由 / bypass理由）を短くログ化
+        flip_reason = ""
+        byp_b = ""
+        byp_f = ""
+        byp_all = ""
+
         if isinstance(dbg, dict):
             flip_flag = str(dbg.get("flipped", ""))
             chosen_side = str(dbg.get("chosen_side", ""))
+
             score_b = dbg.get("score_base", "")
             score_f = dbg.get("score_flip", "")
 
+            # bypass状況（空欄の最大要因）
+            try:
+                byp_b = "1" if bool(dbg.get("bypassed_base", False)) else "0"
+            except Exception:
+                byp_b = ""
+
+            try:
+                byp_f = "1" if bool(dbg.get("bypassed_flip", False)) else "0"
+            except Exception:
+                byp_f = ""
+
+            # 最終bypass（chosen_scoreが無い等）
+            try:
+                byp_all = "1" if bool(dbg.get("bypassed", False)) else "0"
+            except Exception:
+                byp_all = ""
+
+            # flip側のスキップ理由（crash_forbid_flip / flip_not_allowed / AI_SIDE_SELECT=0 等）
+            try:
+                _df = dbg.get("dbg_flip", {})
+                if isinstance(_df, dict):
+                    flip_reason = str(_df.get("reason", "")) or ""
+            except Exception:
+                flip_reason = ""
+
+        # note_str に短い理由コードを追記（挙動は変えない）
         note_str = (
             f"AI:{ai_disp} Pass:{item['ai_pass']} "
-            f"SideChosen:{chosen_side} Flip:{flip_flag} BaseP:{score_b} FlipP:{score_f} "
+            f"SideChosen:{chosen_side} Flip:{flip_flag} "
+            f"BaseP:{score_b} FlipP:{score_f} "
+            f"BByp:{byp_b} FByp:{byp_f} Bypassed:{byp_all} FReason:{flip_reason} "
             f"Calm:{BTC_CALM} SigmaMed:{median_sigma:.4f} BTC_OK:{btc_ok} "
             f"BTC:{btc_mode} 1h:{btc_1h_change:.2%}"
         )
+
 
 
         ai_debug_label = derive_ai_debug(
