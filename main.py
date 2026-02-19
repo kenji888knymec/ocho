@@ -3781,6 +3781,77 @@ def train_process():
             pass
 
 
+@app.route("/label_market", methods=["GET", "POST"])
+def label_market_process():
+    """
+    Cloud Scheduler の /label_market 用エンドポイント。
+    目的：404 を無くして、Scheduler が正常に叩ける状態にする。
+    - /run, /judge, /train と同じ設計で 500 を避ける（Scheduler失敗扱いにしない）
+    - 実処理は label_market_main() が存在すれば呼ぶ。無ければ「未実装」扱いで 200 を返す。
+    """
+    # 同時実行ガード（run/judge/train/label_market）
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Busy (run/judge/train/label_market already in progress).", "version": VERSION}), 200
+
+    mutex_token = ""
+    try:
+        ok, msg = preflight_check()
+        if not ok:
+            err = f"Preflight NG: {msg}"
+            print(f"[WARN] /label_market {err}")
+            send_discord_message(f"[WARN] /label_market {err}")
+            return jsonify({"ok": False, "error": err, "version": VERSION}), 200
+
+        okm, token = acquire_run_mutex()
+        if not okm:
+            return jsonify({"ok": False, "error": "Busy (distributed mutex).", "version": VERSION}), 200
+        mutex_token = token
+
+        # 実処理があるなら呼ぶ（関数名はここで固定）
+        try:
+            fn = globals().get("label_market_main", None)
+            if callable(fn):
+                res = fn()
+                return jsonify({"ok": True, "result": str(res), "version": VERSION}), 200
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"[ERR] /label_market crashed: {err}")
+            send_discord_message(f"[ERR] /label_market crashed: {err}")
+            return jsonify({"ok": False, "error": err, "version": VERSION}), 200
+
+        # 無くても 200（まず 404 を消すのが目的）
+        return jsonify({
+            "ok": True,
+            "version": VERSION,
+            "note": "label_market endpoint is alive. label_market_main() is not implemented (or not found).",
+        }), 200
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /label_market outer exception: {err}")
+        send_discord_message(f"[ERR] /label_market outer crashed: {err}")
+        return jsonify({"ok": False, "error": err, "version": VERSION}), 200
+
+    finally:
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                msg = f"[WARN] /label_market release_run_mutex failed: {type(e).__name__}: {e}"
+                print(msg)
+                try:
+                    send_discord_message(msg)
+                except Exception as e2:
+                    print(f"[WARN] /label_market send_discord_message failed: {type(e2).__name__}: {e2}")
+
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            pass
+
+
+
+
 @app.route("/run", methods=["GET", "POST"])
 def run_process():
     if not _run_lock.acquire(blocking=False):
