@@ -2438,9 +2438,19 @@ def logic_main(force: bool = False):
                     return None, True, d if isinstance(d, dict) else {"error": "no_proba"}
             
                 try:
-                    s = float(proba_x[0][1])
+                    p = np.asarray(proba_x, dtype=float)
+                    win_idx = 1
+                    try:
+                        cls = getattr(model_for_sym, "classes_", None)
+                        if cls is not None and (1 in list(cls)):
+                            win_idx = list(cls).index(1)
+                    except Exception:
+                        win_idx = 1
+                
+                    s = float(p[0][win_idx])
                 except Exception:
                     return None, True, {"error": "proba_parse_failed"}
+
             
                 if not np.isfinite(s):
                     return None, True, {"error": "non_finite_score"}
