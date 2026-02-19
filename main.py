@@ -2432,7 +2432,6 @@ def logic_main(force: bool = False):
 
 
             def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
-            def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
                 """
                 戻り:
                   - score_used: 判定に使うスコア（AI_PROBA_INVERT を反映）
