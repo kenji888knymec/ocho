@@ -1878,7 +1878,16 @@ def reload_default_model() -> bool:
                 AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
                 AI_MODEL_SOURCE_RUNTIME = "gcs"
                 print(f"[AI] Model Loaded Successfully uri={MODEL_GCS_URI} path={tmp_path} ver={AI_MODEL_VERSION_RUNTIME}")
+        
+                try:
+                    fn = getattr(ai_model, "feature_names_in_", None)
+                    if fn is not None:
+                        print(f"[AI] model_feature_names_in_={list(fn)}")
+                except Exception:
+                    pass
+        
                 return True
+
 
     # 2) ローカル fallback
     if os.path.exists(MODEL_LOCAL_PATH):
@@ -1888,7 +1897,16 @@ def reload_default_model() -> bool:
             AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
             AI_MODEL_SOURCE_RUNTIME = "local"
             print(f"[AI] Model Loaded Successfully path={MODEL_LOCAL_PATH} ver={AI_MODEL_VERSION_RUNTIME}")
+    
+            try:
+                fn = getattr(ai_model, "feature_names_in_", None)
+                if fn is not None:
+                    print(f"[AI] model_feature_names_in_={list(fn)}")
+            except Exception:
+                pass
+    
             return True
+
 
     # 3) 失敗 → AI ゲートは bypass（ただし FAIL_CLOSED_ON_AI_BYPASS によって挙動は変わる）
     print("[AI] model load failed -> AI gate is bypassed (ai_model=None).")
@@ -2084,7 +2102,16 @@ def get_ai_model_for_symbol(symbol_code: str):
     ver = v_map.get(sym, "")
     _model_cache[uri] = {"model": m, "ts": now, "version": ver, "source": "gcs"}
     print(f"[AI] Multi-model loaded sym={sym} uri={uri} ver={ver}")
+    
+    try:
+        fn = getattr(m, "feature_names_in_", None)
+        if fn is not None:
+            print(f"[AI] model_feature_names_in_({sym})={list(fn)}")
+    except Exception:
+        pass
+    
     return m, ver, "gcs"
+
 
 
 # ==========================================
