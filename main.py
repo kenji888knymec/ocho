@@ -101,9 +101,13 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
+# 1 のときだけ「Win確率」を反転して扱う（score_used = 1 - score_raw）
+AI_PROBA_INVERT = (os.environ.get("AI_PROBA_INVERT", "0").strip() == "1")
+
 # Hyperliquid: 通常銘柄の表示レバ（基本10倍）
 # ※DEFAULT_LEV を正として一本化（環境変数 DEFAULT_LEV で変更可能）
 DEFAULT_LEV = int(float(os.environ.get("DEFAULT_LEV", "10")))
+
 
 # "5倍までしか掛けられない銘柄" を環境変数で指定（例: "STX,XLM,FET,HBAR,POL"）
 # ※環境変数が空なら HL_MAX5_SYMBOLS を使う
@@ -2428,49 +2432,89 @@ def logic_main(force: bool = False):
 
 
             def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
+            def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
                 """
                 戻り:
                   - score_used: 判定に使うスコア（AI_PROBA_INVERT を反映）
                   - score_raw : model.predict_proba の生値（反転前）
                   - bypass    : Trueなら予測できていない
-                  - dbg       : safe_predict_proba のデバッグ
+                  - dbg       : safe_predict_proba のデバッグ（追跡用情報を必ず追記）
                 """
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
-
+            
+                d = (dbg_x or {})
+                if not isinstance(d, dict):
+                    d = {"dbg": str(d)}
+            
                 # bypass なら予測しない（固定値判定もしない）
                 if bypass_x:
-                    return None, None, True, (dbg_x or {})
-
+                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_applied"] = False
+                    d["proba_raw"] = None
+                    d["proba_used"] = None
+                    d["side"] = str(side)
+                    return None, None, True, d
+            
                 # 念のため：None は絶対にパースしない（事故率低下）
                 if proba_x is None:
-                    d = (dbg_x or {})
-                    if isinstance(d, dict):
-                        d["error"] = "no_proba"
-                    return None, None, True, d if isinstance(d, dict) else {"error": "no_proba"}
-
+                    d["error"] = "no_proba"
+                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_applied"] = False
+                    d["proba_raw"] = None
+                    d["proba_used"] = None
+                    d["side"] = str(side)
+                    return None, None, True, d
+            
                 try:
                     p = np.asarray(proba_x, dtype=float)
-
+            
                     # 1列目が「Win」だと決め打ちせず、classes_ を見て win_idx を確定
                     win_idx = 1
+                    cls_list = None
                     try:
                         cls = getattr(model_for_sym, "classes_", None)
-                        if cls is not None and (1 in list(cls)):
-                            win_idx = list(cls).index(1)
+                        cls_list = list(cls) if cls is not None else []
+                        if cls_list and (1 in cls_list):
+                            win_idx = cls_list.index(1)
                     except Exception:
                         win_idx = 1
-
+            
                     s_raw = float(p[0][win_idx])
-                except Exception:
-                    return None, None, True, {"error": "proba_parse_failed"}
+                    if not np.isfinite(s_raw):
+                        raise ValueError("non_finite_score_raw")
+            
+                    # ★反転（必要なときだけ）
+                    if bool(AI_PROBA_INVERT):
+                        s_used = 1.0 - float(s_raw)
+                        invert_applied = True
+                    else:
+                        s_used = float(s_raw)
+                        invert_applied = False
+            
+                    if not np.isfinite(s_used):
+                        raise ValueError("non_finite_score_used")
+            
+                    # ★追跡用ログを必ず残す（後で分かる）
+                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_applied"] = bool(invert_applied)
+                    d["proba_raw"] = float(s_raw)
+                    d["proba_used"] = float(s_used)
+                    d["win_index"] = int(win_idx)
+                    d["classes_"] = [int(x) for x in cls_list] if cls_list is not None else None
+                    d["side"] = str(side)
+            
+                    return float(s_used), float(s_raw), False, d
+            
+                except Exception as e:
+                    d["error"] = "proba_parse_failed"
+                    d["detail"] = str(e)
+                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_applied"] = False
+                    d["proba_raw"] = None
+                    d["proba_used"] = None
+                    d["side"] = str(side)
+                    return None, None, True, d
 
-                if not np.isfinite(s_raw):
-                    return None, None, True, {"error": "non_finite_score"}
-
-                # ★反転（必要なときだけ）
-                s_used = (1.0 - float(s_raw)) if bool(AI_PROBA_INVERT) else float(s_raw)
-
-                return float(s_used), float(s_raw), False, (dbg_x or {})
 
 
             # base 採点（used=判定用, raw=反転前）
