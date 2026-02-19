@@ -2399,6 +2399,10 @@ def logic_main(force: bool = False):
             # AIでside選択を有効化（envでOFF可）
             AI_SIDE_SELECT = (os.environ.get("AI_SIDE_SELECT", "1").strip() == "1")
 
+            # ★追加：AI確率の解釈を反転（Win向きにする）: p_used = 1 - p_raw
+            AI_PROBA_INVERT = (os.environ.get("AI_PROBA_INVERT", "0").strip() == "1")
+
+            
             base_side = "LONG" if is_buy else "SHORT"
             flip_side = "SHORT" if base_side == "LONG" else "LONG"
             flip_allowed = (ALLOW_SHORT if flip_side == "SHORT" else ALLOW_LONG)
@@ -2423,22 +2427,31 @@ def logic_main(force: bool = False):
 
 
 
-            def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
+            def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
+                """
+                戻り:
+                  - score_used: 判定に使うスコア（AI_PROBA_INVERT を反映）
+                  - score_raw : model.predict_proba の生値（反転前）
+                  - bypass    : Trueなら予測できていない
+                  - dbg       : safe_predict_proba のデバッグ
+                """
                 proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
-            
+
                 # bypass なら予測しない（固定値判定もしない）
                 if bypass_x:
-                    return None, True, (dbg_x or {})
-            
+                    return None, None, True, (dbg_x or {})
+
                 # 念のため：None は絶対にパースしない（事故率低下）
                 if proba_x is None:
                     d = (dbg_x or {})
                     if isinstance(d, dict):
                         d["error"] = "no_proba"
-                    return None, True, d if isinstance(d, dict) else {"error": "no_proba"}
-            
+                    return None, None, True, d if isinstance(d, dict) else {"error": "no_proba"}
+
                 try:
                     p = np.asarray(proba_x, dtype=float)
+
+                    # 1列目が「Win」だと決め打ちせず、classes_ を見て win_idx を確定
                     win_idx = 1
                     try:
                         cls = getattr(model_for_sym, "classes_", None)
@@ -2446,20 +2459,22 @@ def logic_main(force: bool = False):
                             win_idx = list(cls).index(1)
                     except Exception:
                         win_idx = 1
-                
-                    s = float(p[0][win_idx])
+
+                    s_raw = float(p[0][win_idx])
                 except Exception:
-                    return None, True, {"error": "proba_parse_failed"}
+                    return None, None, True, {"error": "proba_parse_failed"}
 
-            
-                if not np.isfinite(s):
-                    return None, True, {"error": "non_finite_score"}
-            
-                return float(s), False, (dbg_x or {})
+                if not np.isfinite(s_raw):
+                    return None, None, True, {"error": "non_finite_score"}
+
+                # ★反転（必要なときだけ）
+                s_used = (1.0 - float(s_raw)) if bool(AI_PROBA_INVERT) else float(s_raw)
+
+                return float(s_used), float(s_raw), False, (dbg_x or {})
 
 
-            # base 採点
-            score_b, bypass_b, dbg_b = _score_side(base_side)
+            # base 採点（used=判定用, raw=反転前）
+            score_b, score_b_raw, bypass_b, dbg_b = _score_side(base_side)
 
             # Crash/Trend 判定：荒れ相場（強トレンド/高ボラ）では flip（逆張り側）を禁止する
             crash_forbid_flip = False
@@ -2470,10 +2485,11 @@ def logic_main(force: bool = False):
 
             # flip 採点（許可 & 有効 & 荒れ相場でない時だけ）
             score_f = None
+            score_f_raw = None
             bypass_f = True
             dbg_f: Dict[str, Any] = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
             if AI_SIDE_SELECT and bool(flip_allowed) and (not crash_forbid_flip):
-                score_f, bypass_f, dbg_f = _score_side(flip_side)
+                score_f, score_f_raw, bypass_f, dbg_f = _score_side(flip_side)
             else:
                 if crash_forbid_flip:
                     dbg_f = {"skipped": True, "reason": "crash_forbid_flip"}
