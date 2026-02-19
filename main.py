@@ -2385,14 +2385,15 @@ def logic_main(force: bool = False):
                 return pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
-                    "BW_Change": float(row["BW_Change"]),
+                    "BW Change": float(row["BW_Change"]),
                     "RSI": float(row["RSI"]),
-                    "Vol_Change": float(row["Vol_Change"]),
-                    "Rise_Score": float(rise),
-                    "Drop_Score": float(drop),
-                    "BTC_Ret": float(btc_ret),
-                    "BTC_Vol": float(btc_vol),
+                    "Vol Change": float(row["Vol_Change"]),
+                    "Rise Score": float(rise),
+                    "Drop Score": float(drop),
+                    "BTC Ret": float(btc_ret),
+                    "BTC Vol": float(btc_vol),
                 }])
+
 
 
             def _score_side(side: str) -> Tuple[Optional[float], bool, Dict[str, Any]]:
