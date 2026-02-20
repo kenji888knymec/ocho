@@ -2677,6 +2677,14 @@ def logic_main(force: bool = False):
                 "ai_score": ai_score,
                 "ai_pass": bool(ai_pass),
                 "ai_debug": dbg,
+
+                # ★追加：AI_PROBA_INVERT の「証拠」を item に乗せる（learn_log/ログで見えるように）
+                # dbg は _score_side() が返す dict をベースにしている前提（あなたの②の通り proba_raw 等が入る）
+                "proba_raw": (dbg.get("proba_raw", "") if isinstance(dbg, dict) else ""),
+                "proba_used": (dbg.get("proba_used", "") if isinstance(dbg, dict) else ""),
+                # print側は invert_applied というキーを見に行っているので、ここで合わせる
+                "invert_applied": (dbg.get("ai_proba_invert_applied", "") if isinstance(dbg, dict) else ""),
+
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
 
@@ -3093,12 +3101,16 @@ def logic_main(force: bool = False):
                 return row_list
             except Exception:
                 return row_list
-
+        
         row_out = _set_field_value(row_out, learn_fields, "ai_proba_base", ai_proba_base_v)
         row_out = _set_field_value(row_out, learn_fields, "ai_proba_flip", ai_proba_flip_v)
         row_out = _set_field_value(row_out, learn_fields, "ai_proba_used", ai_proba_used_v)
         row_out = _set_field_value(row_out, learn_fields, "ai_margin", ai_margin_v)
 
+        # ★追加：列が存在する時だけ「証拠」も書く（無ければ何もしない）
+        row_out = _set_field_value(row_out, learn_fields, "proba_raw", _to_finite_float_or_none(item.get("proba_raw", None)))
+        row_out = _set_field_value(row_out, learn_fields, "proba_used", _to_finite_float_or_none(item.get("proba_used", None)))
+        row_out = _set_field_value(row_out, learn_fields, "invert_applied", item.get("invert_applied", ""))
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
