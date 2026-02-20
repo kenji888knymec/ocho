@@ -2972,16 +2972,81 @@ def logic_main(force: bool = False):
             except Exception:
                 return ""
 
+        # ===== AI debug values for analysis (NO zero-fill; invalid => blank) =====
+        def _to_finite_float_or_none(x):
+            try:
+                if x is None:
+                    return None
+                v = float(x)
+                if not np.isfinite(v):
+                    return None
+                return v
+            except Exception:
+                return None
+
+        # item から ai_proba_* を拾う（無効値は None）
+        ai_proba_base_v = _to_finite_float_or_none(item.get("ai_proba_base", None))
+        ai_proba_flip_v = _to_finite_float_or_none(item.get("ai_proba_flip", None))
+        ai_proba_used_v = _to_finite_float_or_none(item.get("ai_proba_used", None))
+
+        # ai_th_used が未定義の経路でも落ちないように AI_TH にフォールバック
+        try:
+            _th_src = ai_th_used if "ai_th_used" in locals() else AI_TH
+            ai_th_effective = float(_th_src)
+            if not np.isfinite(ai_th_effective):
+                ai_th_effective = None
+        except Exception:
+            ai_th_effective = None
+
+        # margin は used - effective_th（揃わないなら None のまま）
+        ai_margin_v = None
+        if ai_proba_used_v is not None and ai_th_effective is not None:
+            ai_margin_v = ai_proba_used_v - ai_th_effective
+
+        # 欠損理由（0埋め禁止：欠損なら空欄で残す）
+        missing_reason = None
+        if ai_proba_used_v is None:
+            missing_reason = "missing_used"
+        elif ai_th_effective is None:
+            missing_reason = "missing_ai_th"
+
+        if missing_reason is not None:
+            print(
+                "[AI_DEC] skip"
+                f" sym={sym} side={('LONG' if item['is_buy'] else 'SHORT')}"
+                f" reason={missing_reason}"
+                f" base={ai_proba_base_v} flip={ai_proba_flip_v} used={ai_proba_used_v} ai_th={ai_th_effective}"
+                f" ai_pass={bool(item.get('ai_pass'))}"
+                f" invert_env={os.environ.get('AI_PROBA_INVERT', '')}"
+            )
+            # 欠損時は列には空欄を書き込む（候補行は残す）
+            ai_proba_base_v = None
+            ai_proba_flip_v = None
+            ai_proba_used_v = None
+            ai_margin_v = None
+        else:
+            # invert の証拠（item に入っていれば出す。無ければ空のまま）
+            ai_proba_invert_env = os.environ.get("AI_PROBA_INVERT", "")
+            proba_raw_v = item.get("proba_raw", "")
+            invert_applied_v = item.get("invert_applied", "")
+
+            print(
+                "[AI_DEC]"
+                f" sym={sym} side={('LONG' if item['is_buy'] else 'SHORT')}"
+                f" base={ai_proba_base_v} flip={ai_proba_flip_v} used={ai_proba_used_v} margin={ai_margin_v}"
+                f" ai_th={ai_th_effective} ai_pass={bool(item.get('ai_pass'))}"
+                f" invert_env={ai_proba_invert_env} invert_applied={invert_applied_v} proba_raw={proba_raw_v}"
+            )
+
         bw_val = _f_or_blank(item.get("BandWidth", ""))
         bw_chg_val = _f_or_blank(item.get("BW_Change", ""))
         vol_chg_val = _f_or_blank(item.get("Vol_Change", ""))
         btc_ret_val = _f_or_blank(btc_ret)
         btc_vol_val = _f_or_blank(btc_vol)
-        
+
         m_ai_score = item.get("market_ai_score", "")
         m_ai_pass = item.get("market_ai_pass", "")
         m_ai_debug = item.get("market_ai_debug", "")
-
 
         row_out = [
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
@@ -3000,44 +3065,40 @@ def logic_main(force: bool = False):
             m_ai_score, m_ai_pass, m_ai_debug,
         ]
 
-
-        # ai_debug 列が存在する場合は「末尾append」ではなく、その列位置に代入する（列ズレ防止）
+        # ai_debug 列が存在する場合はその列位置に代入（列ズレ防止）
         if ai_debug_field:
             ai_debug_idx = -1
             for i, h in enumerate(learn_fields):
                 if str(h).strip().lower() == "ai_debug":
                     ai_debug_idx = i
                     break
-
             if ai_debug_idx >= 0:
-                # 先に必要な長さまで伸ばしてから代入（index error回避）
                 if len(row_out) <= ai_debug_idx:
                     row_out = row_out + [""] * (ai_debug_idx + 1 - len(row_out))
                 row_out[ai_debug_idx] = ai_debug_label
 
-        # ai_proba_* / ai_margin 列が存在する場合は、その列位置に代入する（列ズレ防止）
-        ai_proba_base_out = _f_or_blank(item.get("ai_proba_base", ""))
-        ai_proba_flip_out = _f_or_blank(item.get("ai_proba_flip", ""))
-        ai_proba_used_out = _f_or_blank(item.get("ai_proba_used", ""))
-        ai_margin_out = _f_or_blank(item.get("ai_margin", ""))
-        
-        for _col, _val in [
-            ("ai_proba_base", ai_proba_base_out),
-            ("ai_proba_flip", ai_proba_flip_out),
-            ("ai_proba_used", ai_proba_used_out),
-            ("ai_margin", ai_margin_out),
-        ]:
-            _idx = -1
-            for j, h in enumerate(learn_fields):
-                if str(h).strip().lower() == _col:
-                    _idx = j
-                    break
-            if _idx >= 0:
-                if len(row_out) <= _idx:
-                    row_out = row_out + [""] * (_idx + 1 - len(row_out))
-                row_out[_idx] = _val
+        # ai_proba_* / ai_margin は列位置に代入（列ズレ防止）
+        def _set_field_value(row_list, fields, field_name, value):
+            try:
+                idx0 = -1
+                for j, h in enumerate(fields):
+                    if str(h).strip().lower() == field_name.lower():
+                        idx0 = j
+                        break
+                if idx0 < 0:
+                    return row_list
+                if len(row_list) <= idx0:
+                    row_list = row_list + [""] * (idx0 + 1 - len(row_list))
+                row_list[idx0] = ("" if value is None else value)
+                return row_list
+            except Exception:
+                return row_list
 
-        
+        row_out = _set_field_value(row_out, learn_fields, "ai_proba_base", ai_proba_base_v)
+        row_out = _set_field_value(row_out, learn_fields, "ai_proba_flip", ai_proba_flip_v)
+        row_out = _set_field_value(row_out, learn_fields, "ai_proba_used", ai_proba_used_v)
+        row_out = _set_field_value(row_out, learn_fields, "ai_margin", ai_margin_v)
+
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
