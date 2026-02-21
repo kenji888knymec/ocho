@@ -3769,6 +3769,8 @@ def ai_health():
 
     return jsonify(resp), 200
 
+# 診断用: AI_PROBA_INVERT の「白黒」確認（1回で確定させる）
+@app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
     """
     統計ではなく「1回の実行で白黒」を付けるための診断用。
