@@ -306,6 +306,9 @@ EXPECTED_HEADERS_LEARN = [
     # --- optional-but-we-want-to-always-write (for analysis/debug) ---
     "BandWidth", "BW_Change", "Vol_Change", "BTC_Ret", "BTC_Vol",
     "market_ai_score", "market_ai_pass", "market_ai_debug",
+    # --- AI evidence columns (already exist in your sheet) ---
+    "ai_debug", "ai_proba_base", "ai_proba_flip", "ai_proba_used", "ai_margin",
+    "tag", "proba_raw", "proba_used", "invert_applied",
 ]
 
 
