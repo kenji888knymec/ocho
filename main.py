@@ -2692,13 +2692,17 @@ def logic_main(force: bool = False):
             proba_raw_val = dbg.get("proba_raw", "")
             proba_used_val = dbg.get("proba_used", "")
             invert_applied_val = dbg.get("ai_proba_invert_applied", "")
-
-            # --- Sheetsへ書く ai_debug は JSON文字列にする（dictのままだと落ちやすい）---
+            
+            # --- DIRECT/REVERSE は ai_debug(AO) ではなく tag に逃がす ---
+            invert_mode_tag = "REVERSE" if bool(AI_PROBA_INVERT) else "DIRECT"
+            
+            # --- Sheetsへ書く ai_debug(AO) は「必ず」JSON文字列にする ---
+            # ※ これで AO が DIRECT/REVERSE になる事故を潰します（ここで上書き確定）
             try:
                 ai_debug_str = json.dumps(dbg, ensure_ascii=False, separators=(",", ":"), default=str)
             except Exception:
                 ai_debug_str = str(dbg)
-
+            
             item = {
                 "symbol": symbol.replace("/USDT", ""),
                 "time": int(row["Time"]),
@@ -2712,35 +2716,36 @@ def logic_main(force: bool = False):
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
                 "ai_score": ai_score,
                 "ai_pass": bool(ai_pass),
-
-                # learn_log(AO) に入れる前提：JSON文字列で保持
+            
+                # learn_log(AO) ：JSON文字列
                 "ai_debug": ai_debug_str,
-
-                # AI_PROBA_INVERT の「証拠」も item に入れる（文字列/数値どちらでもOK）
+            
+                # DIRECT/REVERSE は tag 列へ（learn_log側で追跡できる）
+                "tag": invert_mode_tag,
+            
+                # AI_PROBA_INVERT の「証拠」も item に入れる（必要なら後で列追加できる）
                 "proba_raw": proba_raw_val,
                 "proba_used": proba_used_val,
                 "invert_applied": invert_applied_val,
-
+            
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
-
+            
                 # learn_log(AP..AS) 用
                 "ai_proba_base": ai_proba_base_val,
                 "ai_proba_flip": ai_proba_flip_val,
                 "ai_proba_used": ai_proba_used_val,
                 "ai_margin": ai_margin_val,
-
-                # --- learn_log に書き戻したい値は item に持たせる（row参照を消す） ---
+            
                 "BandWidth": float(row["BandWidth"]),
                 "BW_Change": float(row["BW_Change"]),
                 "Vol_Change": float(row["Vol_Change"]),
-
-                # market_ai_* はここでは空（既存設計のまま）
+            
                 "market_ai_score": "",
                 "market_ai_pass": "",
                 "market_ai_debug": "",
             }
-
+            
             pending_candidates.append(item)
 
 
