@@ -3769,17 +3769,46 @@ def ai_health():
 
     return jsonify(resp), 200
 
-
-
-@app.route("/ai_smoke", methods=["GET"])
 def ai_smoke():
     """
-    - safe_predict_proba が bypass / None / 形不正でも 500 を出さない
-    - score は取れれば返す。取れなければ None のまま返す
+    統計ではなく「1回の実行で白黒」を付けるための診断用。
+    - predict を必ず走らせる入力を用意
+    - proba_raw / proba_used / invert_applied を必ず返す
     """
-    # 固定値を入れない：欠損入力→safe_predict_proba が bypass できることを確認する
-    feats = pd.DataFrame([{}])
+    if ai_model is None:
+        return jsonify({
+            "ok": False,
+            "model_loaded": False,
+            "reason": "ai_model is None",
+            "model_version": os.environ.get("MODEL_VERSION", ""),
+        }), 200
 
+    # グローバル定義（冒頭の AI_PROBA_INVERT）を使う
+    invert_env = bool(AI_PROBA_INVERT)
+
+    # ---- 安全な固定入力（診断用）----
+    expected_cols = None
+    try:
+        if hasattr(ai_model, "feature_names_in_"):
+            expected_cols = list(getattr(ai_model, "feature_names_in_", [])) or None
+    except Exception:
+        expected_cols = None
+
+    if expected_cols:
+        feats = pd.DataFrame([{c: 0.0 for c in expected_cols}])
+    else:
+        # feature_names が取れない場合のフォールバック（あなたの9特徴量）
+        feats = pd.DataFrame([{
+            "Sigma": 0.0,
+            "BandWidth": 0.0,
+            "BW Change": 0.0,
+            "RSI": 50.0,
+            "Vol Change": 0.0,
+            "Rise Score": 0.0,
+            "Drop Score": 0.0,
+            "BTC Ret": 0.0,
+            "BTC Vol": 0.0,
+        }])
 
     proba = None
     bypassed = True
@@ -3788,34 +3817,81 @@ def ai_smoke():
     try:
         proba, bypassed, dbg = safe_predict_proba(ai_model, feats)
     except Exception as e:
-        # safe_predict_proba 自体が例外でも 200 で返す（落とさない）
         dbg = {"error": f"{type(e).__name__}: {e}"}
         proba = None
         bypassed = True
 
-    score = None
-    try:
-        if proba is not None and len(proba) > 0 and len(proba[0]) > 1:
-            s = float(proba[0][1])
-            if np.isfinite(s):
-                score = s
+    # ---- raw/used を必ず作る（白黒判定用）----
+    proba_raw = None
+    proba_used = None
+    invert_applied = False
+    reason = ""
+
+    d = dbg if isinstance(dbg, dict) else {"dbg": str(dbg)}
+
+    if bypassed or proba is None:
+        reason = d.get("reason", "bypassed_or_no_proba")
+    else:
+        try:
+            p = np.asarray(proba, dtype=float)
+
+            # classes_ を見て win_idx を確定（本番 _score_side と同じ思想）
+            win_idx = 1
+            cls_list = None
+            try:
+                cls = getattr(ai_model, "classes_", None)
+                cls_list = list(cls) if cls is not None else []
+                if cls_list and (1 in cls_list):
+                    win_idx = cls_list.index(1)
+            except Exception:
+                win_idx = 1
+
+            s_raw = float(p[0][win_idx])
+            if not np.isfinite(s_raw):
+                raise ValueError("non_finite_proba_raw")
+
+            proba_raw = float(s_raw)
+
+            if invert_env:
+                proba_used = float(1.0 - proba_raw)
+                invert_applied = True
             else:
-                bypassed = True
-                if isinstance(dbg, dict):
-                    dbg["score_error"] = "non_finite"
-    except Exception as e:
-        bypassed = True
-        if isinstance(dbg, dict):
-            dbg["score_error"] = f"{type(e).__name__}: {e}"
+                proba_used = float(proba_raw)
+                invert_applied = False
+
+            if not np.isfinite(proba_used):
+                raise ValueError("non_finite_proba_used")
+
+            # debug にも残す（見える化）
+            d["ai_proba_invert_enabled"] = bool(invert_env)
+            d["ai_proba_invert_applied"] = bool(invert_applied)
+            d["proba_raw"] = float(proba_raw)
+            d["proba_used"] = float(proba_used)
+            d["win_index"] = int(win_idx)
+            d["classes_"] = [int(x) for x in cls_list] if cls_list is not None else None
+
+        except Exception as e:
+            bypassed = True
+            reason = f"parse_error: {type(e).__name__}: {e}"
+            d["score_error"] = reason
+
+    score = proba_used if (proba_used is not None and np.isfinite(float(proba_used))) else None
 
     return jsonify({
         "ok": True,
-        "model_loaded": (ai_model is not None),
+        "model_loaded": True,
+        "invert_env": 1 if invert_env else 0,
+        "invert_applied": 1 if invert_applied else 0,
+        "proba_raw": proba_raw,
+        "proba_used": proba_used,
         "score": score,
         "bypassed": bool(bypassed),
-        "debug": dbg,
+        "reason": reason or d.get("reason", ""),
+        "debug": d,
         "model_version": os.environ.get("MODEL_VERSION", ""),
     }), 200
+
+
 
 
 @app.route("/reload_model", methods=["POST", "GET"])
