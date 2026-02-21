@@ -2382,37 +2382,49 @@ def logic_main(force: bool = False):
             
             # ==========================================================
             # AIで「順張り/逆張り（LONG/SHORT）」を選ぶ（最小変更・泥沼回避）
+
             # - base_side: 現行ロジックが出した side
             # - flip_side: 反対 side
             # - 勝てそうな方（Win確率が高い方）を採用
             # - AIがbypassしたら従来通り（fail-open/closedに従う）
             # ==========================================================
             ai_score = None
-
+            
             # 動的AI_TH（既存仕様）
             ai_th_used = AI_TH
             if DYNAMIC_AI_TH:
                 ai_th_used = compute_dynamic_ai_th(AI_TH, btc_mode, median_sigma, btc_ok, BTC_CALM)
-
+            
             # 銘柄別モデル（既存仕様）
             model_for_sym = ai_model
             sym_code = symbol.replace("/USDT", "")
             if ENABLE_MULTI_MODEL:
                 model_for_sym, _ver, _src = get_ai_model_for_symbol(sym_code)
-
+            
             # AIでside選択を有効化（envでOFF可）
             AI_SIDE_SELECT = (os.environ.get("AI_SIDE_SELECT", "1").strip() == "1")
-
-            # ★追加：AI確率の解釈を反転（Win向きにする）: p_used = 1 - p_raw
-            AI_PROBA_INVERT = (os.environ.get("AI_PROBA_INVERT", "0").strip() == "1")
-
+            # AI_PROBA_INVERT はグローバル定義を使う（ここでは再定義しない）
+            
+            # --- NameError防止：AIブロック突入時点で必ず初期値を持たせる（挙動は変えない）---
+            dbg = {}
+            ai_debug_str = ""
+            
+            proba_raw_val = ""
+            proba_used_val = ""
+            invert_applied_val = ""
+            
+            ai_proba_base_val = ""
+            ai_proba_flip_val = ""
+            ai_proba_used_val = ""
+            ai_margin_val = ""
             
             base_side = "LONG" if is_buy else "SHORT"
             flip_side = "SHORT" if base_side == "LONG" else "LONG"
             flip_allowed = (ALLOW_SHORT if flip_side == "SHORT" else ALLOW_LONG)
-
+            
             # 学習側と整合：Sideに応じて Rise/Drop のどちらか一方だけに寄せる
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
+
 
             def _make_feats(side: str) -> pd.DataFrame:
                 rise = sig_score if side == "LONG" else 0.0
@@ -2662,7 +2674,31 @@ def logic_main(force: bool = False):
             except Exception:
                 ai_margin_val = ""            
 
-            
+
+            # --- NameError防止：どの分岐でも必ず定義しておく ---
+            if "dbg" not in locals() or not isinstance(dbg, dict):
+                dbg = {}
+
+            if "ai_proba_base_val" not in locals():
+                ai_proba_base_val = ""
+            if "ai_proba_flip_val" not in locals():
+                ai_proba_flip_val = ""
+            if "ai_proba_used_val" not in locals():
+                ai_proba_used_val = ""
+            if "ai_margin_val" not in locals():
+                ai_margin_val = ""
+
+            # --- dbg から「証拠」用の値を先に抜く（dbgがdict前提）---
+            proba_raw_val = dbg.get("proba_raw", "")
+            proba_used_val = dbg.get("proba_used", "")
+            invert_applied_val = dbg.get("ai_proba_invert_applied", "")
+
+            # --- Sheetsへ書く ai_debug は JSON文字列にする（dictのままだと落ちやすい）---
+            try:
+                ai_debug_str = json.dumps(dbg, ensure_ascii=False, separators=(",", ":"), default=str)
+            except Exception:
+                ai_debug_str = str(dbg)
+
             item = {
                 "symbol": symbol.replace("/USDT", ""),
                 "time": int(row["Time"]),
@@ -2676,34 +2712,35 @@ def logic_main(force: bool = False):
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
                 "ai_score": ai_score,
                 "ai_pass": bool(ai_pass),
-                "ai_debug": dbg,
 
-                # ★追加：AI_PROBA_INVERT の「証拠」を item に乗せる（learn_log/ログで見えるように）
-                # dbg は _score_side() が返す dict をベースにしている前提（あなたの②の通り proba_raw 等が入る）
-                "proba_raw": (dbg.get("proba_raw", "") if isinstance(dbg, dict) else ""),
-                "proba_used": (dbg.get("proba_used", "") if isinstance(dbg, dict) else ""),
-                # print側は invert_applied というキーを見に行っているので、ここで合わせる
-                "invert_applied": (dbg.get("ai_proba_invert_applied", "") if isinstance(dbg, dict) else ""),
+                # learn_log(AO) に入れる前提：JSON文字列で保持
+                "ai_debug": ai_debug_str,
+
+                # AI_PROBA_INVERT の「証拠」も item に入れる（文字列/数値どちらでもOK）
+                "proba_raw": proba_raw_val,
+                "proba_used": proba_used_val,
+                "invert_applied": invert_applied_val,
 
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
 
-                # ★追加（learn_log分析用）
+                # learn_log(AP..AS) 用
                 "ai_proba_base": ai_proba_base_val,
                 "ai_proba_flip": ai_proba_flip_val,
                 "ai_proba_used": ai_proba_used_val,
                 "ai_margin": ai_margin_val,
-            
+
                 # --- learn_log に書き戻したい値は item に持たせる（row参照を消す） ---
                 "BandWidth": float(row["BandWidth"]),
                 "BW_Change": float(row["BW_Change"]),
                 "Vol_Change": float(row["Vol_Change"]),
-                # market_ai_* は今このスニペット内で row に無いので、空で持たせる（将来拡張用）
+
+                # market_ai_* はここでは空（既存設計のまま）
                 "market_ai_score": "",
                 "market_ai_pass": "",
                 "market_ai_debug": "",
             }
-            
+
             pending_candidates.append(item)
 
 
@@ -3071,6 +3108,13 @@ def logic_main(force: bool = False):
             # --- optional-but-we-want-to-always-write ---
             bw_val, bw_chg_val, vol_chg_val, btc_ret_val, btc_vol_val,
             m_ai_score, m_ai_pass, m_ai_debug,
+
+            # --- ★追加：learn_log の末尾列（AO / AP..AS）---
+            item.get("ai_debug", ""),          # AO: ai_debug（JSON文字列）
+            item.get("ai_proba_base", ""),     # AP
+            item.get("ai_proba_flip", ""),     # AQ
+            item.get("ai_proba_used", ""),     # AR
+            item.get("ai_margin", ""),         # AS
         ]
 
         # ai_debug 列が存在する場合はその列位置に代入（列ズレ防止）
@@ -3114,10 +3158,26 @@ def logic_main(force: bool = False):
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
+        # --- learn_log への書き込み安全化（列ズレ＆dict書き込み事故を潰す）---
+
+        # 1) ai_debug が dict/list の場合は JSON 文字列にしてから書く
+        #    ※ Sheets には dict のまま渡さない（失敗しやすい）
+        try:
+            idx_dbg = learn_fields.index("ai_debug")
+            if idx_dbg < len(row_out) and isinstance(row_out[idx_dbg], (dict, list)):
+                row_out[idx_dbg] = json.dumps(
+                    row_out[idx_dbg],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+        except Exception:
+            pass
+
+        # 2) row_out の長さを learn_fields に合わせてパディング（末尾列が zip から落ちないように）
+        row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
+
         candidate_rows.append(row_out)
-
-        
-
 
         learn_keys.add(k)
 
