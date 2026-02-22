@@ -3534,11 +3534,23 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
         candles = fetch_ohlcv_safe(exchange, market, timeframe="15m", since=since_ms, limit=100)
         if not candles:
             continue
-        if candles and len(candles) >= 1:
+
+        # 最後の1本が「形成中の15m足」なら除外して、確定足だけで判定する
+        if len(candles) >= 1:
             last_open_ts_ms = int(candles[-1][0])
             _log_judge_15m_bar(last_open_ts_ms, label=f"{market}-15m")
 
+            now_ms = int(time.time() * 1000)
+            forming = now_ms < (last_open_ts_ms + 15 * 60 * 1000)
 
+            if forming:
+                # forming足（今の足）を落として、直前の確定足で判定する
+                if len(candles) >= 2:
+                    candles = candles[:-1]
+                    last_open_ts_ms = int(candles[-1][0])
+                    _log_judge_15m_bar(last_open_ts_ms, label=f"{market}-15m-closed")
+                else:
+                    continue
 
         res_status = "PENDING"
         res_win = ""
@@ -4201,7 +4213,18 @@ def judge_process():
         mutex_token = token
 
         try:
+            # 15m足の「確定直後」だけ判定を実行する（5分起動は維持）
+            # 例: window=90 なら、毎時 00/15/30/45 の「最初の90秒だけ」実行し、それ以外は即スキップ
+            now_utc = time.time()
+            rem = now_utc % (15 * 60)
+            window = int(os.environ.get("JUDGE_CLOSE_WINDOW_SEC", "90"))
+            if rem > window:
+                msg = f"Skip: not 15m close window rem={rem:.1f}s window={window}s"
+                print(f"[JUDGE15M]{msg}")
+                return msg, 200
+
             return str(judge_main()), 200
+
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             print(f"[ERR] /judge crashed: {err}")
