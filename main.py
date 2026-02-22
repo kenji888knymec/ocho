@@ -958,25 +958,29 @@ def _resolve_okx_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
     _symbol_resolve_cache[symbol] = symbol
     return symbol
 
-def fetch_ohlcv_safe(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int,
-                     since: Optional[int] = None, retries: int = FETCH_RETRY) -> Optional[List[List[Any]]]:
-    last_err = None
-    sym = _resolve_okx_symbol(exchange, symbol)
+def _log_judge_15m_bar(bar_open_ts_ms: int, label: str = "") -> None:
+    """
+    /judge が参照している 15m足が「形成中か」を1行で出す。
+    bar_open_ts_ms: 足の open 時刻（ms）
+    """
+    try:
+        jst = timezone(timedelta(hours=9))
+        now_jst = datetime.now(timezone.utc).astimezone(jst)
 
-    for k in range(retries + 1):
-        try:
-            if since is None:
-                return exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
-            return exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
-        except Exception as e:
-            last_err = e
-            if k < retries:
-                time.sleep(FETCH_RETRY_SLEEP_SEC * (k + 1))
-                continue
-            break
+        bar_open_jst = datetime.fromtimestamp(bar_open_ts_ms / 1000.0, tz=timezone.utc).astimezone(jst)
+        bar_close_jst = bar_open_jst + timedelta(minutes=15)
 
-    print(f"[WARN] fetch_ohlcv_safe failed: {symbol} (resolved={sym}) err={last_err}")
-    return None
+        forming = now_jst < bar_close_jst
+
+        print(
+            f"[JUDGE15M]{'[' + label + ']' if label else ''} "
+            f"now_jst={now_jst.isoformat(timespec='seconds')} "
+            f"bar_open_jst={bar_open_jst.isoformat(timespec='seconds')} "
+            f"bar_close_jst={bar_close_jst.isoformat(timespec='seconds')} "
+            f"forming={forming}"
+        )
+    except Exception as e:
+        print(f"[WARN] _log_judge_15m_bar failed: {type(e).__name__}: {e}")
 
 # ==========================================
 # 行数/重複キー
@@ -3504,6 +3508,11 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
         candles = fetch_ohlcv_safe(exchange, market, timeframe="15m", since=since_ms, limit=100)
         if not candles:
             continue
+        if candles and len(candles) >= 1:
+            last_open_ts_ms = int(candles[-1][0])
+            _log_judge_15m_bar(last_open_ts_ms, label=f"{market}-15m")
+
+
 
         res_status = "PENDING"
         res_win = ""
