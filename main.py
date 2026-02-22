@@ -958,6 +958,32 @@ def _resolve_okx_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
     _symbol_resolve_cache[symbol] = symbol
     return symbol
 
+def fetch_ohlcv_safe(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int,
+                     since: Optional[int] = None, retries: Optional[int] = None) -> Optional[List[List[Any]]]:
+    """ccxt fetch_ohlcv を安全に呼ぶ。/judge の NameError 回避のためグローバル定義。"""
+    last_err = None
+    sym = _resolve_okx_symbol(exchange, symbol)
+
+    if retries is None:
+        retries = int(globals().get("FETCH_RETRY", 2))
+    sleep_sec = float(globals().get("FETCH_RETRY_SLEEP_SEC", 1.0))
+
+    for k in range(retries + 1):
+        try:
+            if since is None:
+                return exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            return exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
+        except Exception as e:
+            last_err = e
+            if k < retries:
+                time.sleep(sleep_sec * (k + 1))
+                continue
+            break
+
+    print(f"[WARN] fetch_ohlcv_safe failed: {symbol} (resolved={sym}) err={last_err}")
+    return None
+
+
 def _log_judge_15m_bar(bar_open_ts_ms: int, label: str = "") -> None:
     """
     /judge が参照している 15m足が「形成中か」を1行で出す。
