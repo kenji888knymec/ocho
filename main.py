@@ -2743,42 +2743,60 @@ def logic_main(force: bool = False):
                 "is_sell": bool(is_sell),
                 "close": float(row["Close"]),
                 "score": float(max(row["Drop_Score"], row["Rise_Score"])),
-                "sigma": float(row["Dynamic_Sigma"]),
+                "sigma": float(row["Dynamic_Sigma"]),   # 実質 VolSigma として扱う
                 "rsi": float(row["RSI"]),
                 "type": signal_type,
                 "dt": datetime.fromtimestamp(int(row["Time"]) / 1000, JST),
                 "ai_score": ai_score,
                 "ai_pass": bool(ai_pass),
-            
+
                 # learn_log(AO) ：JSON文字列
                 "ai_debug": ai_debug_str,
-            
+
                 # DIRECT/REVERSE は tag 列へ（learn_log側で追跡できる）
                 "tag": invert_mode_tag,
-            
+
                 # AI_PROBA_INVERT の「証拠」も item に入れる（必要なら後で列追加できる）
                 "proba_raw": proba_raw_val,
                 "proba_used": proba_used_val,
                 "invert_applied": invert_applied_val,
-            
+
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
-            
+
                 # learn_log(AP..AS) 用
                 "ai_proba_base": ai_proba_base_val,
                 "ai_proba_flip": ai_proba_flip_val,
                 "ai_proba_used": ai_proba_used_val,
                 "ai_margin": ai_margin_val,
-            
+
                 "BandWidth": float(row["BandWidth"]),
                 "BW_Change": float(row["BW_Change"]),
                 "Vol_Change": float(row["Vol_Change"]),
-            
+
+                # --- 追加：通知レジーム判定・通知フィルター用（Phase1） ---
+                "btc_mode": str(btc_mode),
+                "btc_1h_change": float(btc_1h_change),
+                "btc_calm": bool(BTC_CALM),
+                "market_tag": ("STORM" if not BTC_CALM else "CALM"),
+
+                # NOTE:
+                # ここでは _to_finite_float_or_none(...) を使わない（この位置では未定義の可能性があるため）
+                # 後段の notify filter 側で _nf(...) により安全変換する
+                "btc_ret": btc_ret,
+                "btc_vol": btc_vol,
+
+                # --- market AI（既存） ---
                 "market_ai_score": "",
                 "market_ai_pass": "",
                 "market_ai_debug": "",
+
+                # --- 追加：通知判定結果の一時保持用（Phase1/Phase2で使用） ---
+                "_regime_mode": "",
+                "_notify_tier": "",
+                "_notify_reason": "",
             }
-            
+
             pending_candidates.append(item)
 
 
@@ -3284,6 +3302,196 @@ def logic_main(force: bool = False):
         print(f"[DBG] obs_summary_failed: {_e}")
     # ===== /DEBUG =====
     
+    # =========================
+    # Phase1: Regime notify filter (案A)
+    # =========================
+    def _env_flag(name, default=False):
+        v = os.getenv(name, "1" if default else "0")
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+    def _env_text(name, default=""):
+        v = os.getenv(name, None)
+        return default if v is None else str(v).strip()
+
+    def _env_float(name, default):
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return float(default)
+
+    def _nf(v, default=None):
+        try:
+            if v is None:
+                return default
+            x = float(v)
+            if not np.isfinite(x):
+                return default
+            return x
+        except Exception:
+            return default
+
+    def _item_hour_jst(it):
+        try:
+            dtv = it.get("dt", None)
+            if dtv is None:
+                return None
+            return int(dtv.hour)
+        except Exception:
+            return None
+
+    # ---- Feature flags（Phase1=案A本番 / Phase2=案B shadowはOFFのまま仕込み）----
+    ENABLE_REGIME_NOTIFY_FILTER = _env_flag("ENABLE_REGIME_NOTIFY_FILTER", True)
+    ENABLE_SHADOW_NOTIFY = _env_flag("ENABLE_SHADOW_NOTIFY", False)  # Phase2で使用（今回は未使用）
+    REGIME_FORCE_MODE = _env_text("REGIME_FORCE_MODE", "AUTO").upper()
+    RULE_VERSION_TAG = _env_text("RULE_VERSION_TAG", "REGIME_NOTIFY_V1")
+
+    # ---- Regime判定しきい値（初期値。後で環境変数で微調整可）----
+    REGIME_BEAR_BTC1H_TH = _env_float("REGIME_BEAR_BTC1H_TH", -0.0060)      # -0.60%
+    REGIME_REBOUND_BTC1H_TH = _env_float("REGIME_REBOUND_BTC1H_TH", 0.0040) # +0.40%
+
+    # ---- NEUTRAL（通常）通知フィルター ----
+    NEUTRAL_SHORT_VSIG_MAX = _env_float("NEUTRAL_SHORT_VSIG_MAX", 0.0035)
+    NEUTRAL_LONG_VSIG_MAX = _env_float("NEUTRAL_LONG_VSIG_MAX", 0.0047)
+    NEUTRAL_LONG_RSI_MAX = _env_float("NEUTRAL_LONG_RSI_MAX", 56.0)
+
+    # ---- BEAR_AGGR（下落ショート優位）----
+    BEAR_SHORT_RSI_MIN = _env_float("BEAR_SHORT_RSI_MIN", 38.0)
+    BEAR_SHORT_BTC1H_MIN = _env_float("BEAR_SHORT_BTC1H_MIN", -0.0110)  # -1.10%
+    BEAR_SHORT_BTCVOL_MAX = _env_float("BEAR_SHORT_BTCVOL_MAX", 0.0077)
+    BEAR_ALLOW_LONG = _env_flag("BEAR_ALLOW_LONG", False)
+
+    # ---- REBOUND_LONG（反発上昇）----
+    REBOUND_SHORT_RSI_BLOCK = _env_float("REBOUND_SHORT_RSI_BLOCK", 64.0)
+    REBOUND_SHORT_BTC1H_BLOCK = _env_float("REBOUND_SHORT_BTC1H_BLOCK", 0.0050)  # +0.50%
+    REBOUND_LONG_STRONG_RSI = _env_float("REBOUND_LONG_STRONG_RSI", 74.0)
+
+    BAD_HOURS_NEUTRAL = {14, 16, 17}
+
+    def detect_regime_mode_for_notify(item):
+        """
+        戻り値:
+          - NEUTRAL
+          - BEAR_AGGR
+          - REBOUND_LONG
+        """
+        try:
+            forced = str(REGIME_FORCE_MODE).upper().strip()
+            if forced in ("NEUTRAL", "BEAR_AGGR", "REBOUND_LONG"):
+                return forced
+
+            btc_mode_s = str(item.get("btc_mode", "")).strip().upper()
+            btc1h = _nf(item.get("btc_1h_change", None), None)
+
+            # mode文字列ヒント
+            mode_has_down = ("DOWN" in btc_mode_s) or ("BEAR" in btc_mode_s)
+            mode_has_up = ("UP" in btc_mode_s) or ("BULL" in btc_mode_s)
+
+            # 数値 + mode の複合で判定（安全側）
+            if (btc1h is not None) and (btc1h <= REGIME_BEAR_BTC1H_TH) and mode_has_down:
+                return "BEAR_AGGR"
+
+            if (btc1h is not None) and (btc1h >= REGIME_REBOUND_BTC1H_TH) and mode_has_up:
+                return "REBOUND_LONG"
+
+            # フォールバック（modeだけで明確な時）
+            if mode_has_down and (btc1h is not None) and (btc1h < 0):
+                return "BEAR_AGGR"
+
+            if mode_has_up and (btc1h is not None) and (btc1h > 0):
+                return "REBOUND_LONG"
+
+            return "NEUTRAL"
+        except Exception:
+            return "NEUTRAL"
+
+    def should_notify_signal_phaseA(item, regime_mode):
+        """
+        戻り値: (notify_ok: bool, notify_tier: str, notify_reason: str)
+        Phase1は案Aのみ（AI_Pass=False救済はまだ行わない）
+        """
+        try:
+            if not ENABLE_REGIME_NOTIFY_FILTER:
+                return True, "NORMAL", "filter_off"
+
+            ai_pass = bool(item.get("ai_pass", False))
+            if not ai_pass:
+                # Phase1ではAI_Pass=Falseは通知しない（案Bでshadow育成）
+                return False, "BLOCK", "ai_pass_false"
+
+            side = "LONG" if bool(item.get("is_buy", False)) else "SHORT"
+            hour = _item_hour_jst(item)
+            rsi = _nf(item.get("rsi", None), None)
+            vsig = _nf(item.get("sigma", None), None)          # item["sigma"] は実質 VolSigma
+            bw = _nf(item.get("BandWidth", None), None)
+            btc1h = _nf(item.get("btc_1h_change", None), None)
+            btc_vol = _nf(item.get("btc_vol", None), None)
+
+            # ---- NEUTRAL（通常）----
+            if regime_mode == "NEUTRAL":
+                if hour in BAD_HOURS_NEUTRAL:
+                    return False, "BLOCK", f"neutral_bad_hour_{hour}"
+
+                if side == "SHORT":
+                    if (vsig is not None) and (vsig > NEUTRAL_SHORT_VSIG_MAX):
+                        return False, "BLOCK", f"neutral_short_vsig>{NEUTRAL_SHORT_VSIG_MAX}"
+                    return True, "NORMAL", "neutral_short_ok"
+
+                # LONG
+                if (vsig is not None) and (vsig > NEUTRAL_LONG_VSIG_MAX):
+                    return False, "BLOCK", f"neutral_long_vsig>{NEUTRAL_LONG_VSIG_MAX}"
+
+                if (rsi is not None) and (rsi > NEUTRAL_LONG_RSI_MAX):
+                    return False, "BLOCK", f"neutral_long_rsi>{NEUTRAL_LONG_RSI_MAX}"
+
+                return True, "NORMAL", "neutral_long_ok"
+
+            # ---- BEAR_AGGR（下落ショート優位）----
+            if regime_mode == "BEAR_AGGR":
+                if side == "LONG":
+                    if not BEAR_ALLOW_LONG:
+                        return False, "BLOCK", "bear_long_blocked"
+                    return True, "NORMAL", "bear_long_allowed"
+
+                # SHORT: 基本通すが「売られすぎ最終局面」を抑制
+                if (rsi is not None) and (rsi < BEAR_SHORT_RSI_MIN):
+                    return False, "BLOCK", f"bear_short_rsi<{BEAR_SHORT_RSI_MIN}"
+
+                if (btc1h is not None) and (btc1h < BEAR_SHORT_BTC1H_MIN):
+                    return False, "BLOCK", f"bear_short_btc1h<{BEAR_SHORT_BTC1H_MIN}"
+
+                if (btc_vol is not None) and (btc_vol >= BEAR_SHORT_BTCVOL_MAX):
+                    return False, "BLOCK", f"bear_short_btcvol>={BEAR_SHORT_BTCVOL_MAX}"
+
+                return True, "NORMAL", "bear_short_ok"
+
+            # ---- REBOUND_LONG（反発上昇）----
+            if regime_mode == "REBOUND_LONG":
+                if side == "LONG":
+                    if (rsi is not None) and (rsi >= REBOUND_LONG_STRONG_RSI):
+                        return True, "STRONG", f"rebound_long_rsi>={REBOUND_LONG_STRONG_RSI}"
+                    return True, "NORMAL", "rebound_long_ok"
+
+                # SHORTは厳選（上昇逆行ショートをブロック）
+                if (rsi is not None) and (rsi >= REBOUND_SHORT_RSI_BLOCK):
+                    return False, "BLOCK", f"rebound_short_rsi>={REBOUND_SHORT_RSI_BLOCK}"
+
+                if (btc1h is not None) and (btc1h >= REBOUND_SHORT_BTC1H_BLOCK):
+                    return False, "BLOCK", f"rebound_short_btc1h>={REBOUND_SHORT_BTC1H_BLOCK}"
+
+                # ここまで通れば「反発中でも許容SHORT」
+                # （Phase1では簡易版。Phase2以降でSTRONG条件を追加）
+                return True, "NORMAL", "rebound_short_ok"
+
+            # 予期しない値は安全側でNEUTRAL相当
+            return True, "NORMAL", "regime_unknown_fallback"
+
+        except Exception as e:
+            # フィルター異常で止めない（安全に既存動作寄せ）
+            print(f"[NOTIFY_FILTER] error fallback pass sym={item.get('symbol','?')}: {e}")
+            return True, "NORMAL", "filter_error_fallback_pass"
+
     # いったんスコア順に並べる（ここではまだ上位制限しない）
     filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
 
@@ -3301,6 +3509,7 @@ def logic_main(force: bool = False):
         dt_str = normalize_dt_str(item["dt"].strftime("%Y-%m-%d %H:%M:%S"))
         dt_cell = "'" + dt_str
 
+
         if sym in last_alert_records and last_alert_records[sym] == ts_ms:
             continue
         if (now_jst - item["dt"]).total_seconds() > 3000:
@@ -3310,7 +3519,22 @@ def logic_main(force: bool = False):
         if k in table_keys:
             continue
 
-        last_alert_records[sym] = ts_ms
+        # --- Regime / Notify filter (Phase1: 案A) ---
+        regime_mode = detect_regime_mode_for_notify(item)
+        notify_ok, notify_tier, notify_reason = should_notify_signal_phaseA(item, regime_mode)
+
+        # item にも残しておく（後続の note_compact / debug 用）
+        item["_regime_mode"] = regime_mode
+        item["_notify_tier"] = notify_tier
+        item["_notify_reason"] = notify_reason
+
+        if not notify_ok:
+            print(
+                f"[NOTIFY_FILTER] blocked "
+                f"sym={sym} side={'LONG' if item.get('is_buy', False) else 'SHORT'} "
+                f"regime={regime_mode} reason={notify_reason}"
+            )
+            continue
 
         tp, sl, tp_pct, sl_pct = calc_tp_sl(item)
 
@@ -3319,52 +3543,77 @@ def logic_main(force: bool = False):
             if item.get("ai_score", None) is None:
                 print(f"[EV] filtered sym={sym} reason=no_ai_score_for_ev")
                 continue
-        
+
             p_win = float(item["ai_score"])
             exp_ret = (p_win * float(tp_pct)) - ((1.0 - p_win) * float(sl_pct))
-        
+
             if exp_ret < float(E_TH):
                 print(f"[EV] filtered sym={sym} exp_ret={exp_ret:.4f} < E_TH={E_TH}")
                 continue
 
-
         cp = float(item["close"])
         lev = DEFAULT_LEV
-        
+
         if item["is_buy"]:
             icon = "🚀"
             d_str = "買い(LONG)"
         else:
             icon = "☄️"
             d_str = "売り(SHORT)"
-        
+
         ai_disp = "N/A" if item["ai_score"] is None else f"{float(item['ai_score']):.1%}"
-        
+
         # --- Hyperliquid入力用の%（レバ反映）を計算 ---
         # sym が "STX/USDT" や "STX-USDT" のようでも判定できるようにベース銘柄に正規化
         sym_base = str(sym).split("/")[0].split("-")[0].strip().upper()
-        
+
         # 5倍銘柄は 5、それ以外は DEFAULT_LEV（通常10）
         hl_lev = 5.0 if sym_base in MAX_LEV_5X_SYMBOLS else float(DEFAULT_LEV)
-        
+
         # tp_pct / sl_pct は「0.58」のように“%表記の数値”前提（あなたの既存表示に合わせる）
         hl_tp_pct = float(tp_pct) * hl_lev
         hl_sl_pct = float(sl_pct) * hl_lev
-        
+
+        # itemに積んだBTC情報を優先して表示（無ければ既存変数をフォールバック）
+        btc_mode_disp = str(item.get("btc_mode", btc_mode))
+        try:
+            btc_1h_disp_val = float(item.get("btc_1h_change", btc_1h_change))
+            btc_1h_disp = f"{btc_1h_disp_val:.2%}"
+        except Exception:
+            btc_1h_disp = "N/A"
+        btc_calm_disp = bool(item.get("btc_calm", BTC_CALM))
+
         msg = (
             f"{icon} **{d_str}** {icon}\n"
-            f"{VERSION}\n"
+            f"{VERSION} [{RULE_VERSION_TAG}]\n"
             f"💎 {sym} ({item['type']})\n"
             f"📈 Score:{item['score']:.2f}σ  AI:{ai_disp}\n"
-            f"🟦 BTC:{btc_mode} 1h:{btc_1h_change:.2%}  Calm:{BTC_CALM}  BTC_OK:{btc_ok}\n"
+            f"🧭 Regime:{regime_mode}  Tier:{notify_tier}\n"
+            f"🟦 BTC:{btc_mode_disp} 1h:{btc_1h_disp}  Calm:{btc_calm_disp}  BTC_OK:{btc_ok}\n"
             f"💰 {cp:.4f}\n"
             f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%) HL:{hl_tp_pct:.1f}%\n"
             f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%"
         )
-        
+
         send_discord_message(msg)
+
+        # ★重要：送信処理の後で記録する（送信失敗時の誤更新を避ける）
+        last_alert_records[sym] = ts_ms
+
         count += 1
 
+        # itemに積んだBTC情報を優先（無ければ既存変数をフォールバック）
+        btc_mode_for_note = str(item.get("btc_mode", btc_mode))
+        try:
+            btc_1h_for_note = float(item.get("btc_1h_change", btc_1h_change))
+            btc_1h_for_note_str = f"{btc_1h_for_note:.2%}"
+        except Exception:
+            btc_1h_for_note_str = "N/A"
+
+        btc_calm_for_tbl = bool(item.get("btc_calm", BTC_CALM))
+        regime_for_note = str(item.get("_regime_mode", ""))
+        tier_for_note = str(item.get("_notify_tier", ""))
+        reason_for_note = str(item.get("_notify_reason", ""))
 
         parts = [
             f"{item['type']}",
@@ -3372,9 +3621,12 @@ def logic_main(force: bool = False):
             f"RSI:{item['rsi']:.1f}",
             fmt_opt("Chg:", item["chg_pct"], "%"),
             fmt_opt("VolR:", item["vol_ratio"]),
-            f"BTC:{btc_mode}",
-            f"1h:{btc_1h_change:.2%}",
+            f"BTC:{btc_mode_for_note}",
+            f"1h:{btc_1h_for_note_str}",
             f"BTC_OK:{btc_ok}",
+            (f"RG:{regime_for_note}" if regime_for_note else ""),
+            (f"Tier:{tier_for_note}" if tier_for_note else ""),
+            (f"NF:{reason_for_note}" if reason_for_note else ""),
         ]
         note_compact = " | ".join([p for p in parts if p])
 
@@ -3383,15 +3635,14 @@ def logic_main(force: bool = False):
             float(cp), float(item["score"]), float(item["sigma"]), "AI_PASS",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
             lev, float(tp_pct * lev), float(sl_pct * lev),
-            bool(BTC_CALM), True, VERSION, note_compact,
+            btc_calm_for_tbl, True, VERSION, note_compact,
             item["chg_pct"], item["vol_ratio"], "MARKET",
         ]
-        
+
         # ★列ズレ防止：TABLE_FIELDS の長さに合わせる（tableが37列でも事故らない）
         row_tbl = _pad_row_to_fields(row_tbl, TABLE_FIELDS, fill="")
-        
-        alert_rows.append(row_tbl)
 
+        alert_rows.append(row_tbl)
 
         table_keys.add(k)
 
