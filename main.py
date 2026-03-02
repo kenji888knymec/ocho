@@ -1591,9 +1591,10 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "rows_skipped_blank_required": 0,
         "rows_used": 0,
         # NOTE: モデルの feature_names_in_ と一致させる（スペース入り）
+        # 修正後
         "feature_columns": [
             "Sigma", "BandWidth", "BW Change", "RSI", "Vol Change",
-            "Rise Score", "Drop Score", "BTC Ret", "BTC Vol",
+            "BTC Ret", "BTC Vol",
             "Score", "Is Long"
         ],
         "notes": [
@@ -1665,14 +1666,13 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     score_raw = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     is_long_enc = is_long.astype(float)
     
+    # 修正後
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
         "BandWidth": bw.astype(float),
         "BW Change": bw_chg.astype(float),
         "RSI": rsi.astype(float),
         "Vol Change": vol_chg.astype(float),
-        "Rise Score": pd.to_numeric(rise_score, errors="coerce").astype(float),
-        "Drop Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
         "BTC Ret": btc_ret.astype(float),
         "BTC Vol": btc_vol.astype(float),
         "Score": score_raw.astype(float),
@@ -2246,8 +2246,9 @@ def logic_main(force: bool = False):
         btc_current = float(btc_df.iloc[-2]["Close"])
         btc_1h_ago = float(btc_df.iloc[-6]["Close"])
         btc_1h_change = (btc_current - btc_1h_ago) / btc_1h_ago
+        # 修正後
         btc_ret = float(btc_df.iloc[-2]["Pct_Change"])
-        btc_vol = abs(btc_ret)
+        btc_vol = float(btc_df["Dynamic_Sigma"].tail(5).mean())
 
         if btc_1h_change > 0.001:
             btc_mode = "Up"
@@ -2469,16 +2470,12 @@ def logic_main(force: bool = False):
 
             # 修正後
             def _make_feats(side: str) -> pd.DataFrame:
-                rise = sig_score if side == "LONG" else 0.0
-                drop = sig_score if side == "SHORT" else 0.0
                 return pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
                     "BW Change": float(row["BW_Change"]),
                     "RSI": float(row["RSI"]),
                     "Vol Change": float(row["Vol_Change"]),
-                    "Rise Score": float(rise),
-                    "Drop Score": float(drop),
                     "BTC Ret": float(btc_ret),
                     "BTC Vol": float(btc_vol),
                     "Score": float(sig_score),
@@ -4130,17 +4127,17 @@ def ai_smoke():
     if expected_cols:
         feats = pd.DataFrame([{c: 0.0 for c in expected_cols}])
     else:
-        # feature_names が取れない場合のフォールバック（あなたの9特徴量）
+        # 修正後
         feats = pd.DataFrame([{
             "Sigma": 0.0,
             "BandWidth": 0.0,
             "BW Change": 0.0,
             "RSI": 50.0,
             "Vol Change": 0.0,
-            "Rise Score": 0.0,
-            "Drop Score": 0.0,
             "BTC Ret": 0.0,
             "BTC Vol": 0.0,
+            "Score": 0.0,
+            "Is Long": 0.0,
         }])
 
     proba = None
