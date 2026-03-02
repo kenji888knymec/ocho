@@ -2246,9 +2246,9 @@ def logic_main(force: bool = False):
         btc_current = float(btc_df.iloc[-2]["Close"])
         btc_1h_ago = float(btc_df.iloc[-6]["Close"])
         btc_1h_change = (btc_current - btc_1h_ago) / btc_1h_ago
-        # 修正後
+        # 修正後（元に戻す）
         btc_ret = float(btc_df.iloc[-2]["Pct_Change"])
-        btc_vol = float(btc_df["Dynamic_Sigma"].tail(5).mean())
+        btc_vol = abs(btc_ret)
 
         if btc_1h_change > 0.001:
             btc_mode = "Up"
