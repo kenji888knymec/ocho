@@ -1593,7 +1593,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         # NOTE: モデルの feature_names_in_ と一致させる（スペース入り）
         "feature_columns": [
             "Sigma", "BandWidth", "BW Change", "RSI", "Vol Change",
-            "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"
+            "Rise Score", "Drop Score", "BTC Ret", "BTC Vol",
             "Score", "Is Long"
         ],
         "notes": [
@@ -2467,6 +2467,7 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
 
+            # 修正後
             def _make_feats(side: str) -> pd.DataFrame:
                 rise = sig_score if side == "LONG" else 0.0
                 drop = sig_score if side == "SHORT" else 0.0
@@ -2480,6 +2481,8 @@ def logic_main(force: bool = False):
                     "Drop Score": float(drop),
                     "BTC Ret": float(btc_ret),
                     "BTC Vol": float(btc_vol),
+                    "Score": float(sig_score),
+                    "Is Long": float(1.0 if side == "LONG" else 0.0),
                 }])
 
 
