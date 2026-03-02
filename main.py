@@ -308,7 +308,7 @@ EXPECTED_HEADERS_LEARN = [
     "market_ai_score", "market_ai_pass", "market_ai_debug",
     # --- AI evidence columns (already exist in your sheet) ---
     "ai_debug", "ai_proba_base", "ai_proba_flip", "ai_proba_used", "ai_margin",
-    "tag", "proba_raw", "proba_used", "invert_applied",
+    "tag", "proba_raw", "proba_used", "invert_applied", "is_flip",
 ]
 
 
@@ -2761,6 +2761,7 @@ def logic_main(force: bool = False):
                 "proba_raw": proba_raw_val,
                 "proba_used": proba_used_val,
                 "invert_applied": invert_applied_val,
+                "is_flip": bool(flipped),
 
                 "chg_pct": chg_pct_val,
                 "vol_ratio": vol_ratio_val,
@@ -3229,6 +3230,7 @@ def logic_main(force: bool = False):
         row_out = _set_field_value(row_out, learn_fields, "proba_raw", _to_finite_float_or_none(item.get("proba_raw", None)))
         row_out = _set_field_value(row_out, learn_fields, "proba_used", _to_finite_float_or_none(item.get("proba_used", None)))
         row_out = _set_field_value(row_out, learn_fields, "invert_applied", item.get("invert_applied", ""))
+        row_out = _set_field_value(row_out, learn_fields, "is_flip", item.get("is_flip", ""))
         # ★列ズレ防止：必ずヘッダー長に合わせる
         row_out = _pad_row_to_fields(row_out, learn_fields, fill="")
 
