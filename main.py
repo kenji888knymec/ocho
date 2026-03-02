@@ -4,6 +4,7 @@ import threading
 import hashlib
 import subprocess
 import re
+import json
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -196,14 +197,6 @@ print(
     f"SYMBOL_CAUTIONLIST={sorted(list(SYMBOL_CAUTIONLIST))} "
     f"VOLSIGMA_BAN_RANGE={VOLSIGMA_BAN_MIN}-{VOLSIGMA_BAN_MAX}"
 )
-
-
-
-
-# --- Advanced toggles (SAFE DEFAULT: OFF) ---
-ENABLE_E_FILTER = os.environ.get("ENABLE_E_FILTER", "0") == "1"
-E_TH = float(os.environ.get("E_TH", "0.0"))
-
 
 
 # --- Advanced toggles (SAFE DEFAULT: OFF) ---
@@ -2422,6 +2415,7 @@ def logic_main(force: bool = False):
             # - AIがbypassしたら従来通り（fail-open/closedに従う）
             # ==========================================================
             ai_score = None
+            bypassed = True
             
             # 動的AI_TH（既存仕様）
             ai_th_used = AI_TH
@@ -3153,8 +3147,8 @@ def logic_main(force: bool = False):
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, 0, 0, bool(item["ai_pass"]), bool(BTC_CALM),
-            VERSION, item["type"], 0, 0,
+            DEFAULT_LEV, "", "", bool(item["ai_pass"]), bool(BTC_CALM),
+            VERSION, item["type"], "", "",
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
 
