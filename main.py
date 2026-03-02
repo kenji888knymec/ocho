@@ -1594,6 +1594,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "feature_columns": [
             "Sigma", "BandWidth", "BW Change", "RSI", "Vol Change",
             "Rise Score", "Drop Score", "BTC Ret", "BTC Vol"
+            "Score", "Is Long"
         ],
         "notes": [
             "NO IMPUTATION: rows with blank/non-numeric values in required features are dropped.",
@@ -1660,6 +1661,10 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     rise_score = np.where(is_long, score, 0.0)
     drop_score = np.where(is_short, score, 0.0)
 
+    # 修正後
+    score_raw = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    is_long_enc = is_long.astype(float)
+    
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
         "BandWidth": bw.astype(float),
@@ -1670,6 +1675,8 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "Drop Score": pd.to_numeric(drop_score, errors="coerce").astype(float),
         "BTC Ret": btc_ret.astype(float),
         "BTC Vol": btc_vol.astype(float),
+        "Score": score_raw.astype(float),
+        "Is Long": is_long_enc.astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan)
 
     # NaN が残る行は学習に使わない（=欠損は埋めない）
