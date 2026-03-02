@@ -162,6 +162,12 @@ VOLRATIO_MAX = _env_float("VOLRATIO_MAX", float("inf"))           # 例: 2.0
 RSI_SHORT_MIN = _env_float("RSI_SHORT_MIN", float("-inf"))        # 例: 20
 RSI_LONG_MAX = _env_float("RSI_LONG_MAX", float("inf"))           # 例: 45
 
+# R1: Score上限（例: 3.0 を設定するとScore>3.0をブロック）
+SCORE_MAX = _env_float("SCORE_MAX", float("inf"))
+# R3追加: SHORTのRSI上限（例: 70 を設定するとSHORT×RSI>70をブロック）
+RSI_SHORT_MAX = _env_float("RSI_SHORT_MAX", float("inf"))
+
+
 AI_PCT_MIN = _env_float("AI_PCT_MIN", float("-inf"))              # 未設定なら下限チェック無し（例: 62.7）
 AI_PCT_MAX = _env_float("AI_PCT_MAX", float("inf"))               # 例: 69.4（%）
 
@@ -190,6 +196,7 @@ print(
     "[CFG] "
     f"GUARDRAILS VOLRATIO_MAX={VOLRATIO_MAX} VOLRATIO_MAX_CAUTION={VOLRATIO_MAX_CAUTION} "
     f"RSI_SHORT_MIN={RSI_SHORT_MIN} RSI_LONG_MAX={RSI_LONG_MAX} "
+    f"SCORE_MAX={SCORE_MAX} RSI_SHORT_MAX={RSI_SHORT_MAX} "
     f"AI_PCT_MIN={AI_PCT_MIN} AI_PCT_MAX={AI_PCT_MAX} AI_PCT_MAX_CAUTION={AI_PCT_MAX_CAUTION} "
     f"AI_SIDE_MARGIN={AI_SIDE_MARGIN} "
     f"CRASH_SIGMA={CRASH_SIGMA} CRASH_VOLSIGMA={CRASH_VOLSIGMA} "
@@ -2807,6 +2814,19 @@ def logic_main(force: bool = False):
                 guard_ok = False
                 print(f"[GR] skip alert (blocklist) sym={sym_u}")
 
+            # 1.5) R1: Score上限ブロック
+            if guard_ok:
+                try:
+                    sc_raw = item.get("score", None)
+                    if sc_raw is not None:
+                        sc_v = float(sc_raw)
+                        if np.isfinite(sc_v) and sc_v > SCORE_MAX:
+                            guard_ok = False
+                            print(f"[GR] skip alert sym={sym_u} score={sc_v:.2f} > {SCORE_MAX} (R1)")
+                except Exception:
+                    pass
+
+
             # 2) RSI ガード
             if guard_ok:
                 try:
@@ -2829,6 +2849,10 @@ def logic_main(force: bool = False):
                                 if bool(item.get("is_buy", False)) and (rsi_v > RSI_LONG_MAX):
                                     guard_ok = False
                                     print(f"[GR] skip alert sym={sym_u} side=LONG rsi={rsi_v:.2f} > {RSI_LONG_MAX}")
+                                # R3追加: SHORT×RSI上限
+                                if guard_ok and bool(item.get("is_sell", False)) and (rsi_v > RSI_SHORT_MAX):
+                                    guard_ok = False
+                                    print(f"[GR] skip alert sym={sym_u} side=SHORT rsi={rsi_v:.2f} > {RSI_SHORT_MAX} (R3)")
                         except Exception:
                             guard_ok = False
                             print(f"[GR] skip alert sym={sym_u} rsi=parse_failed (no-signal)")
