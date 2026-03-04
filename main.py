@@ -102,6 +102,29 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
+# --- LONG方向別閾値（Phase1） ---
+
+# LONG_AI_TH 未設定時は AI_TH をそのまま使う（現行動作と同一）
+
+LONG_AI_TH = float(os.environ.get("LONG_AI_TH", str(AI_TH)))
+
+
+# --- LONG BTC_Upバイパス（Phase2） ---
+
+# LONG_BYPASS_ON_BTC_UP=1 のときだけ有効（デフォルト=0で完全OFF）
+
+LONG_BYPASS_ON_BTC_UP = (os.environ.get("LONG_BYPASS_ON_BTC_UP", "0").strip() == "1")
+
+
+# --- SHORT BTC下落深度ガード ---
+
+# SHORTを出すにはBTC_1h_changeがこの値以下であることを要求
+
+# 例: -0.003 → BTCが1hで-0.3%以上下がった時だけSHORT許可
+
+# 未設定(-inf)ならチェック無効（現行動作と同一）
+
+
 # 1 のときだけ「Win確率」を反転して扱う（score_used = 1 - score_raw）
 AI_PROBA_INVERT = (os.environ.get("AI_PROBA_INVERT", "0").strip() == "1")
 
@@ -129,6 +152,14 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         print(f"[CFG] invalid {name}={v} -> default={default}")
         return default
+
+# --- LONG BTC_Upバイパス（Phase2）: _env_float使用分（定義後に配置） ---
+LONG_BYPASS_RSI_MAX = _env_float("LONG_BYPASS_RSI_MAX", 50.0)
+LONG_BYPASS_SCORE_MIN = _env_float("LONG_BYPASS_SCORE_MIN", 1.8)
+
+# --- SHORT BTC下落深度ガード: _env_float使用分（定義後に配置） ---
+SHORT_BTC_1H_MIN = _env_float("SHORT_BTC_1H_MIN", float("-inf"))
+
 
 def _parse_symbol_set(env_name: str) -> set:
     raw = os.environ.get(env_name, "").strip()
@@ -293,6 +324,24 @@ print(
     f"COLCOUNT_TTL_SEC={COLCOUNT_TTL_SEC} OKX_DEFAULT_TYPE={OKX_DEFAULT_TYPE} "
     f"RUN_MUTEX_ENABLED={RUN_MUTEX_ENABLED} RUN_MUTEX_SHEET={RUN_MUTEX_SHEET} RUN_MUTEX_TTL_SEC={RUN_MUTEX_TTL_SEC}"
 )
+
+
+print(
+
+    "[CFG] "
+
+    f"LONG_AI_TH={LONG_AI_TH} "
+
+    f"LONG_BYPASS_ON_BTC_UP={LONG_BYPASS_ON_BTC_UP} "
+
+    f"LONG_BYPASS_RSI_MAX={LONG_BYPASS_RSI_MAX} "
+
+    f"LONG_BYPASS_SCORE_MIN={LONG_BYPASS_SCORE_MIN} "
+
+    f"SHORT_BTC_1H_MIN={SHORT_BTC_1H_MIN}"
+
+)
+
 
 # ==========================================
 # 期待ヘッダー
@@ -2656,12 +2705,57 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
+
             # ai_pass 判定（方針：bypass時は「予測しない」＝通知しない）
+
             if bypassed:
+
                 ai_pass = False
+
                 print(f"[AI] bypassed -> SKIP (no alert) in logic_main sym={sym_code}: {dbg}")
+
             else:
-                ai_pass = (float(ai_score) >= float(ai_th_used))
+
+                # ★Phase1: LONG方向別閾値（SHORTは従来通り）
+
+                if chosen_side == "LONG":
+
+                    ai_th_effective = min(float(ai_th_used), float(LONG_AI_TH))
+
+                else:
+
+                    ai_th_effective = float(ai_th_used)
+
+                ai_pass = (float(ai_score) >= float(ai_th_effective))
+
+
+            # ★Phase2: BTC_Up LONGバイパス（環境変数でON/OFF）
+
+            if (not ai_pass) and (not bypassed) and LONG_BYPASS_ON_BTC_UP:
+
+                try:
+
+                    if (chosen_side == "LONG"
+
+                            and str(btc_mode) == "Up"
+
+                            and bool(BTC_CALM)
+
+                            and float(item.get("rsi", 999)) < float(LONG_BYPASS_RSI_MAX)
+
+                            and float(item.get("score", 0)) >= float(LONG_BYPASS_SCORE_MIN)):
+
+                        ai_pass = True
+
+                        print(f"[AI] LONG bypass activated sym={sym_code} btc_mode=Up calm=True"
+
+                              f" rsi={item.get('rsi','')} score={item.get('score','')}"
+
+                              f" ai_score={ai_score} ai_th={ai_th_effective}")
+
+                except Exception as _bp_err:
+
+                    print(f"[AI] LONG bypass check failed sym={sym_code}: {_bp_err}")
 
             # --- AI確率ログ（learn_log分析用）---
             # 方針:
@@ -2868,6 +2962,38 @@ def logic_main(force: bool = False):
                 except Exception:
                     pass
 
+
+            # 2.5) SHORT BTC下落深度ガード
+
+            #      SHORTを出すにはBTCが一定以上下がっていることを要求
+
+            #      浅い一時下落でのSHORT乱発を防ぐ
+
+            if guard_ok and bool(item.get("is_sell", False)):
+
+                try:
+
+                    _btc_1h_v = item.get("btc_1h_change", None)
+
+                    if _btc_1h_v is not None and str(_btc_1h_v).strip() != "":
+
+                        _btc_1h_f = float(_btc_1h_v)
+
+                        if np.isfinite(_btc_1h_f) and _btc_1h_f > float(SHORT_BTC_1H_MIN):
+
+                            guard_ok = False
+
+                            print(f"[GR] skip alert sym={sym_u} side=SHORT"
+
+                                  f" btc_1h={_btc_1h_f:.6f} > {SHORT_BTC_1H_MIN}"
+
+                                  f" (shallow dip filter)")
+
+                except Exception:
+
+                    pass
+            
+            
             # 2.6) VolSigma（sigma）チェック
             #      方針:
             #        - sigma が取れない / 変換できない / NaN / inf の候補は「アラート採用しない」
