@@ -4269,7 +4269,7 @@ def ai_smoke():
     if expected_cols:
         feats = pd.DataFrame([{c: 0.0 for c in expected_cols}])
     else:
-        # 修正後
+        # 修正後（交互作用項追加）
         feats = pd.DataFrame([{
             "Sigma": 0.0,
             "BandWidth": 0.0,
@@ -4280,6 +4280,8 @@ def ai_smoke():
             "BTC Vol": 0.0,
             "Score": 0.0,
             "Is Long": 0.0,
+            "Long x BTC Ret": 0.0,
+            "Long x RSI": 0.0,
         }])
 
     proba = None
