@@ -1644,7 +1644,8 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "feature_columns": [
             "Sigma", "BandWidth", "BW Change", "RSI", "Vol Change",
             "BTC Ret", "BTC Vol",
-            "Score", "Is Long"
+            "Score", "Is Long",
+            "Long x BTC Ret", "Long x RSI"
         ],
         "notes": [
             "NO IMPUTATION: rows with blank/non-numeric values in required features are dropped.",
@@ -1715,7 +1716,7 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
     score_raw = pd.to_numeric(df2["ScoreSigma"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     is_long_enc = is_long.astype(float)
     
-    # 修正後
+    # 修正後（交互作用項追加）
     X = pd.DataFrame({
         "Sigma": sigma.astype(float),
         "BandWidth": bw.astype(float),
@@ -1726,6 +1727,8 @@ def _build_training_matrix_from_learn_log(df: pd.DataFrame) -> Tuple[pd.DataFram
         "BTC Vol": btc_vol.astype(float),
         "Score": score_raw.astype(float),
         "Is Long": is_long_enc.astype(float),
+        "Long x BTC Ret": (is_long_enc * btc_ret).astype(float),
+        "Long x RSI": (is_long_enc * rsi).astype(float),
     }, index=df2.index).replace([np.inf, -np.inf], np.nan)
 
     # NaN が残る行は学習に使わない（=欠損は埋めない）
@@ -2421,13 +2424,23 @@ def logic_main(force: bool = False):
             is_sell = False
             signal_type = ""
 
-            if (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT:
-                is_sell = True
-                signal_type = "SHORT"
-            elif (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG:
-                if row["Close"] > df.iloc[-6]["Close"]:
+            _short_ok = (row["Drop_Score"] >= CAND_SIGMA) and ALLOW_SHORT
+            _long_ok = (row["Rise_Score"] >= CAND_SIGMA) and ALLOW_LONG and (row["Close"] > df.iloc[-6]["Close"])
+
+            if _short_ok and _long_ok:
+                # 両方成立 → Scoreが高い方を採用
+                if row["Drop_Score"] >= row["Rise_Score"]:
+                    is_sell = True
+                    signal_type = "SHORT"
+                else:
                     is_buy = True
                     signal_type = "LONG"
+            elif _short_ok:
+                is_sell = True
+                signal_type = "SHORT"
+            elif _long_ok:
+                is_buy = True
+                signal_type = "LONG"
 
             if not (is_buy or is_sell):
                 continue
@@ -2517,8 +2530,9 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
 
-            # 修正後
+            # 修正後（交互作用項追加）
             def _make_feats(side: str) -> pd.DataFrame:
+                _is_long = float(1.0 if side == "LONG" else 0.0)
                 return pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
@@ -2528,7 +2542,9 @@ def logic_main(force: bool = False):
                     "BTC Ret": float(btc_ret),
                     "BTC Vol": float(btc_vol),
                     "Score": float(sig_score),
-                    "Is Long": float(1.0 if side == "LONG" else 0.0),
+                    "Is Long": _is_long,
+                    "Long x BTC Ret": _is_long * float(btc_ret),
+                    "Long x RSI": _is_long * float(row["RSI"]),
                 }])
 
 
