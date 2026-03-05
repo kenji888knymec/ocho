@@ -2446,41 +2446,6 @@ def logic_main(force: bool = False):
                 continue
 
 
-            # ===== 欠損・非finiteなら候補スキップ（補完しない）=====
-            required_cols = [
-                "Dynamic_Sigma",
-                "BandWidth",
-                "BW_Change",
-                "RSI",
-                "Vol_Change",
-                "Pct_Change",
-            ]
-
-            ok_row = True
-            for c in required_cols:
-                val = row.get(c, np.nan)
-                if pd.isna(val):
-                    ok_row = False
-                    break
-                try:
-                    fv = float(val)
-                    if not np.isfinite(fv):
-                        ok_row = False
-                        break
-                except Exception:
-                    ok_row = False
-                    break
-
-            # Dynamic_Sigma は正（>0）である必要
-            if ok_row:
-                try:
-                    if float(row["Dynamic_Sigma"]) <= 0.0:
-                        ok_row = False
-                except Exception:
-                    ok_row = False
-
-            if not ok_row:
-                continue
             # =====================================================
             
             # ==========================================================
