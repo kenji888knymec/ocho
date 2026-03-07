@@ -3521,6 +3521,9 @@ def logic_main(force: bool = False):
 
     # ---- BEAR_AGGR（下落ショート優位）----
     BEAR_SHORT_RSI_MIN = _env_float("BEAR_SHORT_RSI_MIN", 38.0)
+    # ★追加：RSIが低くてもAIが強い時はSHORTを許可（品質を落とさないため）
+    BEAR_SHORT_RSI_BYPASS_AI_TH = _env_float("BEAR_SHORT_RSI_BYPASS_AI_TH", 0.60)
+
     BEAR_SHORT_BTC1H_MIN = _env_float("BEAR_SHORT_BTC1H_MIN", -0.0110)  # -1.10%
     BEAR_SHORT_BTCVOL_MAX = _env_float("BEAR_SHORT_BTCVOL_MAX", 0.0077)
     BEAR_ALLOW_LONG = _env_flag("BEAR_ALLOW_LONG", False)
@@ -3618,8 +3621,11 @@ def logic_main(force: bool = False):
                     return True, "NORMAL", "bear_long_allowed"
 
                 # SHORT: 基本通すが「売られすぎ最終局面」を抑制
+                # ただし、AIが強い（ai_score が高い）場合は例外として許可（品質維持）
                 if (rsi is not None) and (rsi < BEAR_SHORT_RSI_MIN):
-                    return False, "BLOCK", f"bear_short_rsi<{BEAR_SHORT_RSI_MIN}"
+                    ai_score = _nf(item.get("ai_score", None), None)  # 0〜1（usedスコア）
+                    if (ai_score is None) or (ai_score < BEAR_SHORT_RSI_BYPASS_AI_TH):
+                        return False, "BLOCK", f"bear_short_rsi<{BEAR_SHORT_RSI_MIN}(ai<{BEAR_SHORT_RSI_BYPASS_AI_TH})"
 
                 if (btc1h is not None) and (btc1h < BEAR_SHORT_BTC1H_MIN):
                     return False, "BLOCK", f"bear_short_btc1h<{BEAR_SHORT_BTC1H_MIN}"
