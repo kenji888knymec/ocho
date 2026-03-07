@@ -2971,33 +2971,36 @@ def logic_main(force: bool = False):
 
 
             # 2.5) SHORT BTC下落深度ガード
-
-            #      SHORTを出すにはBTCが一定以上下がっていることを要求
-
-            #      浅い一時下落でのSHORT乱発を防ぐ
-
+            #
+            # 方針（品質優先）:
+            #   - BTC_Mode=Range のときだけ「浅い下落SHORT」を抑止する（乱発防止）
+            #   - BTC_Mode=Up/Down では shallow dip を適用しない（勝てるSHORTを潰さないため）
+            #
+            # ※ is_sell=True（SHORT）のときだけ対象
+            
             if guard_ok and bool(item.get("is_sell", False)):
-
+            
                 try:
-
+                    _btc_mode_v = str(item.get("btc_mode", "")).strip()
                     _btc_1h_v = item.get("btc_1h_change", None)
-
-                    if _btc_1h_v is not None and str(_btc_1h_v).strip() != "":
-
+            
+                    # Range のときだけ shallow dip filter を適用
+                    if _btc_mode_v == "Range" and _btc_1h_v is not None and str(_btc_1h_v).strip() != "":
+            
                         _btc_1h_f = float(_btc_1h_v)
-
+            
                         if np.isfinite(_btc_1h_f) and _btc_1h_f > float(SHORT_BTC_1H_MIN):
-
+            
                             guard_ok = False
-
-                            print(f"[GR] skip alert sym={sym_u} side=SHORT"
-
-                                  f" btc_1h={_btc_1h_f:.6f} > {SHORT_BTC_1H_MIN}"
-
-                                  f" (shallow dip filter)")
-
+            
+                            print(
+                                f"[GR] skip alert sym={sym_u} side=SHORT"
+                                f" btc_mode={_btc_mode_v}"
+                                f" btc_1h={_btc_1h_f:.6f} > {SHORT_BTC_1H_MIN}"
+                                f" (shallow dip filter)"
+                            )
+            
                 except Exception:
-
                     pass
             
             
