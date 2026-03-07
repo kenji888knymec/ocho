@@ -2364,9 +2364,21 @@ def logic_main(force: bool = False):
             df["Vol_Change"] = v.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
 
 
-            df["Drop_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x < 0 else 0) / df["Dynamic_Sigma"]
-            df["Rise_Score"] = df["Pct_Change"].apply(lambda x: abs(x) if x > 0 else 0) / df["Dynamic_Sigma"]
+            # High/Low を使って「同一足で上も下も動いた」を拾えるようにする
+            if "High" not in df.columns:
+                df["High"] = df["Close"]
+            if "Low" not in df.columns:
+                df["Low"] = df["Close"]
+            
+            prev_close = df["Close"].shift(1)
+            
+            drop_move = ((prev_close - df["Low"]) / prev_close).clip(lower=0)
+            rise_move = ((df["High"] - prev_close) / prev_close).clip(lower=0)
+            
+            df["Drop_Score"] = drop_move / df["Dynamic_Sigma"]
+            df["Rise_Score"] = rise_move / df["Dynamic_Sigma"]
 
+            
             df["Vol_MA20"] = pd.to_numeric(df["Volume"], errors="coerce").rolling(20).mean()
 
             row = df.iloc[-2]
@@ -2804,10 +2816,24 @@ def logic_main(force: bool = False):
             if "ai_margin_val" not in locals():
                 ai_margin_val = ""
 
-            # --- dbg から「証拠」用の値を先に抜く（dbgがdict前提）---
-            proba_raw_val = dbg.get("proba_raw", "")
-            proba_used_val = dbg.get("proba_used", "")
-            invert_applied_val = dbg.get("ai_proba_invert_applied", "")
+            # --- dbg から「証拠」用の値を抜く（chosen_side の dbg を採用）---
+            chosen_dbg = None
+            try:
+                if str(chosen_side) == str(base_side):
+                    chosen_dbg = dbg.get("dbg_base", None)
+                elif str(chosen_side) == str(flip_side):
+                    chosen_dbg = dbg.get("dbg_flip", None)
+            except Exception:
+                chosen_dbg = None
+            
+            if isinstance(chosen_dbg, dict):
+                proba_raw_val = chosen_dbg.get("proba_raw", "")
+                proba_used_val = chosen_dbg.get("proba_used", "")
+                invert_applied_val = chosen_dbg.get("ai_proba_invert_applied", "")
+            else:
+                proba_raw_val = ""
+                proba_used_val = ""
+                invert_applied_val = ""
             
             # --- DIRECT/REVERSE は ai_debug(AO) ではなく tag に逃がす ---
             invert_mode_tag = "REVERSE" if bool(AI_PROBA_INVERT) else "DIRECT"
