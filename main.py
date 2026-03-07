@@ -102,11 +102,15 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
-# --- LONG方向別閾値（Phase1） ---
 
-# LONG_AI_TH 未設定時は AI_TH をそのまま使う（現行動作と同一）
+# --- 方向別AI閾値（Phase1） ---
+
+# LONG_AI_TH / SHORT_AI_TH 未設定時は AI_TH をそのまま使う
+# LONG  : より厳しくするために使う
+# SHORT : 独立に少し緩めるために使う
 
 LONG_AI_TH = float(os.environ.get("LONG_AI_TH", str(AI_TH)))
+SHORT_AI_TH = float(os.environ.get("SHORT_AI_TH", str(AI_TH)))
 
 
 # --- LONG BTC_Upバイパス（Phase2） ---
@@ -2709,15 +2713,19 @@ def logic_main(force: bool = False):
 
             else:
 
-                # ★Phase1: LONG方向別閾値（SHORTは従来通り）
+                # ★Phase1: 方向別閾値
+                # LONG  : ai_th_used と LONG_AI_TH の高い方を使う
+                #         → LONG を厳しくできる
+                # SHORT : ai_th_used と SHORT_AI_TH の低い方を使う
+                #         → SHORT だけ少し通しやすくできる
 
                 if chosen_side == "LONG":
 
-                    ai_th_effective = min(float(ai_th_used), float(LONG_AI_TH))
+                    ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
 
                 else:
 
-                    ai_th_effective = float(ai_th_used)
+                    ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
 
                 ai_pass = (float(ai_score) >= float(ai_th_effective))
 
