@@ -102,15 +102,16 @@ CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
 AI_TH = float(os.environ.get("AI_TH", "0.55"))
 
-
 # --- 方向別AI閾値（Phase1） ---
 
-# LONG_AI_TH / SHORT_AI_TH 未設定時は AI_TH をそのまま使う
-# LONG  : より厳しくするために使う
-# SHORT : 独立に少し緩めるために使う
+# LONG_AI_TH / SHORT_AI_TH / SHORT_AI_TH_UP 未設定時は AI_TH をそのまま使う
+# LONG          : より厳しくするために使う
+# SHORT         : 通常SHORTの独立閾値
+# SHORT_AI_TH_UP: BTC_Mode=Up の SHORT だけに使う追加閾値
 
 LONG_AI_TH = float(os.environ.get("LONG_AI_TH", str(AI_TH)))
 SHORT_AI_TH = float(os.environ.get("SHORT_AI_TH", str(AI_TH)))
+SHORT_AI_TH_UP = float(os.environ.get("SHORT_AI_TH_UP", str(SHORT_AI_TH)))
 
 
 # --- LONG BTC_Upバイパス（Phase2） ---
@@ -329,12 +330,13 @@ print(
     f"RUN_MUTEX_ENABLED={RUN_MUTEX_ENABLED} RUN_MUTEX_SHEET={RUN_MUTEX_SHEET} RUN_MUTEX_TTL_SEC={RUN_MUTEX_TTL_SEC}"
 )
 
-
 print(
 
     "[CFG] "
 
     f"LONG_AI_TH={LONG_AI_TH} "
+    f"SHORT_AI_TH={SHORT_AI_TH} "
+    f"SHORT_AI_TH_UP={SHORT_AI_TH_UP} "
 
     f"LONG_BYPASS_ON_BTC_UP={LONG_BYPASS_ON_BTC_UP} "
 
@@ -2702,7 +2704,6 @@ def logic_main(force: bool = False):
                 ai_score = None
                 bypassed = True
 
-
             # ai_pass 判定（方針：bypass時は「予測しない」＝通知しない）
 
             if bypassed:
@@ -2716,8 +2717,8 @@ def logic_main(force: bool = False):
                 # ★Phase1: 方向別閾値
                 # LONG  : ai_th_used と LONG_AI_TH の高い方を使う
                 #         → LONG を厳しくできる
-                # SHORT : ai_th_used と SHORT_AI_TH の低い方を使う
-                #         → SHORT だけ少し通しやすくできる
+                # SHORT : 通常は ai_th_used と SHORT_AI_TH の低い方を使う
+                #         ただし BTC_Mode=Up の SHORT は SHORT_AI_TH_UP も考慮して厳しくする
 
                 if chosen_side == "LONG":
 
@@ -2726,6 +2727,9 @@ def logic_main(force: bool = False):
                 else:
 
                     ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
+
+                    if str(btc_mode).strip() == "Up":
+                        ai_th_effective = max(float(ai_th_effective), float(SHORT_AI_TH_UP))
 
                 ai_pass = (float(ai_score) >= float(ai_th_effective))
 
