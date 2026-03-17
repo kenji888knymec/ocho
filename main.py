@@ -165,6 +165,8 @@ LONG_BYPASS_SCORE_MIN = _env_float("LONG_BYPASS_SCORE_MIN", 1.8)
 # --- SHORT BTC下落深度ガード: _env_float使用分（定義後に配置） ---
 SHORT_BTC_1H_MIN = _env_float("SHORT_BTC_1H_MIN", float("-inf"))
 
+# --- SHORT × BTC_Mode=Down × BandWidth ブロック ---
+SHORT_DOWN_BW_BLOCK = _env_float("SHORT_DOWN_BW_BLOCK", float("inf"))
 
 def _parse_symbol_set(env_name: str) -> set:
     raw = os.environ.get(env_name, "").strip()
@@ -3014,6 +3016,28 @@ def logic_main(force: bool = False):
             
                 except Exception:
                     pass
+
+            # 2.55) SHORT × BTC_Mode=Down × BandWidth ブロック
+            #       BTC下落トレンド中にBandWidthが広い（ボラ拡大中の）SHORTを止める
+            if guard_ok and bool(item.get("is_sell", False)):
+                try:
+                    _btc_mode_bw = str(item.get("btc_mode", "")).strip()
+                    if _btc_mode_bw == "Down":
+                        _bw_raw = item.get("BandWidth", None)
+                        if _bw_raw is not None and str(_bw_raw).strip() != "":
+                            _bw_f = float(_bw_raw)
+                            if np.isfinite(_bw_f) and _bw_f >= SHORT_DOWN_BW_BLOCK:
+                                guard_ok = False
+                                print(
+                                    f"[GR] skip alert sym={sym_u} side=SHORT"
+                                    f" btc_mode={_btc_mode_bw}"
+                                    f" BandWidth={_bw_f:.6f} >= {SHORT_DOWN_BW_BLOCK}"
+                                    f" (SHORT_DOWN_BW_BLOCK)"
+                                )
+                except Exception:
+                    pass
+
+
             
             
             # 2.6) VolSigma（sigma）チェック
