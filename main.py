@@ -2289,6 +2289,8 @@ V2_HEADERS = [
     "TP_Price", "SL_Price", "TP_Pct", "SL_Pct", "ATR",
     # 分析用
     "RSI", "Hour_JST", "BTC_Mode_Compat",
+    # AI用（将来の V2-AI / LONG-AI / SHORT-AI 用）
+    "AI_Prob_Win", "AI_Pass", "AI_Band", "AI_Model_Version", "AI_Model_Type", "AI_Note",
     # 勝敗（judge が後から埋める）
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "WinLose", "HoldMin",
     # メタ
@@ -2712,7 +2714,8 @@ def v2_generate_signal(
 
 def v2_build_shadow_row(sig: Dict) -> List[Any]:
     """
-    ★修正3: V2専用ヘッダーの行を構築。旧列は一切使わない。
+    V2専用ヘッダーの行を構築。
+    将来の V2-AI / LONG-AI / SHORT-AI を載せられるように AI列も保持する。
     """
     return [
         "'" + sig["dt"].strftime("%Y-%m-%d %H:%M:%S"),
@@ -2746,12 +2749,19 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         # 分析用
         float(sig["rsi"]) if np.isfinite(sig["rsi"]) else "",
         int(sig["hour"]),
-        sig["btc_mode_compat"],  # ★修正3: LONG→Up, SHORT→Down, NEUTRAL→Range
+        sig["btc_mode_compat"],
+        # AI用（未実装時は空欄で保存）
+        sig.get("ai_prob_win", ""),
+        sig.get("ai_pass", ""),
+        sig.get("ai_band", ""),
+        sig.get("ai_model_version", ""),
+        sig.get("ai_model_type", ""),
+        sig.get("ai_note", ""),
         # 勝敗（後で judge が埋める）
         "", "", "", "", "", "", "",
         # メタ
-        "V2-Shadow",
-        "",
+        sig.get("v2_version", "V2-Shadow"),
+        sig.get("note", ""),
     ]
 
 
@@ -2782,9 +2792,11 @@ def v2_write_shadow_rows(rows: List[List[Any]]):
 def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     """
     V1 の logic_main() の後に呼ばれる。
-    V2 シグナルを評価して v2_shadow シートに記録するだけ。
-    実トレードは行わない。
+    現在は V2 シグナルを評価して v2_shadow シートに記録する。
+    将来は SIGNAL_ENGINE に応じて V2本番通知へ昇格できるようにする。
     """
+    engine_mode = str(SIGNAL_ENGINE).strip().lower()
+
     # 15分足確定待ち
     if (not force) and ((now_jst.minute % 15) < 10):
         return "V2: waiting"
@@ -2800,10 +2812,11 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_htf_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
     if not btc_htf_ohlcv or len(btc_htf_ohlcv) < V2_EMA_SLOW + 5:
         return "V2: BTC HTF insufficient"
+
     btc_htf_df = pd.DataFrame(btc_htf_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     btc_htf = assess_htf_trend(btc_htf_df)
 
-    print(f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f}")
+    print(f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f} mode={engine_mode}")
 
     # 銘柄走査
     symbols = [
@@ -2821,16 +2834,34 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         try:
             sig = v2_generate_signal(exchange, symbol, btc_htf, now_jst)
             if sig is not None:
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = ""
+                sig["ai_band"] = ""
+                sig["ai_model_version"] = ""
+                sig["ai_model_type"] = "COMMON"
+                sig["ai_note"] = ""
+                sig["v2_version"] = "V2-Shadow"
+                sig["note"] = ""
+
                 signals.append(sig)
-                print(f"[V2] SIG: {sig['symbol']} {sig['direction']} "
-                      f"total={sig['total_score']:.2f} "
-                      f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f}")
+
+                print(
+                    f"[V2] SIG: {sig['symbol']} {sig['direction']} "
+                    f"total={sig['total_score']:.2f} "
+                    f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
+                    f"AI={sig['ai_prob_win']} PASS={sig['ai_pass']} TYPE={sig['ai_model_type']}"
+                )
         except Exception as e:
             print(f"[V2-ERR] {symbol}: {e}")
 
     # シート書き込み
     rows = [v2_build_shadow_row(sig) for sig in signals]
     v2_write_shadow_rows(rows)
+
+    # 将来の V2本番化用の分岐だけ先に置いておく
+    # 現時点では v2_live にしても通知処理はまだ未実装で、影響を出さない
+    if engine_mode == "v2_live":
+        print("[V2] engine_mode=v2_live (notification hook not implemented yet)")
 
     return f"V2-shadow: {len(signals)} signals from {len(symbols)} symbols"
 
@@ -4446,7 +4477,7 @@ def logic_main(force: bool = False):
         append_rows_to_sheet(MAIN_SHEET_NAME, alert_rows, TABLE_FIELDS)
 
     # --- V2 Shadow Mode ---
-    if SIGNAL_ENGINE in ("shadow", "v2"):
+    if SIGNAL_ENGINE in ("shadow", "v2", "v2_live"):
         try:
             v2_result = v2_shadow_run(exchange, now_jst, force=force)
             print(f"[V2] {v2_result}")
