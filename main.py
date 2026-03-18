@@ -2265,10 +2265,13 @@ V2_FR_WEIGHT       = _env_float("V2_FR_WEIGHT", 0.8)
 V2_VOL_CONFIRM     = _env_float("V2_VOL_CONFIRM", 1.2)
 
 # --- 合計スコア ---
-V2_MIN_SCORE        = _env_float("V2_MIN_SCORE", 1.5)
+V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.5)
+V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
+V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
+V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
 
 # --- V2 Shadow 出力先シート ---
-V2_SHADOW_SHEET     = os.environ.get("V2_SHADOW_SHEET", "v2_shadow")
+V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow")
 
 # --- V2 Shadow ヘッダー（旧列を流用しない） ---
 V2_HEADERS = [
@@ -2596,6 +2599,7 @@ def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_sco
 # ==========================================
 
 def v2_generate_signal(
+
     exchange,
     symbol: str,
     btc_htf: Dict[str, Any],
@@ -2607,7 +2611,9 @@ def v2_generate_signal(
     ★修正1: Pillar1 必須、Pillar2/3 は加点減点
     ★修正2: LONG/SHORT で assess_ltf を分ける
     """
-    sym = symbol.replace("/USDT", "")
+    raw_symbol = str(symbol).strip()
+    base_symbol = raw_symbol.split(":", 1)[0]
+    sym = base_symbol.split("/", 1)[0].strip().upper()
     hour = now_jst.hour
 
     # ---- データ取得 ----
@@ -5232,6 +5238,291 @@ def run_process():
                 except Exception as e2:
                     print(f"[WARN] /run send_discord_message failed: {type(e2).__name__}: {e2}")
 
+
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            pass
+
+# ==========================================
+# V2 判定係 (/judge_v2)
+# ==========================================
+def judge_v2_sheet(
+    sheet_name: str = V2_SHADOW_SHEET,
+    lookback_rows: int = V2_JUDGE_LOOKBACK_ROWS,
+    max_judge: int = 100,
+) -> int:
+    service = get_sheet_service()
+    exchange = build_exchange()
+
+    ok, msg = self_heal_prerequisites()
+    if not ok:
+        print(f"[WARN] self_heal_prerequisites failed (judge_v2): {msg}")
+        return 0
+
+    headers, _, okh = get_headers_and_len(sheet_name)
+    if STRICT_HEADER_CHECK and not okh:
+        print(f"[WARN] judge_v2_sheet header check failed -> skip. sheet={sheet_name}")
+        return 0
+
+    last_row = _get_row_count_cached(sheet_name)
+    if last_row < 2:
+        return 0
+
+    start_row = max(2, last_row - lookback_rows + 1)
+    res = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A{start_row}:{HEADER_COL_END}{last_row}",
+    ).execute()
+    rows = res.get("values", []) or []
+    if not rows:
+        return 0
+
+    hm = _build_headers_map(headers)
+
+    col_symbol = _resolve_col_idx(hm, "Symbol")
+    col_time = _resolve_col_idx(hm, "Datetime_JST")
+    col_entry = _resolve_col_idx(hm, "EntryPrice")
+    col_dir = _resolve_col_idx(hm, "Direction")
+    col_tp = _resolve_col_idx(hm, "TP_Price")
+    col_sl = _resolve_col_idx(hm, "SL_Price")
+    col_tp_pct = _resolve_col_idx(hm, "TP_Pct")
+    col_sl_pct = _resolve_col_idx(hm, "SL_Pct")
+
+    col_eval = _resolve_col_idx(hm, "EvalStatus")
+    col_exit_time = _resolve_col_idx(hm, "ExitTime")
+    col_exit_price = _resolve_col_idx(hm, "ExitPrice")
+    col_exit_reason = _resolve_col_idx(hm, "ExitReason")
+    col_pnl = _resolve_col_idx(hm, "PnL_Pct")
+    col_winlose = _resolve_col_idx(hm, "WinLose")
+    col_holdmin = _resolve_col_idx(hm, "HoldMin")
+
+    must = [
+        col_symbol, col_time, col_entry, col_dir, col_tp, col_sl,
+        col_tp_pct, col_sl_pct,
+        col_eval, col_exit_time, col_exit_price, col_exit_reason,
+        col_pnl, col_winlose, col_holdmin,
+    ]
+    if any(c == -1 for c in must):
+        print(f"[WARN] judge_v2_sheet missing required columns in {sheet_name}")
+        return 0
+
+    updates = []
+    judged = 0
+
+    def get_cell(row, idx: int) -> str:
+        if idx < 0:
+            return ""
+        return str(row[idx]).strip() if idx < len(row) else ""
+
+    def put_one(row_idx_1based: int, col_idx: int, value):
+        if col_idx < 0:
+            return
+        a1 = col_to_a1(col_idx)
+        updates.append({"range": f"{sheet_name}!{a1}{row_idx_1based}", "values": [[value]]})
+
+    for offset in range(len(rows) - 1, -1, -1):
+        if judged >= max_judge:
+            break
+
+        row = rows[offset]
+        sheet_row_idx = start_row + offset
+
+        status = get_cell(row, col_eval).upper()
+        if status not in ("", "OPEN"):
+            continue
+
+        sym = get_cell(row, col_symbol)
+        tstr = get_cell(row, col_time)
+        direction = get_cell(row, col_dir).upper()
+        entry = to_float(get_cell(row, col_entry), default=None)
+        tp = to_float(get_cell(row, col_tp), default=None)
+        sl = to_float(get_cell(row, col_sl), default=None)
+        tp_pct = to_float(get_cell(row, col_tp_pct), default=None)
+        sl_pct = to_float(get_cell(row, col_sl_pct), default=None)
+
+        if (not sym) or (not tstr) or entry is None or tp is None or sl is None:
+            continue
+
+        dt0 = parse_dt_any(tstr)
+        if dt0 is None:
+            continue
+        if getattr(dt0, "tzinfo", None) is None:
+            dt_jst = dt0.replace(tzinfo=JST)
+        else:
+            dt_jst = dt0.astimezone(JST)
+
+        actual_entry_jst = dt_jst + timedelta(minutes=15)
+        since_ms = int(actual_entry_jst.astimezone(timezone.utc).timestamp() * 1000)
+
+        raw_sym = str(sym).strip().upper()
+        base_sym = raw_sym.split(":", 1)[0]
+        base_sym = base_sym.split("/", 1)[0].strip()
+        market = f"{base_sym}/USDT:USDT"
+
+        candles = fetch_ohlcv_safe(
+            exchange,
+            market,
+            timeframe="15m",
+            since=since_ms,
+            limit=V2_JUDGE_MAX_BARS + 4,
+        )
+        if not candles:
+            continue
+
+        if len(candles) >= 1:
+            last_open_ts_ms = int(candles[-1][0])
+            _log_judge_15m_bar(last_open_ts_ms, label=f"{market}-15m-v2")
+            now_ms = int(time.time() * 1000)
+            forming = now_ms < (last_open_ts_ms + 15 * 60 * 1000)
+            if forming:
+                if len(candles) >= 2:
+                    candles = candles[:-1]
+                else:
+                    continue
+
+        res_status = "OPEN"
+        res_win = ""
+        res_reason = ""
+        res_exit_price = ""
+        res_exit_time_ms = None
+
+        side = "SHORT" if "SHORT" in direction else "LONG"
+
+        for ts, o, h, l, c, v in candles:
+            if ts < since_ms:
+                continue
+
+            if side == "LONG":
+                tp_hit = (h >= tp)
+                sl_hit = (l <= sl)
+            else:
+                tp_hit = (l <= tp)
+                sl_hit = (h >= sl)
+
+            if tp_hit and sl_hit:
+                res_status = "AMBIGUOUS"
+                res_reason = "Both"
+                res_exit_time_ms = ts
+                break
+            if tp_hit:
+                res_status = "DONE"
+                res_reason = "TP"
+                res_exit_time_ms = ts
+                res_exit_price = tp
+                res_win = "Win"
+                break
+            if sl_hit:
+                res_status = "DONE"
+                res_reason = "SL"
+                res_exit_time_ms = ts
+                res_exit_price = sl
+                res_win = "Lose"
+                break
+
+        if res_status == "OPEN" and len(candles) >= V2_JUDGE_MAX_BARS:
+            res_status = "EXPIRED"
+            res_reason = "TimeOver"
+
+        if res_exit_time_ms is not None:
+            exit_dt_jst = datetime.fromtimestamp(res_exit_time_ms / 1000, JST)
+            exit_time_str = exit_dt_jst.strftime("%Y-%m-%d %H:%M:%S")
+            hold_min = int((exit_dt_jst - actual_entry_jst).total_seconds() / 60)
+        else:
+            exit_time_str = ""
+            hold_min = ""
+
+        if res_status == "DONE":
+            if res_reason == "TP":
+                pnl_pct = tp_pct if tp_pct is not None else ((abs(tp - entry) / entry) * 100.0)
+            else:
+                pnl_pct = -(sl_pct if sl_pct is not None else ((abs(sl - entry) / entry) * 100.0))
+        else:
+            pnl_pct = ""
+
+        put_one(sheet_row_idx, col_eval, res_status)
+        put_one(sheet_row_idx, col_exit_time, exit_time_str)
+        put_one(sheet_row_idx, col_exit_price, res_exit_price)
+        put_one(sheet_row_idx, col_exit_reason, res_reason)
+        put_one(sheet_row_idx, col_pnl, pnl_pct)
+        put_one(sheet_row_idx, col_winlose, res_win)
+        put_one(sheet_row_idx, col_holdmin, hold_min)
+
+        judged += 1
+        time.sleep(0.12)
+
+    if updates:
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        ).execute()
+        _invalidate_sheet_caches(sheet_name)
+
+    return judged
+
+
+def judge_v2_main() -> str:
+    max_judge = int(float(os.environ.get("V2_JUDGE_MAX_ROWS", "100")))
+    total = judge_v2_sheet(
+        V2_SHADOW_SHEET,
+        lookback_rows=V2_JUDGE_LOOKBACK_ROWS,
+        max_judge=max_judge,
+    )
+    return f"Judged {total} rows ({V2_SHADOW_SHEET})"
+
+
+@app.route("/judge_v2", methods=["GET", "POST"])
+def judge_v2_process():
+    if not _run_lock.acquire(blocking=False):
+        return "Busy (run/judge/judge_v2 already in progress).", 200
+
+    mutex_token = ""
+    try:
+        ok, msg = preflight_check()
+        if not ok:
+            err = f"Preflight NG: {msg}"
+            print(f"[WARN] /judge_v2 {err}")
+            send_discord_message(f"[WARN] /judge_v2 {err}")
+            return f"NG: {err}", 200
+
+        okm, token = acquire_run_mutex()
+        if not okm:
+            return "Busy (distributed mutex).", 200
+        mutex_token = token
+
+        try:
+            now_utc = time.time()
+            rem = now_utc % (15 * 60)
+            window = V2_JUDGE_CLOSE_WINDOW_SEC
+            if rem > window:
+                msg = f"Skip: not 15m close window rem={rem:.1f}s window={window}s"
+                print(f"[JUDGE15M-V2]{msg}")
+                return msg, 200
+
+            return str(judge_v2_main()), 200
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"[ERR] /judge_v2 crashed: {err}")
+            send_discord_message(f"[ERR] /judge_v2 crashed: {err}")
+            return f"ERR: {err}", 200
+
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /judge_v2 outer exception: {err}")
+        send_discord_message(f"[ERR] /judge_v2 outer crashed: {err}")
+        return f"ERR: {err}", 200
+
+    finally:
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                msg = f"[WARN] /judge_v2 release_run_mutex failed: {type(e).__name__}: {e}"
+                print(msg)
+                try:
+                    send_discord_message(msg)
+                except Exception as e2:
+                    print(f"[WARN] /judge_v2 send_discord_message failed: {type(e2).__name__}: {e2}")
 
         try:
             _run_lock.release()
