@@ -97,6 +97,8 @@ LEARN_SHEET_NAME = os.environ.get("LEARN_SHEET_NAME", "learn_log")
 
 VERSION = "Ver7.7 ModelReloadFix (Code v3.5.5)"
 
+SIGNAL_ENGINE = os.environ.get("SIGNAL_ENGINE", "v1").strip().lower()
+
 # --- Thresholds (env configurable) ---
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
@@ -2246,6 +2248,589 @@ def _pad_row_to_fields(row: List[Any], fields: List[str], fill: Any = "") -> Lis
         return row[:n]
     return row
 
+
+# --- Pillar1: 多時間足 ---
+V2_HTF_TIMEFRAME   = os.environ.get("V2_HTF_TIMEFRAME", "1h")
+V2_HTF_LIMIT       = int(float(os.environ.get("V2_HTF_LIMIT", "60")))
+V2_EMA_FAST        = int(float(os.environ.get("V2_EMA_FAST", "8")))
+V2_EMA_SLOW        = int(float(os.environ.get("V2_EMA_SLOW", "21")))
+V2_PILLAR1_MIN     = _env_float("V2_PILLAR1_MIN", 0.5)  # Pillar1 最低スコア（必須ゲート）
+
+# --- Pillar2: ファンディングレート ---
+V2_FR_LONG_TH      = _env_float("V2_FR_LONG_TH", -0.0001)
+V2_FR_SHORT_TH     = _env_float("V2_FR_SHORT_TH", 0.0003)
+V2_FR_WEIGHT       = _env_float("V2_FR_WEIGHT", 0.8)
+
+# --- Pillar3: 出来高 ---
+V2_VOL_CONFIRM     = _env_float("V2_VOL_CONFIRM", 1.2)
+
+# --- 合計スコア ---
+V2_MIN_SCORE        = _env_float("V2_MIN_SCORE", 1.5)
+
+# --- V2 Shadow 出力先シート ---
+V2_SHADOW_SHEET     = os.environ.get("V2_SHADOW_SHEET", "v2_shadow")
+
+# --- V2 Shadow ヘッダー（旧列を流用しない） ---
+V2_HEADERS = [
+    "Datetime_JST", "Symbol", "Direction", "EntryPrice",
+    # スコア
+    "TotalScore", "P1_TrendScore", "P2_FundingScore", "P3_VolumeScore",
+    # Pillar1 詳細
+    "SymHTF_Dir", "SymHTF_Strength", "BTC_HTF_Dir", "BTC_HTF_Strength",
+    "LTF_Aligned", "LTF_Reasons",
+    # Pillar2 詳細
+    "FundingRate", "FR_Available",
+    # Pillar3 詳細
+    "VolRatio", "VolConfirmed",
+    # TP/SL（ATRベース）
+    "TP_Price", "SL_Price", "TP_Pct", "SL_Pct", "ATR",
+    # 分析用
+    "RSI", "Hour_JST", "BTC_Mode_Compat",
+    # 勝敗（judge が後から埋める）
+    "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "WinLose", "HoldMin",
+    # メタ
+    "Version", "Note",
+]
+
+print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
+      f"EMA={V2_EMA_FAST}/{V2_EMA_SLOW} P1_MIN={V2_PILLAR1_MIN} "
+      f"MIN_SCORE={V2_MIN_SCORE} SHEET={V2_SHADOW_SHEET}")
+
+
+# ==========================================
+# 補助関数
+# ==========================================
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([h - l, (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _safe_float(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+# ==========================================
+# Pillar 1: 多時間足トレンド整合
+# ==========================================
+
+def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
+    """1H足のEMAトレンド方向と強度。"""
+    if len(htf_df) < V2_EMA_SLOW + 5:
+        return {"direction": "NEUTRAL", "strength": 0.0, "ema_spread": 0.0}
+
+    htf_df = htf_df.copy()
+    htf_df["EMA_F"] = _ema(htf_df["Close"], V2_EMA_FAST)
+    htf_df["EMA_S"] = _ema(htf_df["Close"], V2_EMA_SLOW)
+
+    ema_f = float(htf_df["EMA_F"].iloc[-1])
+    ema_s = float(htf_df["EMA_S"].iloc[-1])
+    close = float(htf_df["Close"].iloc[-1])
+
+    spread = (ema_f - ema_s) / ema_s if ema_s != 0 else 0
+    strength = min(abs(spread) / 0.005, 1.0)
+
+    if ema_f > ema_s and close > ema_s:
+        direction = "LONG"
+    elif ema_f < ema_s and close < ema_s:
+        direction = "SHORT"
+    else:
+        direction = "NEUTRAL"
+
+    # EMAの傾き（減速検出）
+    if len(htf_df) >= 4:
+        slope = float(htf_df["EMA_F"].iloc[-1] - htf_df["EMA_F"].iloc[-3])
+        if direction == "LONG" and slope < 0:
+            strength *= 0.5
+        elif direction == "SHORT" and slope > 0:
+            strength *= 0.5
+
+    return {"direction": direction, "strength": float(strength), "ema_spread": float(spread)}
+
+
+def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    ★修正2: LONG専用のLTF評価。
+    押し目買い + モメンタム追従。
+    """
+    if len(ltf_df) < 20:
+        return {"score": 0.0, "reasons": []}
+
+    df = ltf_df.copy()
+    df["RSI"] = _rsi(df["Close"])
+    df["EMA20"] = _ema(df["Close"], 20)
+
+    cur = df.iloc[-2]   # 確定足
+    prev = df.iloc[-3]
+    rsi = _safe_float(cur["RSI"], 50)
+    close = float(cur["Close"])
+    ema20 = float(cur["EMA20"])
+    prev_rsi = _safe_float(prev["RSI"], 50)
+
+    score = 0.0
+    reasons = []
+
+    # 押し目: 価格がEMA20付近（-1%～+0.5%）
+    dist = (close - ema20) / ema20 if ema20 != 0 else 0
+    if -0.01 <= dist <= 0.005:
+        score += 0.5
+        reasons.append(f"pullback({dist:.4f})")
+
+    # RSI 40-60帯で上昇中 → 押し目からの回復
+    if 40 <= rsi <= 60 and rsi > prev_rsi:
+        score += 0.5
+        reasons.append(f"rsi_recovering({rsi:.1f})")
+
+    # ★修正5: RSI>65 のモメンタム追従
+    # 実績データ: LONG × RSI 70+ = WR 41.9%（最良グループ）
+    # ただし LONG × RSI 70+ × 13-18時 = WR 11.8%（壊滅）
+    # → Pillar0 で時間帯は先に弾いているので、ここでは加点してOK
+    if rsi > 65:
+        score += 0.7
+        reasons.append(f"momentum({rsi:.1f})")
+
+    # 陽線確認
+    if close > float(cur["Open"]):
+        score += 0.2
+        reasons.append("bullish_bar")
+
+    return {"score": float(score), "reasons": reasons, "rsi": rsi}
+
+
+def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    ★修正2: SHORT専用のLTF評価。
+    戻り売り。LONG とは非対称。
+
+    ★修正5: RSI<35 は加点しない。
+    実績データ:
+      SHORT × RSI<30  = WR 20.0%, PnL -0.535%
+      SHORT × RSI 30-40 = WR 40.6%（最良）
+      SHORT × RSI 40-50 = WR 44.0%（最良）
+    つまりSHORT は RSI 30-55 帯がベスト。極端に低いRSIは危険。
+    """
+    if len(ltf_df) < 20:
+        return {"score": 0.0, "reasons": []}
+
+    df = ltf_df.copy()
+    df["RSI"] = _rsi(df["Close"])
+    df["EMA20"] = _ema(df["Close"], 20)
+
+    cur = df.iloc[-2]
+    prev = df.iloc[-3]
+    rsi = _safe_float(cur["RSI"], 50)
+    close = float(cur["Close"])
+    ema20 = float(cur["EMA20"])
+    prev_rsi = _safe_float(prev["RSI"], 50)
+
+    score = 0.0
+    reasons = []
+
+    # 戻り: 価格がEMA20付近（-0.5%～+1%）
+    dist = (close - ema20) / ema20 if ema20 != 0 else 0
+    if -0.005 <= dist <= 0.01:
+        score += 0.5
+        reasons.append(f"retracement({dist:.4f})")
+
+    # ★修正5: SHORT最適帯 RSI 30-55 で下降中
+    if 30 <= rsi <= 55 and rsi < prev_rsi:
+        score += 0.7
+        reasons.append(f"rsi_optimal_short({rsi:.1f})")
+    elif 55 < rsi <= 70 and rsi < prev_rsi:
+        # RSI 55-70 はまだ許容（戻りが深い）
+        score += 0.3
+        reasons.append(f"rsi_declining({rsi:.1f})")
+
+    # ★修正5: RSI<30 は減点（追いかけ危険）
+    if rsi < 30:
+        score -= 0.5
+        reasons.append(f"rsi_oversold_penalty({rsi:.1f})")
+
+    # ★修正5: RSI>70 も減点（SHORTには逆風）
+    # 実績: SHORT × RSI 70+ = WR 13.4%
+    if rsi > 70:
+        score -= 0.8
+        reasons.append(f"rsi_high_penalty({rsi:.1f})")
+
+    # 陰線確認
+    if close < float(cur["Open"]):
+        score += 0.2
+        reasons.append("bearish_bar")
+
+    return {"score": float(score), "reasons": reasons, "rsi": rsi}
+
+
+# ==========================================
+# Pillar 2: ファンディングレート
+# ==========================================
+
+def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
+    """ccxt で FR 取得。失敗なら None。"""
+    try:
+        result = exchange.fetch_funding_rate(symbol)
+        if result and "fundingRate" in result:
+            fr = result["fundingRate"]
+            if fr is not None:
+                return float(fr)
+    except Exception as e:
+        # 取れない銘柄もある → None で返してPillar2無効化するだけ
+        pass
+    return None
+
+
+def assess_funding(fr: Optional[float], direction: str) -> Dict[str, Any]:
+    """
+    ★修正2: LONG/SHORT で閾値の意味が違う。
+    ★修正1: FR が取れなければスコア0（全一致不要）。
+    """
+    if fr is None:
+        return {"score": 0.0, "available": False, "reason": "no_data"}
+
+    score = 0.0
+    reason = ""
+
+    if direction == "LONG":
+        if fr < V2_FR_LONG_TH:
+            # 負のFR → ショートが溜まっている → LONG有利
+            score = min(abs(fr - V2_FR_LONG_TH) / 0.0005, 1.0) * V2_FR_WEIGHT
+            reason = f"negative_fr({fr:.6f})"
+        elif fr > V2_FR_SHORT_TH:
+            # 高い正のFR → LONG過密 → 逆風
+            score = -0.3 * V2_FR_WEIGHT
+            reason = f"crowded_long({fr:.6f})"
+    elif direction == "SHORT":
+        if fr > V2_FR_SHORT_TH:
+            # 正のFR → ロングが溜まっている → SHORT有利
+            score = min(abs(fr - V2_FR_SHORT_TH) / 0.0005, 1.0) * V2_FR_WEIGHT
+            reason = f"positive_fr({fr:.6f})"
+        elif fr < V2_FR_LONG_TH:
+            # 負のFR → SHORT過密 → 逆風
+            score = -0.3 * V2_FR_WEIGHT
+            reason = f"crowded_short({fr:.6f})"
+
+    return {"score": float(score), "available": True, "funding_rate": fr, "reason": reason}
+
+
+# ==========================================
+# Pillar 3: 出来高確認
+# ==========================================
+
+def assess_volume(ltf_df: pd.DataFrame, direction: str) -> Dict[str, Any]:
+    if len(ltf_df) < 20:
+        return {"score": 0.0, "confirmed": False, "vol_ratio": None}
+
+    vol = pd.to_numeric(ltf_df["Volume"], errors="coerce")
+    vol_ma = vol.rolling(20).mean()
+    cur_vol = float(vol.iloc[-2])
+    cur_ma = float(vol_ma.iloc[-2])
+
+    if cur_ma <= 0 or pd.isna(cur_ma):
+        return {"score": 0.0, "confirmed": False, "vol_ratio": None}
+
+    vr = cur_vol / cur_ma
+    chg = float(ltf_df["Close"].iloc[-2] - ltf_df["Close"].iloc[-3])
+
+    score = 0.0
+    confirmed = False
+
+    if direction == "LONG" and chg > 0 and vr >= V2_VOL_CONFIRM:
+        score = min(vr / 2.0, 1.0)
+        confirmed = True
+    elif direction == "SHORT" and chg < 0 and vr >= V2_VOL_CONFIRM:
+        score = min(vr / 2.0, 1.0)
+        confirmed = True
+    elif vr < 0.8:
+        score = -0.2  # 方向は合っているが出来高が伴わない
+
+    return {"score": float(score), "confirmed": confirmed, "vol_ratio": float(vr)}
+
+
+# ==========================================
+# 動的TP/SL（ATRベース）
+# ==========================================
+
+def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_score: float) -> Dict:
+    atr_val = _safe_float(_atr(ltf_df).iloc[-2], abs(entry * 0.005))
+    if atr_val <= 0:
+        atr_val = abs(entry * 0.005)
+
+    sl_mult = 1.5
+    tp_mult = 2.0 + min(total_score / 5.0, 1.5)
+
+    if direction == "LONG":
+        sl = entry - atr_val * sl_mult
+        tp = entry + atr_val * tp_mult
+    else:
+        sl = entry + atr_val * sl_mult
+        tp = entry - atr_val * tp_mult
+
+    return {
+        "tp": float(tp), "sl": float(sl),
+        "tp_pct": abs(tp - entry) / entry * 100,
+        "sl_pct": abs(sl - entry) / entry * 100,
+        "atr": float(atr_val),
+    }
+
+
+# ==========================================
+# 統合シグナル生成
+# ==========================================
+
+def v2_generate_signal(
+    exchange,
+    symbol: str,
+    btc_htf: Dict[str, Any],
+    now_jst: datetime,
+) -> Optional[Dict[str, Any]]:
+    """
+    1銘柄を評価。合意なければ None。
+
+    ★修正1: Pillar1 必須、Pillar2/3 は加点減点
+    ★修正2: LONG/SHORT で assess_ltf を分ける
+    """
+    sym = symbol.replace("/USDT", "")
+    hour = now_jst.hour
+
+    # ---- データ取得 ----
+    ltf = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
+    if not ltf or len(ltf) < 30:
+        return None
+    ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
+    htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
+    if not htf or len(htf) < V2_EMA_SLOW + 5:
+        return None
+    htf_df = pd.DataFrame(htf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
+    # ---- Pillar1: 多時間足トレンド ----
+    sym_htf = assess_htf_trend(htf_df)
+    direction = sym_htf["direction"]
+
+    if direction == "NEUTRAL":
+        return None
+
+    # BTC整合チェック
+    btc_dir = btc_htf.get("direction", "NEUTRAL")
+    btc_str = btc_htf.get("strength", 0.0)
+    if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= 0.3:
+        return None
+
+    # ★修正2: 方向別LTF評価
+    if direction == "LONG":
+        ltf_eval = assess_ltf_long(ltf_df)
+    else:
+        ltf_eval = assess_ltf_short(ltf_df)
+
+    p1_score = sym_htf["strength"] + ltf_eval["score"]
+    if btc_dir == direction:
+        p1_score += btc_str * 0.5
+
+    # ★修正1: Pillar1 必須ゲート
+    if p1_score < V2_PILLAR1_MIN:
+        return None
+
+    # ---- Pillar2: ファンディングレート ----
+    fr = fetch_funding_rate_safe(exchange, symbol)
+    p2 = assess_funding(fr, direction)
+    p2_score = p2["score"]
+
+    # ---- Pillar3: 出来高 ----
+    p3 = assess_volume(ltf_df, direction)
+    p3_score = p3["score"]
+
+    # ---- 合計 ----
+    total = p1_score + p2_score + p3_score
+    if total < V2_MIN_SCORE:
+        return None
+
+    # ---- TP/SL ----
+    entry = float(ltf_df["Close"].iloc[-2])
+    tpsl = calc_atr_tp_sl(ltf_df, direction, entry, total)
+
+    # ★修正3: btc_mode 互換変換
+    btc_mode_compat = {"LONG": "Up", "SHORT": "Down", "NEUTRAL": "Range"}.get(btc_dir, "Range")
+
+    return {
+        "symbol": sym,
+        "direction": direction,
+        "entry_price": entry,
+        "total_score": float(total),
+        "p1_score": float(p1_score),
+        "p2_score": float(p2_score),
+        "p3_score": float(p3_score),
+        "sym_htf_dir": sym_htf["direction"],
+        "sym_htf_strength": sym_htf["strength"],
+        "btc_htf_dir": btc_dir,
+        "btc_htf_strength": btc_str,
+        "ltf_aligned": ltf_eval["score"] >= 0.5,
+        "ltf_reasons": ltf_eval.get("reasons", []),
+        "funding_rate": fr,
+        "fr_available": p2["available"],
+        "vol_ratio": p3.get("vol_ratio"),
+        "vol_confirmed": p3["confirmed"],
+        "tp": tpsl["tp"],
+        "sl": tpsl["sl"],
+        "tp_pct": tpsl["tp_pct"],
+        "sl_pct": tpsl["sl_pct"],
+        "atr": tpsl["atr"],
+        "rsi": ltf_eval.get("rsi", np.nan),
+        "hour": hour,
+        "btc_mode_compat": btc_mode_compat,
+        "time_ms": int(ltf_df["Time"].iloc[-2]),
+        "dt": datetime.fromtimestamp(int(ltf_df["Time"].iloc[-2]) / 1000, JST),
+    }
+
+
+# ==========================================
+# V2 Shadow シートへの書き込み
+# ==========================================
+
+def v2_build_shadow_row(sig: Dict) -> List[Any]:
+    """
+    ★修正3: V2専用ヘッダーの行を構築。旧列は一切使わない。
+    """
+    return [
+        "'" + sig["dt"].strftime("%Y-%m-%d %H:%M:%S"),
+        sig["symbol"],
+        sig["direction"],
+        float(sig["entry_price"]),
+        # スコア
+        float(sig["total_score"]),
+        float(sig["p1_score"]),
+        float(sig["p2_score"]),
+        float(sig["p3_score"]),
+        # Pillar1 詳細
+        sig["sym_htf_dir"],
+        float(sig["sym_htf_strength"]),
+        sig["btc_htf_dir"],
+        float(sig["btc_htf_strength"]),
+        sig["ltf_aligned"],
+        json.dumps(sig["ltf_reasons"], ensure_ascii=False) if sig["ltf_reasons"] else "",
+        # Pillar2 詳細
+        sig["funding_rate"] if sig["funding_rate"] is not None else "",
+        sig["fr_available"],
+        # Pillar3 詳細
+        sig["vol_ratio"] if sig["vol_ratio"] is not None else "",
+        sig["vol_confirmed"],
+        # TP/SL
+        float(sig["tp"]),
+        float(sig["sl"]),
+        float(sig["tp_pct"]),
+        float(sig["sl_pct"]),
+        float(sig["atr"]),
+        # 分析用
+        float(sig["rsi"]) if np.isfinite(sig["rsi"]) else "",
+        int(sig["hour"]),
+        sig["btc_mode_compat"],  # ★修正3: LONG→Up, SHORT→Down, NEUTRAL→Range
+        # 勝敗（後で judge が埋める）
+        "", "", "", "", "", "", "",
+        # メタ
+        "V2-Shadow",
+        "",
+    ]
+
+
+def v2_ensure_shadow_sheet(svc, spreadsheet_id: str):
+    """v2_shadow シートが無ければ作成し、ヘッダーを書く。"""
+    ensure_sheet_exists(V2_SHADOW_SHEET, min_rows=5000, min_cols=len(V2_HEADERS) + 5)
+    current = read_header_row(V2_SHADOW_SHEET)
+    if current != V2_HEADERS:
+        write_header_row(V2_SHADOW_SHEET, V2_HEADERS)
+        print(f"[V2] shadow sheet headers written: {V2_SHADOW_SHEET}")
+
+
+def v2_write_shadow_rows(rows: List[List[Any]]):
+    """v2_shadow シートに行を追記。"""
+    if not rows:
+        return
+    try:
+        append_rows_to_sheet(V2_SHADOW_SHEET, rows, V2_HEADERS)
+        print(f"[V2] wrote {len(rows)} rows to {V2_SHADOW_SHEET}")
+    except Exception as e:
+        print(f"[V2-ERR] shadow write failed: {e}")
+
+
+# ==========================================
+# Shadow Mode メインループ
+# ==========================================
+
+def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
+    """
+    V1 の logic_main() の後に呼ばれる。
+    V2 シグナルを評価して v2_shadow シートに記録するだけ。
+    実トレードは行わない。
+    """
+    # 15分足確定待ち
+    if (not force) and ((now_jst.minute % 15) < 10):
+        return "V2: waiting"
+
+    # シート準備
+    try:
+        v2_ensure_shadow_sheet(get_sheet_service(), SPREADSHEET_ID)
+    except Exception as e:
+        print(f"[V2-ERR] sheet setup: {e}")
+        return f"V2: sheet error {e}"
+
+    # BTC 上位足トレンド
+    btc_htf_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
+    if not btc_htf_ohlcv or len(btc_htf_ohlcv) < V2_EMA_SLOW + 5:
+        return "V2: BTC HTF insufficient"
+    btc_htf_df = pd.DataFrame(btc_htf_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    btc_htf = assess_htf_trend(btc_htf_df)
+
+    print(f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f}")
+
+    # 銘柄走査
+    symbols = [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+        "AAVE/USDT", "NEAR/USDT", "ATOM/USDT", "AVAX/USDT",
+        "APT/USDT", "FET/USDT", "LTC/USDT", "LINK/USDT",
+        "DOT/USDT", "DOGE/USDT", "UNI/USDT", "XRP/USDT",
+        "ARB/USDT", "INJ/USDT", "SUI/USDT", "SEI/USDT",
+        "ADA/USDT", "XLM/USDT", "HBAR/USDT", "SHIB/USDT",
+        "BONK/USDT", "TRX/USDT", "STX/USDT", "POL/USDT",
+    ]
+
+    signals = []
+    for symbol in symbols:
+        try:
+            sig = v2_generate_signal(exchange, symbol, btc_htf, now_jst)
+            if sig is not None:
+                signals.append(sig)
+                print(f"[V2] SIG: {sig['symbol']} {sig['direction']} "
+                      f"total={sig['total_score']:.2f} "
+                      f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f}")
+        except Exception as e:
+            print(f"[V2-ERR] {symbol}: {e}")
+
+    # シート書き込み
+    rows = [v2_build_shadow_row(sig) for sig in signals]
+    v2_write_shadow_rows(rows)
+
+    return f"V2-shadow: {len(signals)} signals from {len(symbols)} symbols"
+
+
+
+
 # ==========================================
 # ロジック本体 (/run)
 # ==========================================
@@ -3853,6 +4438,14 @@ def logic_main(force: bool = False):
 
     if alert_rows:
         append_rows_to_sheet(MAIN_SHEET_NAME, alert_rows, TABLE_FIELDS)
+
+    # --- V2 Shadow Mode ---
+    if SIGNAL_ENGINE in ("shadow", "v2"):
+        try:
+            v2_result = v2_shadow_run(exchange, now_jst, force=force)
+            print(f"[V2] {v2_result}")
+        except Exception as e:
+            print(f"[V2-ERR] shadow run crashed: {e}")
 
     elapsed = time.time() - start
     print(f"[RUN] done alerts={count} candidates={len(candidate_rows)} elapsed={elapsed:.2f}s")
