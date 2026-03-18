@@ -2271,7 +2271,7 @@ V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", 
 V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
 
 # --- V2 Shadow 出力先シート ---
-V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow")
+V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
 
 # --- V2 Shadow ヘッダー（旧列を流用しない） ---
 V2_HEADERS = [
