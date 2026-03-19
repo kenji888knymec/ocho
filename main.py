@@ -2653,7 +2653,7 @@ def v2_generate_signal(
     # BTC整合チェック
     btc_dir = btc_htf.get("direction", "NEUTRAL")
     btc_str = btc_htf.get("strength", 0.0)
-    if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= 0.3:
+    if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= 0.8:
         _v2_reject(
             "btc_conflict_block",
             f"direction={direction} btc_dir={btc_dir} btc_str={btc_str}"
