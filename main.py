@@ -2269,6 +2269,7 @@ V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.5)
 V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
 V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
 V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
+V2_DEBUG_REJECTS           = str(os.environ.get("V2_DEBUG_REJECTS", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
@@ -2601,7 +2602,6 @@ def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_sco
 # ==========================================
 
 def v2_generate_signal(
-
     exchange,
     symbol: str,
     btc_htf: Dict[str, Any],
@@ -2612,20 +2612,30 @@ def v2_generate_signal(
 
     ★修正1: Pillar1 必須、Pillar2/3 は加点減点
     ★修正2: LONG/SHORT で assess_ltf を分ける
+    ★追加: どこで不採用になったかをログで見える化
     """
     raw_symbol = str(symbol).strip()
     base_symbol = raw_symbol.split(":", 1)[0]
     sym = base_symbol.split("/", 1)[0].strip().upper()
     hour = now_jst.hour
 
+    def _v2_reject(reason: str, extra: str = "") -> None:
+        if V2_DEBUG_REJECTS:
+            msg = f"[V2-REJECT] sym={sym} raw={raw_symbol} reason={reason}"
+            if extra:
+                msg += f" {extra}"
+            print(msg)
+
     # ---- データ取得 ----
     ltf = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
     if not ltf or len(ltf) < 30:
+        _v2_reject("ltf_insufficient", f"len={0 if not ltf else len(ltf)} need=30")
         return None
     ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
 
     htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
     if not htf or len(htf) < V2_EMA_SLOW + 5:
+        _v2_reject("htf_insufficient", f"len={0 if not htf else len(htf)} need={V2_EMA_SLOW + 5}")
         return None
     htf_df = pd.DataFrame(htf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
 
@@ -2634,12 +2644,20 @@ def v2_generate_signal(
     direction = sym_htf["direction"]
 
     if direction == "NEUTRAL":
+        _v2_reject(
+            "sym_htf_neutral",
+            f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf.get('strength')}"
+        )
         return None
 
     # BTC整合チェック
     btc_dir = btc_htf.get("direction", "NEUTRAL")
     btc_str = btc_htf.get("strength", 0.0)
     if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= 0.3:
+        _v2_reject(
+            "btc_conflict_block",
+            f"direction={direction} btc_dir={btc_dir} btc_str={btc_str}"
+        )
         return None
 
     # ★修正2: 方向別LTF評価
@@ -2654,6 +2672,12 @@ def v2_generate_signal(
 
     # ★修正1: Pillar1 必須ゲート
     if p1_score < V2_PILLAR1_MIN:
+        _v2_reject(
+            "pillar1_below_min",
+            f"direction={direction} p1={p1_score:.4f} min={V2_PILLAR1_MIN} "
+            f"sym_htf_strength={sym_htf['strength']:.4f} ltf_score={ltf_eval['score']:.4f} "
+            f"btc_dir={btc_dir} btc_str={btc_str:.4f}"
+        )
         return None
 
     # ---- Pillar2: ファンディングレート ----
@@ -2668,6 +2692,11 @@ def v2_generate_signal(
     # ---- 合計 ----
     total = p1_score + p2_score + p3_score
     if total < V2_MIN_SCORE:
+        _v2_reject(
+            "total_below_min",
+            f"direction={direction} total={total:.4f} min={V2_MIN_SCORE} "
+            f"p1={p1_score:.4f} p2={p2_score:.4f} p3={p3_score:.4f}"
+        )
         return None
 
     # ---- TP/SL ----
