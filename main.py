@@ -2265,7 +2265,7 @@ V2_FR_WEIGHT       = _env_float("V2_FR_WEIGHT", 0.8)
 V2_VOL_CONFIRM     = _env_float("V2_VOL_CONFIRM", 1.2)
 
 # --- 合計スコア ---
-V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.5)
+V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.3)
 V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
 V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
 V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
