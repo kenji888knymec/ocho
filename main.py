@@ -4586,7 +4586,7 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
         return 0
 
     updates: List[Dict[str, Any]] = []
-    judged = 0
+    
 
     def get_cell(row: List[Any], idx: int) -> str:
         if idx < 0:
@@ -5381,7 +5381,21 @@ def judge_v2_sheet(
         a1 = col_to_a1(col_idx)
         updates.append({"range": f"{sheet_name}!{a1}{row_idx_1based}", "values": [[value]]})
 
-    for offset in range(len(rows) - 1, -1, -1):
+    pending_offsets = []
+    open_offsets = []
+
+    for offset in range(len(rows)):
+        row = rows[offset]
+        status = get_cell(row, col_eval).upper()
+
+        if status == "":
+            pending_offsets.append(offset)
+        elif status == "OPEN":
+            open_offsets.append(offset)
+
+    target_offsets = pending_offsets + open_offsets
+
+    for offset in target_offsets:
         if judged >= max_judge:
             break
 
@@ -5389,8 +5403,6 @@ def judge_v2_sheet(
         sheet_row_idx = start_row + offset
 
         status = get_cell(row, col_eval).upper()
-        if status not in ("", "OPEN"):
-            continue
 
         sym = get_cell(row, col_symbol)
         tstr = get_cell(row, col_time)
