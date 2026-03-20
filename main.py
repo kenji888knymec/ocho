@@ -1034,6 +1034,12 @@ def fetch_ohlcv_safe(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit
             return exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
         except Exception as e:
             last_err = e
+            emsg = str(e)
+
+            if "does not have market symbol" in emsg:
+                print(f"[WARN] fetch_ohlcv_safe failed: {symbol} (resolved={sym}) err={emsg}")
+                raise RuntimeError(emsg)
+
             if k < retries:
                 time.sleep(sleep_sec * (k + 1))
                 continue
