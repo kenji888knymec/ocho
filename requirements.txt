@@ -9,3 +9,4 @@ google-auth==2.36.0
 google-api-python-client==2.154.0
 google-cloud-storage==2.10.0
 scikit-learn==1.6.1
+anthropic>=0.40.0
