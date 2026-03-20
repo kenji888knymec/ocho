@@ -5402,6 +5402,15 @@ def judge_v2_sheet(
         a1 = col_to_a1(col_idx)
         updates.append({"range": f"{sheet_name}!{a1}{row_idx_1based}", "values": [[value]]})
 
+    def mark_invalid_market(row_idx_1based: int, market: str):
+        put_one(row_idx_1based, col_eval, "INVALID_MARKET")
+        put_one(row_idx_1based, col_exit_time, "")
+        put_one(row_idx_1based, col_exit_price, "")
+        put_one(row_idx_1based, col_exit_reason, f"BadSymbol:{market}")
+        put_one(row_idx_1based, col_pnl, "")
+        put_one(row_idx_1based, col_winlose, "")
+        put_one(row_idx_1based, col_holdmin, "")
+
     pending_offsets = []
     open_offsets = []
 
@@ -5453,13 +5462,34 @@ def judge_v2_sheet(
         base_sym = base_sym.split("/", 1)[0].strip()
         market = f"{base_sym}/USDT:USDT"
 
-        candles = fetch_ohlcv_safe(
-            exchange,
-            market,
-            timeframe="15m",
-            since=since_ms,
-            limit=V2_JUDGE_MAX_BARS + 4,
-        )
+        candles = None
+        bad_symbol = False
+        bad_symbol_msg = ""
+
+        try:
+            candles = fetch_ohlcv_safe(
+                exchange,
+                market,
+                timeframe="15m",
+                since=since_ms,
+                limit=V2_JUDGE_MAX_BARS + 4,
+            )
+        except Exception as e:
+            emsg = str(e)
+            if "does not have market symbol" in emsg:
+                bad_symbol = True
+                bad_symbol_msg = emsg
+            else:
+                print(f"[JUDGE15M-V2]fetch exception keep-retry row={sheet_row_idx} market={market} err={emsg}")
+                continue
+
+        if bad_symbol:
+            print(f"[JUDGE15M-V2]Mark invalid market row={sheet_row_idx} market={market} err={bad_symbol_msg}")
+            mark_invalid_market(sheet_row_idx, market)
+            judged += 1
+            time.sleep(0.12)
+            continue
+
         if not candles:
             continue
 
