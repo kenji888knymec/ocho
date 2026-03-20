@@ -3005,7 +3005,85 @@ def analyze_v2_performance() -> str:
     msg = "\n".join(lines)
     send_discord_message(msg)
     print(f"[V2-REPORT] sent. done={n_done}")
+
+    # ---- Claude AI 分析 ----
+    call_claude_for_analysis(msg)
+
     return msg
+
+
+# ==========================================
+# Claude AI 分析（/v2_report から呼び出す）
+# ==========================================
+
+def call_claude_for_analysis(report_text: str) -> str:
+    """
+    集計レポートを Claude API に送り、3分類と最小修正案を生成して Discord に送信する。
+    ANTHROPIC_API_KEY が未設定の場合はスキップする。
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("[V2-AI] ANTHROPIC_API_KEY 未設定 — AI分析をスキップ")
+        return ""
+
+    prompt = f"""あなたは暗号通貨botのV2ルール改善アドバイザーです。
+以下の集計データを分析し、日本語で回答してください。
+
+【ロードマップ現在地】
+第4段階：V2ルールの成績レビュー・3分類
+
+【厳守事項】
+- V1コードには絶対に触らない
+- AI学習・LONG/SHORTモデル実装はまだしない
+- 時間帯フィルターは観察するが実装しない
+- 最小修正（1〜2個）を超える変更はしない
+- v2_live化はまだしない
+
+【集計データ】
+{report_text}
+
+【出力形式（この形式を必ず守ること）】
+## 全体評価
+（2〜3行で現状を要約）
+
+## 切る候補
+- 対象：
+- 理由：
+- 具体的な除外条件（コード修正イメージ）：
+
+## 残す候補
+- 対象：
+- 理由：
+
+## まだ観察
+- 対象：
+- 理由：
+- 次の再判断タイミング：
+
+## 最小修正案（1〜2個のみ）
+1. （具体的な変更内容）
+2. （あれば）
+"""
+
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        ai_text = response.content[0].text if response.content else "(応答なし)"
+        header = "=== AI分析レポート（Claude） ==="
+        full_msg = f"{header}\n{ai_text}"
+        send_discord_message(full_msg)
+        print("[V2-AI] AI分析送信完了")
+        return full_msg
+    except Exception as e:
+        err_msg = f"[V2-AI] AI分析エラー: {type(e).__name__}: {e}"
+        print(err_msg)
+        send_discord_message(err_msg)
+        return err_msg
 
 
 # ==========================================
