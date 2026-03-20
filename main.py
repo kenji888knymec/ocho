@@ -4607,7 +4607,7 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
         return 0
 
     updates: List[Dict[str, Any]] = []
-    
+    judged = 0
 
     def get_cell(row: List[Any], idx: int) -> str:
         if idx < 0:
