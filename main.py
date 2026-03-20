@@ -2883,7 +2883,12 @@ def get_v2_done_records(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze_v2_performance() -> str:
-    """v2_shadow_ai の完了データを集計して Discord に送信する。"""
+    """v2_shadow_ai の完了データを変更前後に分割して集計し、Discord に送信する。"""
+    # ブロック銘柄変更日時（JST）
+    CUTOFF_STR = "2026-03-20 22:30"
+    CUTOFF = pd.Timestamp("2026-03-20 22:30:00")
+    BLOCKED_SYMBOLS = ["AAVE", "ARB", "BONK", "SOL", "XRP", "XLM", "LINK", "ETH", "TRX"]
+
     try:
         df_all = get_v2_shadow_ai_data()
     except Exception as e:
@@ -2902,20 +2907,20 @@ def analyze_v2_performance() -> str:
         n_open = 0
 
     now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-    lines = [
-        "=== V2 Shadow AI 分析レポート ===",
-        f"集計日時: {now_jst}",
-        f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
-    ]
 
     if n_done == 0:
-        lines.append("（完了データなし）")
-        msg = "\n".join(lines)
+        msg = "\n".join([
+            "=== V2 Shadow AI 分析レポート ===",
+            f"集計日時: {now_jst}",
+            f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
+            "（完了データなし）",
+        ])
         send_discord_message(msg)
         return msg
 
     df_done = df_done.copy()
 
+    # ---- 共通前処理 ----
     if "PnL_Pct" in df_done.columns:
         df_done["_pnl"] = pd.to_numeric(
             df_done["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
@@ -2932,93 +2937,139 @@ def analyze_v2_performance() -> str:
         df_done["_win"] = False
         df_done["_lose"] = False
 
+    # ---- Datetime_JST で変更前後に分割 ----
+    if "Datetime_JST" in df_done.columns:
+        dt_parsed = pd.to_datetime(
+            df_done["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        n_dt_invalid = int(dt_parsed.isna().sum())
+        df_before = df_done[dt_parsed < CUTOFF].copy()
+        df_after = df_done[dt_parsed >= CUTOFF].copy()
+    else:
+        # Datetime_JST 列がない場合は全件を「変更前」扱いにして後を空にする
+        n_dt_invalid = 0
+        df_before = df_done.copy()
+        df_after = df_done.iloc[0:0].copy()
+
     def _summarize(sub: pd.DataFrame, label: str) -> str:
         n = len(sub)
         if n == 0:
             return f"  {label}: 0件"
-
         w = int(sub["_win"].sum())
         lo = int(sub["_lose"].sum())
         wr = w / (w + lo) * 100 if (w + lo) > 0 else float("nan")
         avg_pnl = sub["_pnl"].mean()
-
         wr_str = f"{wr:.1f}%" if not pd.isna(wr) else "N/A"
         pnl_str = f"{avg_pnl:+.2f}%" if not pd.isna(avg_pnl) else "N/A"
-
         return f"  {label}: {n}件 | Win:{w} Lose:{lo} | 勝率:{wr_str} | 平均PnL:{pnl_str}"
 
-    lines.append("")
-    lines.append("【全体】")
-    lines.append(_summarize(df_done, "DONE合計"))
+    def _build_section_lines(df: pd.DataFrame) -> list:
+        """1つのデータフレームに対して全集計軸のlineリストを返す。"""
+        sec = []
 
-    lines.append("")
-    lines.append("【Direction別】")
-    if "Direction" in df_done.columns:
-        direction_col = df_done["Direction"].astype(str).str.strip().str.upper()
-        for direction in ["SHORT", "LONG"]:
-            sub = df_done[direction_col == direction]
-            lines.append(_summarize(sub, direction))
-    else:
-        lines.append("  Direction列なし")
+        sec.append("【全体】")
+        sec.append(_summarize(df, "DONE合計"))
 
-    lines.append("")
-    lines.append("【Symbol別（件数降順・上位10件）】")
-    if "Symbol" in df_done.columns:
-        symbol_col = df_done["Symbol"].astype(str).str.strip()
-        top_symbols = symbol_col.value_counts().head(10).index.tolist()
-        for sym in top_symbols:
-            sub = df_done[symbol_col == sym]
-            lines.append(_summarize(sub, str(sym)))
-    else:
-        lines.append("  Symbol列なし")
-
-    # ---- P3_VolumeScore 別 ----
-    lines.append("")
-    lines.append("【P3_VolumeScore別】")
-    if "P3_VolumeScore" in df_done.columns:
-        p3 = pd.to_numeric(df_done["P3_VolumeScore"], errors="coerce")
-        df_done["_p3_cat"] = "ゼロ"
-        df_done.loc[p3 > 0, "_p3_cat"] = "プラス"
-        df_done.loc[p3 < 0, "_p3_cat"] = "マイナス"
-        for cat in ["プラス", "ゼロ", "マイナス"]:
-            sub = df_done[df_done["_p3_cat"] == cat]
-            lines.append(_summarize(sub, f"P3={cat}"))
-    else:
-        lines.append("  P3_VolumeScore列なし")
-
-    # ---- Hour_JST 別 ----
-    lines.append("")
-    lines.append("【Hour_JST別（3件以上）】")
-    if "Hour_JST" in df_done.columns:
-        hour_num = pd.to_numeric(df_done["Hour_JST"], errors="coerce")
-        hour_counts = hour_num.dropna().astype(int).value_counts()
-        target_hours = sorted(hour_counts[hour_counts >= 3].index.tolist())
-        if target_hours:
-            for h in target_hours:
-                sub = df_done[hour_num.fillna(-1).astype(int) == h]
-                lines.append(_summarize(sub, f"{h:02d}時"))
+        sec.append("")
+        sec.append("【Direction別】")
+        if "Direction" in df.columns:
+            direction_col = df["Direction"].astype(str).str.strip().str.upper()
+            for direction in ["SHORT", "LONG"]:
+                sub = df[direction_col == direction]
+                sec.append(_summarize(sub, direction))
         else:
-            lines.append("  3件以上の時間帯なし（データ不足）")
+            sec.append("  Direction列なし")
+
+        sec.append("")
+        sec.append("【Symbol別（件数降順・上位10件）】")
+        if "Symbol" in df.columns:
+            symbol_col = df["Symbol"].astype(str).str.strip()
+            top_symbols = symbol_col.value_counts().head(10).index.tolist()
+            for sym in top_symbols:
+                sub = df[symbol_col == sym]
+                sec.append(_summarize(sub, str(sym)))
+        else:
+            sec.append("  Symbol列なし")
+
+        sec.append("")
+        sec.append("【P3_VolumeScore別】")
+        if "P3_VolumeScore" in df.columns:
+            p3 = pd.to_numeric(df["P3_VolumeScore"], errors="coerce")
+            df = df.copy()
+            df["_p3_cat"] = "ゼロ"
+            df.loc[p3 > 0, "_p3_cat"] = "プラス"
+            df.loc[p3 < 0, "_p3_cat"] = "マイナス"
+            for cat in ["プラス", "ゼロ", "マイナス"]:
+                sub = df[df["_p3_cat"] == cat]
+                sec.append(_summarize(sub, f"P3={cat}"))
+        else:
+            sec.append("  P3_VolumeScore列なし")
+
+        sec.append("")
+        sec.append("【Hour_JST別（3件以上）】")
+        if "Hour_JST" in df.columns:
+            hour_num = pd.to_numeric(df["Hour_JST"], errors="coerce")
+            hour_counts = hour_num.dropna().astype(int).value_counts()
+            target_hours = sorted(hour_counts[hour_counts >= 3].index.tolist())
+            if target_hours:
+                for h in target_hours:
+                    sub = df[hour_num.fillna(-1).astype(int) == h]
+                    sec.append(_summarize(sub, f"{h:02d}時"))
+            else:
+                sec.append("  3件以上の時間帯なし（データ不足）")
+        else:
+            sec.append("  Hour_JST列なし")
+
+        return sec
+
+    header_common = [
+        f"集計日時: {now_jst}",
+        f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
+        f"  うちDatetime_JST解析失敗: {n_dt_invalid}件（除外）",
+        f"  変更前({CUTOFF_STR}より前): {len(df_before)}件",
+        f"  変更後({CUTOFF_STR}以降): {len(df_after)}件",
+    ]
+
+    # ---- ① 変更前レポート ----
+    lines_before = [
+        f"=== V2 Shadow AI 分析レポート ①変更前 ({CUTOFF_STR}より前) ===",
+    ] + header_common + [""]
+    if len(df_before) == 0:
+        lines_before.append("（変更前の完了データなし）")
     else:
-        lines.append("  Hour_JST列なし")
+        lines_before += _build_section_lines(df_before)
+    msg_before = "\n".join(lines_before)
+    send_discord_message(msg_before)
+    print(f"[V2-REPORT] ①変更前送信完了. before={len(df_before)}")
 
-    msg = "\n".join(lines)
-    send_discord_message(msg)
-    print(f"[V2-REPORT] sent. done={n_done}")
+    # ---- ② 変更後レポート ----
+    blocked_str = "、".join(BLOCKED_SYMBOLS)
+    lines_after = [
+        f"=== V2 Shadow AI 分析レポート ②変更後 ({CUTOFF_STR}以降) ===",
+        f"※ブロック追加銘柄: {blocked_str}",
+    ] + header_common + [""]
+    if len(df_after) == 0:
+        lines_after.append("（変更後の完了データなし）")
+    else:
+        lines_after += _build_section_lines(df_after)
+    msg_after = "\n".join(lines_after)
+    send_discord_message(msg_after)
+    print(f"[V2-REPORT] ②変更後送信完了. after={len(df_after)}")
 
-    # ---- Claude AI 分析 ----
-    call_claude_for_analysis(msg)
+    # ---- ③ Claude AI 分析 ----
+    call_claude_for_analysis(msg_before, msg_after, BLOCKED_SYMBOLS)
 
-    return msg
+    return msg_before + "\n\n" + msg_after
 
 
 # ==========================================
 # Claude AI 分析（/v2_report から呼び出す）
 # ==========================================
 
-def call_claude_for_analysis(report_text: str) -> str:
+def call_claude_for_analysis(report_before: str, report_after: str, blocked_symbols: list) -> str:
     """
-    集計レポートを Claude API に送り、3分類と最小修正案を生成して Discord に送信する。
+    変更前・変更後の集計レポートを Claude API に送り、比較分析を生成して Discord に送信する。
     ANTHROPIC_API_KEY が未設定の場合はスキップする。
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -3026,8 +3077,9 @@ def call_claude_for_analysis(report_text: str) -> str:
         print("[V2-AI] ANTHROPIC_API_KEY 未設定 — AI分析をスキップ")
         return ""
 
+    blocked_str = "、".join(blocked_symbols)
     prompt = f"""あなたは暗号通貨botのV2ルール改善アドバイザーです。
-以下の集計データを分析し、日本語で回答してください。
+以下の変更前・変更後の集計データを分析し、日本語で回答してください。
 
 【ロードマップ現在地】
 第4段階：V2ルールの成績レビュー・3分類
@@ -3039,12 +3091,30 @@ def call_claude_for_analysis(report_text: str) -> str:
 - 最小修正（1〜2個）を超える変更はしない
 - v2_live化はまだしない
 
-【集計データ】
-{report_text}
+【背景】
+2026-03-20 22:30 JST に以下の銘柄をV2_SHORT_SYMBOL_BLOCKLISTに追加した：
+{blocked_str}
+
+【重要な分析ルール】
+- 変更前データと変更後データを絶対に混ぜて分析しない
+- 変更前後を必ず比較して差分を明示する
+- ブロック銘柄を除外した効果を具体的に評価する
+- 変更後のデータが少ない場合はその旨を明記し、判断を急がない
+
+【変更前集計データ（2026-03-20 22:30より前）】
+{report_before}
+
+【変更後集計データ（2026-03-20 22:30以降）】
+{report_after}
 
 【出力形式（この形式を必ず守ること）】
 ## 全体評価
-（2〜3行で現状を要約）
+（変更前・変更後それぞれの現状を2〜3行で要約。混ぜない）
+
+## 変更前後の比較・差分
+- 勝率の変化：
+- 平均PnLの変化：
+- ブロック銘柄除外の効果：
 
 ## 切る候補
 - 対象：
@@ -3060,6 +3130,12 @@ def call_claude_for_analysis(report_text: str) -> str:
 - 理由：
 - 次の再判断タイミング：
 
+## 改善した点
+（変更後で明確に良くなった点）
+
+## まだ課題の点
+（変更後でも残る問題）
+
 ## 最小修正案（1〜2個のみ）
 1. （具体的な変更内容）
 2. （あれば）
@@ -3074,7 +3150,7 @@ def call_claude_for_analysis(report_text: str) -> str:
             messages=[{"role": "user", "content": prompt}],
         )
         ai_text = response.content[0].text if response.content else "(応答なし)"
-        header = "=== AI分析レポート（Claude） ==="
+        header = "=== AI分析レポート ③（Claude） ==="
         full_msg = f"{header}\n{ai_text}"
         send_discord_message(full_msg)
         print("[V2-AI] AI分析送信完了")
