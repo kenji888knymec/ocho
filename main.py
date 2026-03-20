@@ -2885,8 +2885,8 @@ def get_v2_done_records(df: pd.DataFrame) -> pd.DataFrame:
 def analyze_v2_performance() -> str:
     """v2_shadow_ai の完了データを変更前後に分割して集計し、Discord に送信する。"""
     # ブロック銘柄変更日時（JST）
-    CUTOFF_STR = "2026-03-20 22:30"
-    CUTOFF = pd.Timestamp("2026-03-20 22:30:00")
+    CUTOFF_STR = "2026-03-20 22:20"
+    CUTOFF = pd.Timestamp("2026-03-20 22:20:00")
     BLOCKED_SYMBOLS = ["AAVE", "ARB", "BONK", "SOL", "XRP", "XLM", "LINK", "ETH", "TRX"]
 
     try:
@@ -3092,7 +3092,7 @@ def call_claude_for_analysis(report_before: str, report_after: str, blocked_symb
 - v2_live化はまだしない
 
 【背景】
-2026-03-20 22:30 JST に以下の銘柄をV2_SHORT_SYMBOL_BLOCKLISTに追加した：
+2026-03-20 22:20 JST に以下の銘柄をV2_SHORT_SYMBOL_BLOCKLISTに追加した：
 {blocked_str}
 
 【重要な分析ルール】
@@ -3101,10 +3101,10 @@ def call_claude_for_analysis(report_before: str, report_after: str, blocked_symb
 - ブロック銘柄を除外した効果を具体的に評価する
 - 変更後のデータが少ない場合はその旨を明記し、判断を急がない
 
-【変更前集計データ（2026-03-20 22:30より前）】
+【変更前集計データ（2026-03-20 22:20より前）】
 {report_before}
 
-【変更後集計データ（2026-03-20 22:30以降）】
+【変更後集計データ（2026-03-20 22:20以降）】
 {report_after}
 
 【出力形式（この形式を必ず守ること）】
