@@ -5711,7 +5711,7 @@ def judge_v2_sheet(
         raw_sym = str(sym).strip().upper()
         base_sym = raw_sym.split(":", 1)[0]
         base_sym = base_sym.split("/", 1)[0].strip()
-        market = f"{base_sym}/USDT:USDT"
+        market = f"{base_sym}/USDT"
 
         candles = None
         bad_symbol = False
