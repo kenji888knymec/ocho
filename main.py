@@ -2972,6 +2972,36 @@ def analyze_v2_performance() -> str:
     else:
         lines.append("  Symbol列なし")
 
+    # ---- P3_VolumeScore 別 ----
+    lines.append("")
+    lines.append("【P3_VolumeScore別】")
+    if "P3_VolumeScore" in df_done.columns:
+        p3 = pd.to_numeric(df_done["P3_VolumeScore"], errors="coerce")
+        df_done["_p3_cat"] = "ゼロ"
+        df_done.loc[p3 > 0, "_p3_cat"] = "プラス"
+        df_done.loc[p3 < 0, "_p3_cat"] = "マイナス"
+        for cat in ["プラス", "ゼロ", "マイナス"]:
+            sub = df_done[df_done["_p3_cat"] == cat]
+            lines.append(_summarize(sub, f"P3={cat}"))
+    else:
+        lines.append("  P3_VolumeScore列なし")
+
+    # ---- Hour_JST 別 ----
+    lines.append("")
+    lines.append("【Hour_JST別（3件以上）】")
+    if "Hour_JST" in df_done.columns:
+        hour_num = pd.to_numeric(df_done["Hour_JST"], errors="coerce")
+        hour_counts = hour_num.dropna().astype(int).value_counts()
+        target_hours = sorted(hour_counts[hour_counts >= 3].index.tolist())
+        if target_hours:
+            for h in target_hours:
+                sub = df_done[hour_num.fillna(-1).astype(int) == h]
+                lines.append(_summarize(sub, f"{h:02d}時"))
+        else:
+            lines.append("  3件以上の時間帯なし（データ不足）")
+    else:
+        lines.append("  Hour_JST列なし")
+
     msg = "\n".join(lines)
     send_discord_message(msg)
     print(f"[V2-REPORT] sent. done={n_done}")
