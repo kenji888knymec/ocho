@@ -2842,6 +2842,143 @@ def v2_write_shadow_rows(rows: List[List[Any]]):
 
 
 # ==========================================
+# V2 Shadow 分析レポート
+# ==========================================
+
+def get_v2_shadow_ai_data() -> pd.DataFrame:
+    """v2_shadow_ai シートを全件取得して DataFrame で返す（列名ベース）。"""
+    service = get_sheet_service()
+
+    hdr_res = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{V2_SHADOW_SHEET}!A1:{HEADER_COL_END}1",
+    ).execute()
+    raw_hdr = (hdr_res.get("values", [[]]) or [[]])[0]
+    headers = _normalize_headers(raw_hdr)
+
+    if not headers:
+        return pd.DataFrame()
+
+    data_res = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{V2_SHADOW_SHEET}!A2:{HEADER_COL_END}",
+    ).execute()
+    rows = data_res.get("values", []) or []
+
+    if not rows:
+        return pd.DataFrame(columns=headers)
+
+    n_cols = len(headers)
+    fixed = [r[:n_cols] + [""] * max(0, n_cols - len(r)) for r in rows]
+    return pd.DataFrame(fixed, columns=headers)
+
+
+def get_v2_done_records(df: pd.DataFrame) -> pd.DataFrame:
+    """EvalStatus == 'DONE' の行だけ返す。"""
+    if "EvalStatus" not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    status = df["EvalStatus"].astype(str).str.strip().str.upper()
+    return df[status == "DONE"].copy()
+
+
+def analyze_v2_performance() -> str:
+    """v2_shadow_ai の完了データを集計して Discord に送信する。"""
+    try:
+        df_all = get_v2_shadow_ai_data()
+    except Exception as e:
+        msg = f"[V2-REPORT] シート取得失敗: {e}"
+        print(msg)
+        return msg
+
+    total_rows = len(df_all)
+    df_done = get_v2_done_records(df_all)
+    n_done = len(df_done)
+
+    if "EvalStatus" in df_all.columns:
+        status_all = df_all["EvalStatus"].astype(str).str.strip().str.upper()
+        n_open = int((status_all == "OPEN").sum())
+    else:
+        n_open = 0
+
+    now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+    lines = [
+        "=== V2 Shadow AI 分析レポート ===",
+        f"集計日時: {now_jst}",
+        f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
+    ]
+
+    if n_done == 0:
+        lines.append("（完了データなし）")
+        msg = "\n".join(lines)
+        send_discord_message(msg)
+        return msg
+
+    df_done = df_done.copy()
+
+    if "PnL_Pct" in df_done.columns:
+        df_done["_pnl"] = pd.to_numeric(
+            df_done["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+    else:
+        df_done["_pnl"] = float("nan")
+
+    if "WinLose" in df_done.columns:
+        wl = df_done["WinLose"].astype(str).str.strip().str.lower()
+        df_done["_win"] = wl.isin(["win", "w", "1", "true"])
+        df_done["_lose"] = wl.isin(["lose", "l", "0", "false"])
+    else:
+        df_done["_win"] = False
+        df_done["_lose"] = False
+
+    def _summarize(sub: pd.DataFrame, label: str) -> str:
+        n = len(sub)
+        if n == 0:
+            return f"  {label}: 0件"
+
+        w = int(sub["_win"].sum())
+        lo = int(sub["_lose"].sum())
+        wr = w / (w + lo) * 100 if (w + lo) > 0 else float("nan")
+        avg_pnl = sub["_pnl"].mean()
+
+        wr_str = f"{wr:.1f}%" if not pd.isna(wr) else "N/A"
+        pnl_str = f"{avg_pnl:+.2f}%" if not pd.isna(avg_pnl) else "N/A"
+
+        return f"  {label}: {n}件 | Win:{w} Lose:{lo} | 勝率:{wr_str} | 平均PnL:{pnl_str}"
+
+    lines.append("")
+    lines.append("【全体】")
+    lines.append(_summarize(df_done, "DONE合計"))
+
+    lines.append("")
+    lines.append("【Direction別】")
+    if "Direction" in df_done.columns:
+        direction_col = df_done["Direction"].astype(str).str.strip().str.upper()
+        for direction in ["SHORT", "LONG"]:
+            sub = df_done[direction_col == direction]
+            lines.append(_summarize(sub, direction))
+    else:
+        lines.append("  Direction列なし")
+
+    lines.append("")
+    lines.append("【Symbol別（件数降順・上位10件）】")
+    if "Symbol" in df_done.columns:
+        symbol_col = df_done["Symbol"].astype(str).str.strip()
+        top_symbols = symbol_col.value_counts().head(10).index.tolist()
+        for sym in top_symbols:
+            sub = df_done[symbol_col == sym]
+            lines.append(_summarize(sub, str(sym)))
+    else:
+        lines.append("  Symbol列なし")
+
+    msg = "\n".join(lines)
+    send_discord_message(msg)
+    print(f"[V2-REPORT] sent. done={n_done}")
+    return msg
+
+
+# ==========================================
 # Shadow Mode メインループ
 # ==========================================
 
@@ -5598,6 +5735,17 @@ def judge_v2_main() -> str:
         max_judge=max_judge,
     )
     return f"Judged {total} rows ({V2_SHADOW_SHEET})"
+
+
+@app.route("/v2_report", methods=["GET", "POST"])
+def v2_report_process():
+    try:
+        result = analyze_v2_performance()
+        return result, 200
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /v2_report crashed: {err}")
+        return f"ERR: {err}", 200
 
 
 @app.route("/judge_v2", methods=["GET", "POST"])
