@@ -2270,6 +2270,9 @@ V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")
 V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
 V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
 V2_DEBUG_REJECTS           = str(os.environ.get("V2_DEBUG_REJECTS", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_SYMBOL_BLOCKLIST   = [s.strip().upper() for s in str(os.environ.get("V2_LONG_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
+V2_SHORT_SYMBOL_BLOCKLIST  = [s.strip().upper() for s in str(os.environ.get("V2_SHORT_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
+
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
@@ -2647,6 +2650,24 @@ def v2_generate_signal(
         _v2_reject(
             "sym_htf_neutral",
             f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf.get('strength')}"
+        )
+        return None
+
+    # side別シンボル blocklist
+    long_block = set(V2_LONG_SYMBOL_BLOCKLIST or [])
+    short_block = set(V2_SHORT_SYMBOL_BLOCKLIST or [])
+
+    if direction == "LONG" and sym in long_block:
+        _v2_reject(
+            "long_symbol_block",
+            f"sym={sym} blocklist={sorted(long_block)}"
+        )
+        return None
+
+    if direction == "SHORT" and sym in short_block:
+        _v2_reject(
+            "short_symbol_block",
+            f"sym={sym} blocklist={sorted(short_block)}"
         )
         return None
 
