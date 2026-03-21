@@ -3409,10 +3409,10 @@ def _build_short_selection_report(df_done: pd.DataFrame, now_jst: str) -> str:
 
 def analyze_v2_performance() -> str:
     """v2_shadow_ai の完了データを変更前後に分割して集計し、Discord に送信する。"""
-    # ブロック銘柄変更日時（JST）
-    CUTOFF_STR = "2026-03-20 22:20"
-    CUTOFF = pd.Timestamp("2026-03-20 22:20:00")
-    BLOCKED_SYMBOLS = ["AAVE", "ARB", "BONK", "SOL", "XRP", "XLM", "LINK", "ETH", "TRX"]
+    # コード修正日時（JST）: レジーム転換検出・NaN安全化・TP固定化・FR取得改善
+    CUTOFF_STR = "2026-03-21 16:20"
+    CUTOFF = pd.Timestamp("2026-03-21 16:20:00")
+    CHANGE_SUMMARY = "レジーム転換検出・NaN安全化・TP倍率固定化・FR取得改善"
 
     try:
         df_all = get_v2_shadow_ai_data()
@@ -3569,10 +3569,9 @@ def analyze_v2_performance() -> str:
     print(f"[V2-REPORT] ①変更前送信完了. before={len(df_before)}")
 
     # ---- ② 変更後レポート ----
-    blocked_str = "、".join(BLOCKED_SYMBOLS)
     lines_after = [
         f"=== V2 Shadow AI 分析レポート ②変更後 ({CUTOFF_STR}以降) ===",
-        f"※ブロック追加銘柄: {blocked_str}",
+        f"※コード修正内容: {CHANGE_SUMMARY}",
     ] + header_common + [""]
     if len(df_after) == 0:
         lines_after.append("（変更後の完了データなし）")
@@ -3588,7 +3587,7 @@ def analyze_v2_performance() -> str:
     print(f"[V2-REPORT] ③SHORT選抜効果送信完了.")
 
     # ---- ④ Claude AI 分析 ----
-    call_claude_for_analysis(msg_before, msg_after, BLOCKED_SYMBOLS)
+    call_claude_for_analysis(msg_before, msg_after, CHANGE_SUMMARY)
 
     return msg_before + "\n\n" + msg_after + "\n\n" + msg_selection
 
@@ -3597,7 +3596,7 @@ def analyze_v2_performance() -> str:
 # Claude AI 分析（/v2_report から呼び出す）
 # ==========================================
 
-def call_claude_for_analysis(report_before: str, report_after: str, blocked_symbols: list) -> str:
+def call_claude_for_analysis(report_before: str, report_after: str, change_summary: str) -> str:
     """
     変更前・変更後の集計レポートを Claude API に送り、比較分析を生成して Discord に送信する。
     ANTHROPIC_API_KEY が未設定の場合はスキップする。
@@ -3607,7 +3606,6 @@ def call_claude_for_analysis(report_before: str, report_after: str, blocked_symb
         print("[V2-AI] ANTHROPIC_API_KEY 未設定 — AI分析をスキップ")
         return ""
 
-    blocked_str = "、".join(blocked_symbols)
     prompt = f"""あなたは暗号通貨botのV2ルール改善アドバイザーです。
 以下の変更前・変更後の集計データを分析し、日本語で回答してください。
 
@@ -3622,19 +3620,19 @@ def call_claude_for_analysis(report_before: str, report_after: str, blocked_symb
 - v2_live化はまだしない
 
 【背景】
-2026-03-20 22:20 JST に以下の銘柄をV2_SHORT_SYMBOL_BLOCKLISTに追加した：
-{blocked_str}
+2026-03-21 16:20 JST に以下のコード修正を実施した：
+{change_summary}
 
 【重要な分析ルール】
 - 変更前データと変更後データを絶対に混ぜて分析しない
 - 変更前後を必ず比較して差分を明示する
-- ブロック銘柄を除外した効果を具体的に評価する
+- コード修正による効果を具体的に評価する
 - 変更後のデータが少ない場合はその旨を明記し、判断を急がない
 
-【変更前集計データ（2026-03-20 22:20より前）】
+【変更前集計データ（2026-03-21 16:20より前）】
 {report_before}
 
-【変更後集計データ（2026-03-20 22:20以降）】
+【変更後集計データ（2026-03-21 16:20以降）】
 {report_after}
 
 【出力形式（この形式を必ず守ること）】
@@ -3644,7 +3642,7 @@ def call_claude_for_analysis(report_before: str, report_after: str, blocked_symb
 ## 変更前後の比較・差分
 - 勝率の変化：
 - 平均PnLの変化：
-- ブロック銘柄除外の効果：
+- コード修正の効果：
 
 ## 切る候補
 - 対象：
