@@ -3104,6 +3104,163 @@ def get_v2_done_records(df: pd.DataFrame) -> pd.DataFrame:
     return df[status == "DONE"].copy()
 
 
+def _build_short_selection_report(df_done: pd.DataFrame, now_jst: str) -> str:
+    """
+    v2_shadow_ai の DONE データから SHORT 選抜効果を集計してレポート文字列を返す。
+    対象: Direction=SHORT AND EvalStatus=DONE AND AI_Model_Version が空でない行。
+    """
+    MIN_SAMPLES = 10  # これ未満は「判定保留」
+
+    lines = [f"=== V2 SHORT 選抜効果 ({now_jst}) ==="]
+
+    # AI_Model_Version が存在し空でない行のみ（パイプライン稼働後）
+    if "AI_Model_Version" not in df_done.columns or "Direction" not in df_done.columns:
+        lines.append("（AI_Model_Version または Direction 列なし — スキップ）")
+        return "\n".join(lines)
+
+    mv = df_done["AI_Model_Version"].astype(str).str.strip()
+    dir_col = df_done["Direction"].astype(str).str.strip().str.upper()
+    df_short_pipeline = df_done[(dir_col == "SHORT") & (mv != "") & (mv != "NAN") & (mv != "NONE")].copy()
+
+    n_target = len(df_short_pipeline)
+    if n_target == 0:
+        lines.append("（選抜パイプライン稼働後のSHORT DONEデータなし）")
+        return "\n".join(lines)
+
+    # _pnl / _win / _lose が親で付与済みのはずだが念のため
+    if "_pnl" not in df_short_pipeline.columns:
+        if "PnL_Pct" in df_short_pipeline.columns:
+            df_short_pipeline["_pnl"] = pd.to_numeric(
+                df_short_pipeline["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
+                errors="coerce",
+            )
+        else:
+            df_short_pipeline["_pnl"] = float("nan")
+
+    if "_win" not in df_short_pipeline.columns:
+        if "WinLose" in df_short_pipeline.columns:
+            wl = df_short_pipeline["WinLose"].astype(str).str.strip().str.lower()
+            df_short_pipeline["_win"] = wl.isin(["win", "w", "1", "true"])
+            df_short_pipeline["_lose"] = wl.isin(["lose", "l", "0", "false"])
+        else:
+            df_short_pipeline["_win"] = False
+            df_short_pipeline["_lose"] = False
+
+    def _fmt(sub: pd.DataFrame, label: str) -> str:
+        n = len(sub)
+        if n == 0:
+            return f"  {label}: 0件"
+        w = int(sub["_win"].sum())
+        lo = int(sub["_lose"].sum())
+        wr = w / (w + lo) * 100 if (w + lo) > 0 else float("nan")
+        avg_pnl = sub["_pnl"].mean()
+        wr_str = f"{wr:.1f}%" if not pd.isna(wr) else "N/A"
+        pnl_str = f"{avg_pnl:+.4f}%" if not pd.isna(avg_pnl) else "N/A"
+        return f"  {label}: n={n}, WR={wr_str}, PnL={pnl_str}"
+
+    # ---- 1. A/B/C 群比較 ----
+    ai_pass_col = df_short_pipeline["AI_Pass"].astype(str).str.strip() if "AI_Pass" in df_short_pipeline.columns else pd.Series([""] * n_target, index=df_short_pipeline.index)
+    df_pass1 = df_short_pipeline[ai_pass_col == "1"]
+    df_pass0 = df_short_pipeline[ai_pass_col == "0"]
+
+    lines.append(f"SHORT全体:    {_fmt(df_short_pipeline, 'A群').strip()}")
+    lines.append(f"選抜通過(1):  {_fmt(df_pass1, 'B群').strip()}")
+    lines.append(f"選抜落ち(0):  {_fmt(df_pass0, 'C群').strip()}")
+
+    # 判定
+    n_b = len(df_pass1)
+    n_c = len(df_pass0)
+    w_b = int(df_pass1["_win"].sum())
+    lo_b = int(df_pass1["_lose"].sum())
+    w_c = int(df_pass0["_win"].sum())
+    lo_c = int(df_pass0["_lose"].sum())
+    wr_b = w_b / (w_b + lo_b) * 100 if (w_b + lo_b) > 0 else None
+    wr_c = w_c / (w_c + lo_c) * 100 if (w_c + lo_c) > 0 else None
+
+    if n_b < MIN_SAMPLES:
+        verdict = f"判定保留（B群 n={n_b} < {MIN_SAMPLES}件）"
+    elif wr_b is None or wr_c is None:
+        verdict = "判定保留（WinLose データ不足）"
+    elif wr_b > wr_c + 2:
+        verdict = "効いている（B群 > C群）"
+    elif wr_b < wr_c - 2:
+        verdict = "逆効果（B群 < C群 — 要調整）"
+    else:
+        verdict = "差なし（±2%以内）"
+    lines.append(f"判定: {verdict}")
+
+    # ---- 2. AI_Band 別 ----
+    lines.append("")
+    lines.append("--- AI_Band別 ---")
+    if "AI_Band" in df_short_pipeline.columns:
+        band_col = df_short_pipeline["AI_Band"].astype(str).str.strip()
+        for band in ["RULE_QS", "RULE_QS_NO_RANK", "RANK_REJECT", "REJECTED"]:
+            sub = df_short_pipeline[band_col == band]
+            if len(sub) > 0:
+                lines.append(_fmt(sub, band))
+    else:
+        lines.append("  AI_Band列なし")
+
+    # ---- 3. QualityScore (AI_Prob_Win) 帯別 ----
+    lines.append("")
+    lines.append("--- QualityScore帯別 ---")
+    if "AI_Prob_Win" in df_short_pipeline.columns:
+        qs = pd.to_numeric(df_short_pipeline["AI_Prob_Win"], errors="coerce")
+        df_qs = df_short_pipeline.copy()
+        df_qs["_qs"] = qs
+        df_qs_valid = df_qs[df_qs["_qs"].notna()]
+        if len(df_qs_valid) == 0:
+            lines.append("  数値データなし")
+        else:
+            bands_qs = [
+                ("QS <3.0",    df_qs_valid[df_qs_valid["_qs"] < 3.0]),
+                ("QS 3.0-3.5", df_qs_valid[(df_qs_valid["_qs"] >= 3.0) & (df_qs_valid["_qs"] < 3.5)]),
+                ("QS 3.5-4.0", df_qs_valid[(df_qs_valid["_qs"] >= 3.5) & (df_qs_valid["_qs"] < 4.0)]),
+                ("QS 4.0+",    df_qs_valid[df_qs_valid["_qs"] >= 4.0]),
+            ]
+            for label, sub in bands_qs:
+                if len(sub) > 0:
+                    lines.append(_fmt(sub, label))
+    else:
+        lines.append("  AI_Prob_Win列なし")
+
+    # ---- 4. 日次推移 ----
+    lines.append("")
+    lines.append("--- 日次推移 ---")
+    if "Datetime_JST" in df_short_pipeline.columns:
+        dt_s = pd.to_datetime(
+            df_short_pipeline["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        df_daily = df_short_pipeline.copy()
+        df_daily["_date"] = dt_s.dt.date
+        dates_valid = df_daily[df_daily["_date"].notna()]["_date"].unique()
+        dates_sorted = sorted(dates_valid)
+        if len(dates_sorted) == 0:
+            lines.append("  日付データなし")
+        else:
+            def _wr_str(sub: pd.DataFrame) -> str:
+                w = int(sub["_win"].sum()); lo = int(sub["_lose"].sum())
+                return f"{w/(w+lo)*100:.1f}%" if (w + lo) > 0 else "N/A"
+            for d in dates_sorted:
+                day_df = df_daily[df_daily["_date"] == d]
+                if "AI_Pass" in day_df.columns:
+                    ap = day_df["AI_Pass"].astype(str).str.strip()
+                    pass1_day = day_df[ap == "1"]
+                    pass0_day = day_df[ap == "0"]
+                else:
+                    pass1_day = day_df.iloc[0:0]
+                    pass0_day = day_df.iloc[0:0]
+                lines.append(
+                    f"  {d}: Pass n={len(pass1_day)} WR={_wr_str(pass1_day)} | "
+                    f"Reject n={len(pass0_day)} WR={_wr_str(pass0_day)}"
+                )
+    else:
+        lines.append("  Datetime_JST列なし")
+
+    return "\n".join(lines)
+
+
 def analyze_v2_performance() -> str:
     """v2_shadow_ai の完了データを変更前後に分割して集計し、Discord に送信する。"""
     # ブロック銘柄変更日時（JST）
@@ -3279,10 +3436,15 @@ def analyze_v2_performance() -> str:
     send_discord_message(msg_after)
     print(f"[V2-REPORT] ②変更後送信完了. after={len(df_after)}")
 
-    # ---- ③ Claude AI 分析 ----
+    # ---- ③ SHORT 選抜効果分析 ----
+    msg_selection = _build_short_selection_report(df_done, now_jst)
+    send_discord_message(msg_selection)
+    print(f"[V2-REPORT] ③SHORT選抜効果送信完了.")
+
+    # ---- ④ Claude AI 分析 ----
     call_claude_for_analysis(msg_before, msg_after, BLOCKED_SYMBOLS)
 
-    return msg_before + "\n\n" + msg_after
+    return msg_before + "\n\n" + msg_after + "\n\n" + msg_selection
 
 
 # ==========================================
