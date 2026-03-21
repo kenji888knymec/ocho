@@ -2306,6 +2306,31 @@ V2_SHORT_QS_MIN            = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 V2_SHORT_RSI_SWEET_MIN     = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
 V2_SHORT_RSI_SWEET_MAX     = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
 
+# --- V2 LONG Selection Pipeline ---
+V2_LONG_DEF_ENABLE         = str(os.environ.get("V2_LONG_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 1.5)
+V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
+V2_LONG_DEF_RSI_MIN        = _env_float("V2_LONG_DEF_RSI_MIN", 40.0)
+V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 55.0)
+
+V2_LONG_RANK_ENABLE        = str(os.environ.get("V2_LONG_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RANK_TOP_N         = int(float(os.environ.get("V2_LONG_RANK_TOP_N", "2")))
+V2_LONG_QS_MIN             = _env_float("V2_LONG_QS_MIN", float("-inf"))
+
+V2_LONG_RSI_SWEET_MIN      = _env_float("V2_LONG_RSI_SWEET_MIN", 40.0)
+V2_LONG_RSI_SWEET_MAX      = _env_float("V2_LONG_RSI_SWEET_MAX", 45.0)
+V2_LONG_BTCSTR_SOFT_MAX    = _env_float("V2_LONG_BTCSTR_SOFT_MAX", 0.5)
+V2_LONG_BTCSTR_HARD_MAX    = _env_float("V2_LONG_BTCSTR_HARD_MAX", 0.7)
+
+V2_LONG_QS_W_P1            = _env_float("V2_LONG_QS_W_P1", 1.0)
+V2_LONG_QS_W_RSI           = _env_float("V2_LONG_QS_W_RSI", 0.6)
+V2_LONG_QS_W_P3            = _env_float("V2_LONG_QS_W_P3", 0.5)
+V2_LONG_QS_W_BTC           = _env_float("V2_LONG_QS_W_BTC", 0.4)
+V2_LONG_QS_W_OTHER         = _env_float("V2_LONG_QS_W_OTHER", 0.2)
+V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.6)
+
+V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
+
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
 
@@ -3055,79 +3080,299 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return ranked
 
 
+def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    LONG専用の最低品質ライン。
+    SHORTはここでは触らない。
+    """
+    direction = str(sig.get("direction", "")).upper()
+    if direction != "LONG":
+        return True, "not_long"
+
+    if not V2_LONG_DEF_ENABLE:
+        return True, "long_def_disabled"
+
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    total = _safe_float_or_nan(sig.get("total_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    if not np.isfinite(p1):
+        return False, "missing_p1_score"
+
+    if not np.isfinite(total):
+        return False, "missing_total_score"
+
+    if not np.isfinite(rsi):
+        return False, "missing_rsi"
+
+    if p1 < V2_LONG_DEF_P1_MIN:
+        return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
+
+    if total < V2_LONG_DEF_SCORE_MIN:
+        return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
+
+    if rsi < V2_LONG_DEF_RSI_MIN or rsi > V2_LONG_DEF_RSI_MAX:
+        return False, (
+            f"rsi_out_of_range rsi={rsi:.4f} "
+            f"min={V2_LONG_DEF_RSI_MIN:.1f} max={V2_LONG_DEF_RSI_MAX:.1f}"
+        )
+
+    return True, "pass"
+
+
+def _calc_long_rsi_bonus(rsi: float) -> float:
+    if not np.isfinite(rsi):
+        return 0.0
+
+    if V2_LONG_RSI_SWEET_MIN <= rsi <= V2_LONG_RSI_SWEET_MAX:
+        return 1.0
+
+    if V2_LONG_DEF_RSI_MIN <= rsi <= V2_LONG_DEF_RSI_MAX:
+        return 0.4
+
+    return 0.0
+
+
+def _calc_long_p3_bonus(p3_score: float) -> float:
+    if not np.isfinite(p3_score):
+        return 0.0
+
+    p3_rounded = round(float(p3_score), 1)
+
+    if p3_rounded == -0.2:
+        return 1.0
+    if p3_rounded == 0.0:
+        return 0.3
+    if p3_rounded == 1.0:
+        return -0.3
+
+    return 0.0
+
+
+def _calc_long_btc_bonus(btcstr: float) -> float:
+    if not np.isfinite(btcstr):
+        return 0.0
+
+    if btcstr < V2_LONG_BTCSTR_SOFT_MAX:
+        return 1.0
+    if btcstr < V2_LONG_BTCSTR_HARD_MAX:
+        return 0.2
+
+    return -0.5
+
+
+def _calc_long_bad_symbol_flag(symbol: str) -> float:
+    sym = str(symbol).split("/", 1)[0].strip().upper()
+    return 1.0 if sym in V2_LONG_BAD_SYMBOLS else 0.0
+
+
+def calc_long_quality_score(sig: Dict[str, Any]) -> float:
+    """
+    LONG用の仮QualityScore。
+    将来LONG-AIに差し替える場所。
+    """
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    total = _safe_float_or_nan(sig.get("total_score"))
+    p3_score = _safe_float_or_nan(sig.get("p3_score"))
+    btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    if not np.isfinite(p1):
+        p1 = 0.0
+    if not np.isfinite(total):
+        total = 0.0
+    if not np.isfinite(p3_score):
+        p3_score = 0.0
+    if not np.isfinite(btcstr):
+        btcstr = 0.0
+
+    rsi_bonus = _calc_long_rsi_bonus(rsi)
+    p3_bonus = _calc_long_p3_bonus(p3_score)
+    btc_bonus = _calc_long_btc_bonus(btcstr)
+
+    other_score = total - p1
+    other_score = max(-1.5, min(other_score, 1.5))
+
+    bad_symbol_flag = _calc_long_bad_symbol_flag(sig.get("symbol", ""))
+
+    qs = (
+        (p1 * V2_LONG_QS_W_P1) +
+        (rsi_bonus * V2_LONG_QS_W_RSI) +
+        (p3_bonus * V2_LONG_QS_W_P3) +
+        (btc_bonus * V2_LONG_QS_W_BTC) +
+        (other_score * V2_LONG_QS_W_OTHER) +
+        (bad_symbol_flag * V2_LONG_QS_W_BAD_SYMBOL)
+    )
+    return float(qs)
+
+
+def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    LONG候補を QualityScore 降順に並べる。
+    上位N件は ai_pass="1" のまま通し、
+    上位に入らなかったものは ai_pass="0" / ai_band="RANK_REJECT" にして
+    記録用に残したまま返す。
+    """
+    if not long_signals:
+        return []
+
+    ranked = sorted(
+        long_signals,
+        key=lambda x: float(x.get("ai_prob_win", 0.0) or 0.0),
+        reverse=True,
+    )
+
+    if not V2_LONG_RANK_ENABLE:
+        for rank_idx, sig in enumerate(ranked, start=1):
+            slot_total = len(ranked)
+            sig["ai_band"] = "RULE_QS_NO_RANK"
+            current_note = str(sig.get("ai_note", "") or "")
+            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n=ALL;selected=true;rank_disabled=true"
+        return ranked
+
+    top_n = max(1, int(V2_LONG_RANK_TOP_N))
+    slot_total = len(ranked)
+
+    for rank_idx, sig in enumerate(ranked, start=1):
+        current_note = str(sig.get("ai_note", "") or "")
+        if rank_idx <= top_n:
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = "RULE_QS"
+            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n={top_n};selected=true"
+        else:
+            sig["ai_pass"] = "0"
+            sig["ai_band"] = "RANK_REJECT"
+            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n={top_n};selected=false;reason=rank_exceeded"
+
+    return ranked
+
+
 def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Stage A -> B -> C
-    LONGはそのまま通す。
-    SHORTだけディフェンシブフィルター + QualityScoreランキングを適用する。
+    SHORT:
+        defensive_filter -> calc_quality_score -> rank_and_select
+    LONG:
+        defensive_filter_long -> calc_long_quality_score -> rank_and_select_long
 
-    REJECTされたSHORTも ai_pass="0" でシートに記録する（検証用）。
+    REJECT も rank落ちも記録用に残す。
     """
     if not signals:
         return []
 
     output: List[Dict[str, Any]] = []
     short_passed: List[Dict[str, Any]] = []
+    long_passed: List[Dict[str, Any]] = []
 
     for sig in signals:
         direction = str(sig.get("direction", "")).upper()
 
-        if direction != "SHORT":
-            sig["ai_prob_win"] = ""
-            sig["ai_pass"] = ""
-            sig["ai_band"] = ""
-            sig["ai_model_version"] = ""
-            sig["ai_model_type"] = "COMMON"
-            sig["ai_note"] = ""
-            output.append(sig)
-            continue
+        if direction == "SHORT":
+            ok, reason = defensive_filter(sig)
 
-        ok, reason = defensive_filter(sig)
+            if not ok:
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "QS_v1"
+                sig["ai_model_type"] = "SHORT_RULE_RANK"
+                sig["ai_note"] = f"REJECTED:{reason}"
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={reason}")
+                continue
 
-        if not ok:
-            sig["ai_prob_win"] = ""
-            sig["ai_pass"] = "0"
-            sig["ai_band"] = "REJECTED"
-            sig["ai_model_version"] = "QS_v1"
-            sig["ai_model_type"] = "SHORT_RULE_RANK"
-            sig["ai_note"] = f"REJECTED:{reason}"
-            output.append(sig)
-            print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} reason={reason}")
-            continue
+            qs = calc_quality_score(sig)
 
-        qs = calc_quality_score(sig)
+            if qs < V2_SHORT_QS_MIN:
+                sig["ai_prob_win"] = round(qs, 6)
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "QS_v1"
+                sig["ai_model_type"] = "SHORT_RULE_RANK"
+                sig["ai_note"] = f"REJECTED:qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
+                output.append(sig)
+                print(
+                    f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT "
+                    f"reason=qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
+                )
+                continue
 
-        if qs < V2_SHORT_QS_MIN:
             sig["ai_prob_win"] = round(qs, 6)
-            sig["ai_pass"] = "0"
-            sig["ai_band"] = "REJECTED"
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = "RULE_QS"
             sig["ai_model_version"] = "QS_v1"
             sig["ai_model_type"] = "SHORT_RULE_RANK"
-            sig["ai_note"] = f"REJECTED:qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
-            output.append(sig)
-            print(
-                f"[V2-SELECT-REJECT] sym={sig.get('symbol')} "
-                f"reason=qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
+            sig["ai_note"] = (
+                f"qs={qs:.4f};"
+                f"p1={float(sig.get('p1_score', 0.0) or 0.0):.4f};"
+                f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
+                f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
+                f"rsi={sig.get('rsi', '')}"
             )
+
+            short_passed.append(sig)
             continue
 
-        sig["ai_prob_win"] = round(qs, 6)
-        sig["ai_pass"] = "1"
-        sig["ai_band"] = "RULE_QS"
-        sig["ai_model_version"] = "QS_v1"
-        sig["ai_model_type"] = "SHORT_RULE_RANK"
-        sig["ai_note"] = (
-            f"qs={qs:.4f};"
-            f"p1={float(sig.get('p1_score', 0.0) or 0.0):.4f};"
-            f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
-            f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
-            f"rsi={sig.get('rsi', '')}"
-        )
+        if direction == "LONG":
+            ok, reason = defensive_filter_long(sig)
 
-        short_passed.append(sig)
+            if not ok:
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "LONG_QS_v1"
+                sig["ai_model_type"] = "LONG_RULE_RANK"
+                sig["ai_note"] = f"REJECTED:{reason}"
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={reason}")
+                continue
+
+            qs = calc_long_quality_score(sig)
+
+            if qs < V2_LONG_QS_MIN:
+                sig["ai_prob_win"] = round(qs, 6)
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "LONG_QS_v1"
+                sig["ai_model_type"] = "LONG_RULE_RANK"
+                sig["ai_note"] = f"REJECTED:qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
+                output.append(sig)
+                print(
+                    f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
+                    f"reason=qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
+                )
+                continue
+
+            sig["ai_prob_win"] = round(qs, 6)
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = "RULE_QS"
+            sig["ai_model_version"] = "LONG_QS_v1"
+            sig["ai_model_type"] = "LONG_RULE_RANK"
+            sig["ai_note"] = (
+                f"qs={qs:.4f};"
+                f"p1={float(sig.get('p1_score', 0.0) or 0.0):.4f};"
+                f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
+                f"p3={float(sig.get('p3_score', 0.0) or 0.0):.4f};"
+                f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
+                f"rsi={sig.get('rsi', '')}"
+            )
+
+            long_passed.append(sig)
+            continue
+
+        sig["ai_prob_win"] = ""
+        sig["ai_pass"] = ""
+        sig["ai_band"] = "COMMON"
+        sig["ai_model_version"] = ""
+        sig["ai_model_type"] = "COMMON"
+        sig["ai_note"] = ""
+        output.append(sig)
 
     ranked_shorts = rank_and_select(short_passed)
+    ranked_longs = rank_and_select_long(long_passed)
+
     output.extend(ranked_shorts)
+    output.extend(ranked_longs)
 
     return output
 
@@ -3777,14 +4022,27 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     # REJECTされたSHORTも ai_pass="0" で含まれる
     final_signals = v2_selection_pipeline(raw_signals)
 
-    # 集計ログ
-    n_long = sum(1 for x in final_signals if str(x.get("direction", "")).upper() == "LONG")
-    n_short_pass = sum(1 for x in final_signals if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("ai_pass", "")) == "1")
-    n_short_reject = sum(1 for x in final_signals if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("ai_pass", "")) == "0")
+    n_short_pass = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("ai_pass", "")) == "1"
+    )
+    n_short_reject = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("ai_pass", "")) == "0"
+    )
+    n_long_pass = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "LONG" and str(x.get("ai_pass", "")) == "1"
+    )
+    n_long_reject = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "LONG" and str(x.get("ai_pass", "")) == "0"
+    )
 
     print(
         f"[V2] RAW={len(raw_signals)} FINAL={len(final_signals)} "
-        f"LONG={n_long} SHORT_PASS={n_short_pass} SHORT_REJECT={n_short_reject}"
+        f"SHORT_PASS={n_short_pass} SHORT_REJECT={n_short_reject} "
+        f"LONG_PASS={n_long_pass} LONG_REJECT={n_long_reject}"
     )
 
     for sig in final_signals:
@@ -3793,18 +4051,29 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
         if direction == "SHORT" and ai_pass == "1":
             print(
-                f"[V2] SELECTED: {sig['symbol']} {sig['direction']} "
+                f"[V2] SHORT-SELECTED: {sig['symbol']} {sig['direction']} "
                 f"total={sig['total_score']:.2f} "
                 f"P1={sig['p1_score']:.2f} "
                 f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')}"
             )
-        elif direction == "LONG":
+        elif direction == "SHORT" and ai_pass == "0":
             print(
-                f"[V2] LONG-PASS: {sig['symbol']} {sig['direction']} "
+                f"[V2] SHORT-REJECTED: {sig['symbol']} {sig['direction']} "
+                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
+            )
+        elif direction == "LONG" and ai_pass == "1":
+            print(
+                f"[V2] LONG-SELECTED: {sig['symbol']} {sig['direction']} "
                 f"total={sig['total_score']:.2f} "
                 f"P1={sig['p1_score']:.2f} "
+                f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')}"
+            )
+        elif direction == "LONG" and ai_pass == "0":
+            print(
+                f"[V2] LONG-REJECTED: {sig['symbol']} {sig['direction']} "
+                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
             )
 
     # シート書き込み（選抜通過もREJECTも全部書く）
@@ -3814,7 +4083,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     if engine_mode == "v2_live":
         print("[V2] engine_mode=v2_live (notification hook not implemented yet)")
 
-    return f"V2-shadow: final={len(final_signals)} (pass={n_short_pass} reject={n_short_reject} long={n_long}) raw={len(raw_signals)}"
+    return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
 
 
 
