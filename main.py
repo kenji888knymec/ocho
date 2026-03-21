@@ -3653,11 +3653,16 @@ def _build_short_selection_report(df_done: pd.DataFrame, now_jst: str) -> str:
 
 
 def analyze_v2_performance() -> str:
-    """v2_shadow_ai の完了データを変更前後に分割して集計し、Discord に送信する。"""
-    # コード修正日時（JST）: レジーム転換検出・NaN安全化・TP固定化・FR取得改善
-    CUTOFF_STR = "2026-03-21 16:20"
-    CUTOFF = pd.Timestamp("2026-03-21 16:20:00")
-    CHANGE_SUMMARY = "レジーム転換検出・NaN安全化・TP倍率固定化・FR取得改善"
+    """v2_shadow_ai の完了データを SHORT/LONG 別のカットオフで分割して集計し、Discord に送信する。"""
+    # SHORT カットオフ（コード修正: レジーム転換検出・NaN安全化・TP固定化・FR改善）
+    CUTOFF_SHORT_STR = "2026-03-21 16:20"
+    CUTOFF_SHORT = pd.Timestamp("2026-03-21 16:20:00")
+    CHANGE_SUMMARY_SHORT = "レジーム転換検出・NaN安全化・TP倍率固定化・FR取得改善"
+
+    # LONG カットオフ（コード修正: LONGフィルター・QualityScore・選抜パイプライン追加）
+    CUTOFF_LONG_STR = "2026-03-21 23:30"
+    CUTOFF_LONG = pd.Timestamp("2026-03-21 23:30:00")
+    CHANGE_SUMMARY_LONG = "LONG選抜パイプライン追加（defensive_filter_long・calc_long_quality_score・rank_and_select_long）"
 
     try:
         df_all = get_v2_shadow_ai_data()
@@ -3707,20 +3712,35 @@ def analyze_v2_performance() -> str:
         df_done["_win"] = False
         df_done["_lose"] = False
 
-    # ---- Datetime_JST で変更前後に分割 ----
+    # ---- Datetime_JST パース ----
     if "Datetime_JST" in df_done.columns:
         dt_parsed = pd.to_datetime(
             df_done["Datetime_JST"].astype(str).str.strip(),
             errors="coerce",
         )
         n_dt_invalid = int(dt_parsed.isna().sum())
-        df_before = df_done[dt_parsed < CUTOFF].copy()
-        df_after = df_done[dt_parsed >= CUTOFF].copy()
     else:
-        # Datetime_JST 列がない場合は全件を「変更前」扱いにして後を空にする
-        n_dt_invalid = 0
-        df_before = df_done.copy()
-        df_after = df_done.iloc[0:0].copy()
+        dt_parsed = pd.Series([pd.NaT] * len(df_done), index=df_done.index)
+        n_dt_invalid = len(df_done)
+
+    # ---- Direction で SHORT / LONG に分離 ----
+    if "Direction" in df_done.columns:
+        direction_col = df_done["Direction"].astype(str).str.strip().str.upper()
+    else:
+        direction_col = pd.Series([""] * len(df_done), index=df_done.index)
+
+    df_short = df_done[direction_col == "SHORT"].copy()
+    df_long = df_done[direction_col == "LONG"].copy()
+    dt_short = dt_parsed[direction_col == "SHORT"]
+    dt_long = dt_parsed[direction_col == "LONG"]
+
+    # SHORT 前後分割
+    df_short_before = df_short[dt_short < CUTOFF_SHORT].copy()
+    df_short_after = df_short[dt_short >= CUTOFF_SHORT].copy()
+
+    # LONG 前後分割
+    df_long_before = df_long[dt_long < CUTOFF_LONG].copy()
+    df_long_after = df_long[dt_long >= CUTOFF_LONG].copy()
 
     def _summarize(sub: pd.DataFrame, label: str) -> str:
         n = len(sub)
@@ -3740,16 +3760,6 @@ def analyze_v2_performance() -> str:
 
         sec.append("【全体】")
         sec.append(_summarize(df, "DONE合計"))
-
-        sec.append("")
-        sec.append("【Direction別】")
-        if "Direction" in df.columns:
-            direction_col = df["Direction"].astype(str).str.strip().str.upper()
-            for direction in ["SHORT", "LONG"]:
-                sub = df[direction_col == direction]
-                sec.append(_summarize(sub, direction))
-        else:
-            sec.append("  Direction列なし")
 
         sec.append("")
         sec.append("【Symbol別（件数降順・上位10件）】")
@@ -3797,53 +3807,88 @@ def analyze_v2_performance() -> str:
         f"集計日時: {now_jst}",
         f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
         f"  うちDatetime_JST解析失敗: {n_dt_invalid}件（除外）",
-        f"  変更前({CUTOFF_STR}より前): {len(df_before)}件",
-        f"  変更後({CUTOFF_STR}以降): {len(df_after)}件",
+        f"  SHORT: 変更前({CUTOFF_SHORT_STR}より前)={len(df_short_before)}件 / 変更後({CUTOFF_SHORT_STR}以降)={len(df_short_after)}件",
+        f"  LONG:  変更前({CUTOFF_LONG_STR}より前)={len(df_long_before)}件 / 変更後({CUTOFF_LONG_STR}以降)={len(df_long_after)}件",
     ]
 
-    # ---- ① 変更前レポート ----
-    lines_before = [
-        f"=== V2 Shadow AI 分析レポート ①変更前 ({CUTOFF_STR}より前) ===",
+    # ---- ① SHORT 変更前レポート ----
+    lines_s_before = [
+        f"=== V2 Shadow AI 分析レポート ①SHORT変更前 ({CUTOFF_SHORT_STR}より前) ===",
     ] + header_common + [""]
-    if len(df_before) == 0:
-        lines_before.append("（変更前の完了データなし）")
+    if len(df_short_before) == 0:
+        lines_s_before.append("（SHORT変更前の完了データなし）")
     else:
-        lines_before += _build_section_lines(df_before)
-    msg_before = "\n".join(lines_before)
-    send_discord_message(msg_before)
-    print(f"[V2-REPORT] ①変更前送信完了. before={len(df_before)}")
+        lines_s_before += _build_section_lines(df_short_before)
+    msg_short_before = "\n".join(lines_s_before)
+    send_discord_message(msg_short_before)
+    print(f"[V2-REPORT] ①SHORT変更前送信完了. short_before={len(df_short_before)}")
 
-    # ---- ② 変更後レポート ----
-    lines_after = [
-        f"=== V2 Shadow AI 分析レポート ②変更後 ({CUTOFF_STR}以降) ===",
-        f"※コード修正内容: {CHANGE_SUMMARY}",
+    # ---- ② SHORT 変更後レポート ----
+    lines_s_after = [
+        f"=== V2 Shadow AI 分析レポート ②SHORT変更後 ({CUTOFF_SHORT_STR}以降) ===",
+        f"※コード修正内容: {CHANGE_SUMMARY_SHORT}",
     ] + header_common + [""]
-    if len(df_after) == 0:
-        lines_after.append("（変更後の完了データなし）")
+    if len(df_short_after) == 0:
+        lines_s_after.append("（SHORT変更後の完了データなし）")
     else:
-        lines_after += _build_section_lines(df_after)
-    msg_after = "\n".join(lines_after)
-    send_discord_message(msg_after)
-    print(f"[V2-REPORT] ②変更後送信完了. after={len(df_after)}")
+        lines_s_after += _build_section_lines(df_short_after)
+    msg_short_after = "\n".join(lines_s_after)
+    send_discord_message(msg_short_after)
+    print(f"[V2-REPORT] ②SHORT変更後送信完了. short_after={len(df_short_after)}")
 
-    # ---- ③ SHORT 選抜効果分析 ----
+    # ---- ③ LONG 変更前レポート ----
+    lines_l_before = [
+        f"=== V2 Shadow AI 分析レポート ③LONG変更前 ({CUTOFF_LONG_STR}より前) ===",
+    ] + header_common + [""]
+    if len(df_long_before) == 0:
+        lines_l_before.append("（LONG変更前の完了データなし）")
+    else:
+        lines_l_before += _build_section_lines(df_long_before)
+    msg_long_before = "\n".join(lines_l_before)
+    send_discord_message(msg_long_before)
+    print(f"[V2-REPORT] ③LONG変更前送信完了. long_before={len(df_long_before)}")
+
+    # ---- ④ LONG 変更後レポート ----
+    lines_l_after = [
+        f"=== V2 Shadow AI 分析レポート ④LONG変更後 ({CUTOFF_LONG_STR}以降) ===",
+        f"※コード修正内容: {CHANGE_SUMMARY_LONG}",
+    ] + header_common + [""]
+    if len(df_long_after) == 0:
+        lines_l_after.append("（LONG変更後の完了データなし）")
+    else:
+        lines_l_after += _build_section_lines(df_long_after)
+    msg_long_after = "\n".join(lines_l_after)
+    send_discord_message(msg_long_after)
+    print(f"[V2-REPORT] ④LONG変更後送信完了. long_after={len(df_long_after)}")
+
+    # ---- ⑤ SHORT 選抜効果分析 ----
     msg_selection = _build_short_selection_report(df_done, now_jst)
     send_discord_message(msg_selection)
-    print(f"[V2-REPORT] ③SHORT選抜効果送信完了.")
+    print(f"[V2-REPORT] ⑤SHORT選抜効果送信完了.")
 
-    # ---- ④ Claude AI 分析 ----
-    call_claude_for_analysis(msg_before, msg_after, CHANGE_SUMMARY)
+    # ---- ⑥ Claude AI 分析 ----
+    call_claude_for_analysis(
+        msg_short_before, msg_short_after,
+        msg_long_before, msg_long_after,
+        CHANGE_SUMMARY_SHORT, CHANGE_SUMMARY_LONG,
+        CUTOFF_SHORT_STR, CUTOFF_LONG_STR,
+    )
 
-    return msg_before + "\n\n" + msg_after + "\n\n" + msg_selection
+    return "\n\n".join([msg_short_before, msg_short_after, msg_long_before, msg_long_after, msg_selection])
 
 
 # ==========================================
 # Claude AI 分析（/v2_report から呼び出す）
 # ==========================================
 
-def call_claude_for_analysis(report_before: str, report_after: str, change_summary: str) -> str:
+def call_claude_for_analysis(
+    short_before: str, short_after: str,
+    long_before: str, long_after: str,
+    change_summary_short: str, change_summary_long: str,
+    cutoff_short_str: str, cutoff_long_str: str,
+) -> str:
     """
-    変更前・変更後の集計レポートを Claude API に送り、比較分析を生成して Discord に送信する。
+    SHORT/LONG それぞれの変更前後レポートを Claude API に送り、比較分析を生成して Discord に送信する。
     ANTHROPIC_API_KEY が未設定の場合はスキップする。
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -3865,31 +3910,49 @@ def call_claude_for_analysis(report_before: str, report_after: str, change_summa
 - v2_live化はまだしない
 
 【背景】
-2026-03-21 16:20 JST に以下のコード修正を実施した：
-{change_summary}
+SHORT カットオフ（{cutoff_short_str} JST）に実施したコード修正：
+{change_summary_short}
+
+LONG カットオフ（{cutoff_long_str} JST）に実施したコード修正：
+{change_summary_long}
 
 【重要な分析ルール】
+- SHORTとLONGを混ぜて分析しない
 - 変更前データと変更後データを絶対に混ぜて分析しない
 - 変更前後を必ず比較して差分を明示する
 - コード修正による効果を具体的に評価する
 - 変更後のデータが少ない場合はその旨を明記し、判断を急がない
 
-【変更前集計データ（2026-03-21 16:20より前）】
-{report_before}
+【SHORT変更前集計データ（{cutoff_short_str}より前）】
+{short_before}
 
-【変更後集計データ（2026-03-21 16:20以降）】
-{report_after}
+【SHORT変更後集計データ（{cutoff_short_str}以降）】
+{short_after}
+
+【LONG変更前集計データ（{cutoff_long_str}より前）】
+{long_before}
+
+【LONG変更後集計データ（{cutoff_long_str}以降）】
+{long_after}
 
 【出力形式（この形式を必ず守ること）】
-## 全体評価
-（変更前・変更後それぞれの現状を2〜3行で要約。混ぜない）
+## SHORT 全体評価
+（SHORT変更前・変更後それぞれの現状を2〜3行で要約。混ぜない）
 
-## 変更前後の比較・差分
+## SHORT 変更前後の比較・差分
 - 勝率の変化：
 - 平均PnLの変化：
 - コード修正の効果：
 
-## 切る候補
+## LONG 全体評価
+（LONG変更前・変更後それぞれの現状を2〜3行で要約。混ぜない）
+
+## LONG 変更前後の比較・差分
+- 勝率の変化：
+- 平均PnLの変化：
+- フィルター追加の効果：
+
+## 切る候補（SHORT/LONG共通）
 - 対象：
 - 理由：
 - 具体的な除外条件（コード修正イメージ）：
@@ -3923,7 +3986,7 @@ def call_claude_for_analysis(report_before: str, report_after: str, change_summa
             messages=[{"role": "user", "content": prompt}],
         )
         ai_text = response.content[0].text if response.content else "(応答なし)"
-        header = "=== AI分析レポート ③（Claude） ==="
+        header = "=== AI分析レポート ⑥（Claude） ==="
         full_msg = f"{header}\n{ai_text}"
         send_discord_message(full_msg)
         print("[V2-AI] AI分析送信完了")
