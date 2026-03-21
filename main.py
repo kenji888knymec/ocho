@@ -2309,7 +2309,6 @@ V2_SHORT_RSI_SWEET_MAX     = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
 # --- V2 LONG Selection Pipeline ---
 V2_LONG_DEF_ENABLE         = str(os.environ.get("V2_LONG_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 1.5)
-V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
 V2_LONG_DEF_RSI_MIN        = _env_float("V2_LONG_DEF_RSI_MIN", 40.0)
 V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 55.0)
 
@@ -2325,9 +2324,13 @@ V2_LONG_BTCSTR_HARD_MAX    = _env_float("V2_LONG_BTCSTR_HARD_MAX", 0.7)
 V2_LONG_QS_W_P1            = _env_float("V2_LONG_QS_W_P1", 1.0)
 V2_LONG_QS_W_RSI           = _env_float("V2_LONG_QS_W_RSI", 0.6)
 V2_LONG_QS_W_P3            = _env_float("V2_LONG_QS_W_P3", 0.5)
-V2_LONG_QS_W_BTC           = _env_float("V2_LONG_QS_W_BTC", 0.4)
+V2_LONG_QS_W_BTC           = _env_float("V2_LONG_QS_W_BTC", 0.2)
 V2_LONG_QS_W_OTHER         = _env_float("V2_LONG_QS_W_OTHER", 0.2)
-V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.6)
+V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.3)
+V2_LONG_QS_W_MODE          = _env_float("V2_LONG_QS_W_MODE", 0.5)
+V2_LONG_MODE_UP_PENALTY    = _env_float("V2_LONG_MODE_UP_PENALTY", -1.0)
+V2_LONG_MODE_RANGE_BONUS   = _env_float("V2_LONG_MODE_RANGE_BONUS", 0.3)
+V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.3)
 
 V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
 
@@ -2494,8 +2497,9 @@ def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
 
 def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    ★修正2: LONG専用のLTF評価。
-    押し目買い + モメンタム追従。
+    LONG専用のLTF評価。
+    押し目買い + 押し目からの回復を重視する。
+    高RSIの追いかけ加点はしない。
     """
     if len(ltf_df) < 20:
         return {"score": 0.0, "reasons": []}
@@ -2524,14 +2528,6 @@ def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     if np.isfinite(rsi) and np.isfinite(prev_rsi) and 40 <= rsi <= 60 and rsi > prev_rsi:
         score += 0.5
         reasons.append(f"rsi_recovering({rsi:.1f})")
-
-    # ★修正5: RSI>65 のモメンタム追従
-    # 実績データ: LONG × RSI 70+ = WR 41.9%（最良グループ）
-    # ただし LONG × RSI 70+ × 13-18時 = WR 11.8%（壊滅）
-    # 注意: 時間帯フィルターは未実装。将来追加を検討。
-    if np.isfinite(rsi) and rsi > 65:
-        score += 0.7
-        reasons.append(f"momentum({rsi:.1f})")
 
     # 陽線確認
     if close > float(cur["Open"]):
@@ -2831,13 +2827,21 @@ def v2_generate_signal(
         )
         return None
 
-    # レジーム転換ガード: 方向別。SHORTだけ今は止める。
+    # レジーム転換ガード: 方向別。SHORT/LONG の両方を見る。
     short_regime_conflict = bool((regime_info or {}).get("short_conflict", False))
+    long_regime_conflict = bool((regime_info or {}).get("long_conflict", False))
 
     if short_regime_conflict and direction == "SHORT":
         _v2_reject(
             "regime_conflict_block",
             f"direction={direction} btc_dir={btc_dir} short_regime_conflict=True"
+        )
+        return None
+
+    if long_regime_conflict and direction == "LONG":
+        _v2_reject(
+            "regime_conflict_block",
+            f"direction={direction} btc_dir={btc_dir} long_regime_conflict=True"
         )
         return None
 
@@ -3084,6 +3088,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
     SHORTはここでは触らない。
+    LONGは最初は P1 と RSI だけで gate する。
     """
     direction = str(sig.get("direction", "")).upper()
     if direction != "LONG":
@@ -3093,23 +3098,16 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return True, "long_def_disabled"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
-    total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
 
     if not np.isfinite(p1):
         return False, "missing_p1_score"
-
-    if not np.isfinite(total):
-        return False, "missing_total_score"
 
     if not np.isfinite(rsi):
         return False, "missing_rsi"
 
     if p1 < V2_LONG_DEF_P1_MIN:
         return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
-
-    if total < V2_LONG_DEF_SCORE_MIN:
-        return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
 
     if rsi < V2_LONG_DEF_RSI_MIN or rsi > V2_LONG_DEF_RSI_MAX:
         return False, (
@@ -3137,13 +3135,13 @@ def _calc_long_p3_bonus(p3_score: float) -> float:
     if not np.isfinite(p3_score):
         return 0.0
 
-    p3_rounded = round(float(p3_score), 1)
+    p3 = float(p3_score)
 
-    if p3_rounded == -0.2:
+    if -0.25 <= p3 <= -0.15:
         return 1.0
-    if p3_rounded == 0.0:
+    if -0.05 <= p3 <= 0.05:
         return 0.3
-    if p3_rounded == 1.0:
+    if 0.95 <= p3 <= 1.05:
         return -0.3
 
     return 0.0
@@ -3161,6 +3159,17 @@ def _calc_long_btc_bonus(btcstr: float) -> float:
     return -0.5
 
 
+def _calc_long_mode_bonus(btc_mode_compat: str) -> float:
+    mode = str(btc_mode_compat or "").strip()
+    if mode == "Up":
+        return V2_LONG_MODE_UP_PENALTY
+    if mode == "Range":
+        return V2_LONG_MODE_RANGE_BONUS
+    if mode == "Down":
+        return V2_LONG_MODE_DOWN_BONUS
+    return 0.0
+
+
 def _calc_long_bad_symbol_flag(symbol: str) -> float:
     sym = str(symbol).split("/", 1)[0].strip().upper()
     return 1.0 if sym in V2_LONG_BAD_SYMBOLS else 0.0
@@ -3170,12 +3179,15 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
     """
     LONG用の仮QualityScore。
     将来LONG-AIに差し替える場所。
+    LONGは gate で P1 と RSI を見ているので、
+    ここでは補助情報（P3 / BTC強度 / BTCモード / other_score / bad_symbol）を中心に順位づけする。
     """
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
     p3_score = _safe_float_or_nan(sig.get("p3_score"))
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "")
 
     if not np.isfinite(p1):
         p1 = 0.0
@@ -3189,6 +3201,7 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
     rsi_bonus = _calc_long_rsi_bonus(rsi)
     p3_bonus = _calc_long_p3_bonus(p3_score)
     btc_bonus = _calc_long_btc_bonus(btcstr)
+    mode_bonus = _calc_long_mode_bonus(btc_mode_compat)
 
     other_score = total - p1
     other_score = max(-1.5, min(other_score, 1.5))
@@ -3200,6 +3213,7 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
         (rsi_bonus * V2_LONG_QS_W_RSI) +
         (p3_bonus * V2_LONG_QS_W_P3) +
         (btc_bonus * V2_LONG_QS_W_BTC) +
+        (mode_bonus * V2_LONG_QS_W_MODE) +
         (other_score * V2_LONG_QS_W_OTHER) +
         (bad_symbol_flag * V2_LONG_QS_W_BAD_SYMBOL)
     )
@@ -3320,7 +3334,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_prob_win"] = ""
                 sig["ai_pass"] = "0"
                 sig["ai_band"] = "REJECTED"
-                sig["ai_model_version"] = "LONG_QS_v1"
+                sig["ai_model_version"] = "LONG_QS_v2"
                 sig["ai_model_type"] = "LONG_RULE_RANK"
                 sig["ai_note"] = f"REJECTED:{reason}"
                 output.append(sig)
@@ -3333,7 +3347,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_prob_win"] = round(qs, 6)
                 sig["ai_pass"] = "0"
                 sig["ai_band"] = "REJECTED"
-                sig["ai_model_version"] = "LONG_QS_v1"
+                sig["ai_model_version"] = "LONG_QS_v2"
                 sig["ai_model_type"] = "LONG_RULE_RANK"
                 sig["ai_note"] = f"REJECTED:qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
                 output.append(sig)
@@ -3346,7 +3360,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             sig["ai_prob_win"] = round(qs, 6)
             sig["ai_pass"] = "1"
             sig["ai_band"] = "RULE_QS"
-            sig["ai_model_version"] = "LONG_QS_v1"
+            sig["ai_model_version"] = "LONG_QS_v2"
             sig["ai_model_type"] = "LONG_RULE_RANK"
             sig["ai_note"] = (
                 f"qs={qs:.4f};"
@@ -3354,6 +3368,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
                 f"p3={float(sig.get('p3_score', 0.0) or 0.0):.4f};"
                 f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
+                f"btc_mode={sig.get('btc_mode_compat', '')};"
                 f"rsi={sig.get('rsi', '')}"
             )
 
