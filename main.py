@@ -2410,10 +2410,10 @@ def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
 
     cur = df.iloc[-2]   # 確定足
     prev = df.iloc[-3]
-    rsi = _safe_float(cur["RSI"], 50)
+    rsi = _safe_float(cur["RSI"], np.nan)
     close = float(cur["Close"])
     ema20 = float(cur["EMA20"])
-    prev_rsi = _safe_float(prev["RSI"], 50)
+    prev_rsi = _safe_float(prev["RSI"], np.nan)
 
     score = 0.0
     reasons = []
@@ -2425,7 +2425,7 @@ def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
         reasons.append(f"pullback({dist:.4f})")
 
     # RSI 40-60帯で上昇中 → 押し目からの回復
-    if 40 <= rsi <= 60 and rsi > prev_rsi:
+    if np.isfinite(rsi) and np.isfinite(prev_rsi) and 40 <= rsi <= 60 and rsi > prev_rsi:
         score += 0.5
         reasons.append(f"rsi_recovering({rsi:.1f})")
 
@@ -2433,7 +2433,7 @@ def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     # 実績データ: LONG × RSI 70+ = WR 41.9%（最良グループ）
     # ただし LONG × RSI 70+ × 13-18時 = WR 11.8%（壊滅）
     # → Pillar0 で時間帯は先に弾いているので、ここでは加点してOK
-    if rsi > 65:
+    if np.isfinite(rsi) and rsi > 65:
         score += 0.7
         reasons.append(f"momentum({rsi:.1f})")
 
@@ -2466,10 +2466,10 @@ def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
 
     cur = df.iloc[-2]
     prev = df.iloc[-3]
-    rsi = _safe_float(cur["RSI"], 50)
+    rsi = _safe_float(cur["RSI"], np.nan)
     close = float(cur["Close"])
     ema20 = float(cur["EMA20"])
-    prev_rsi = _safe_float(prev["RSI"], 50)
+    prev_rsi = _safe_float(prev["RSI"], np.nan)
 
     score = 0.0
     reasons = []
@@ -2481,22 +2481,22 @@ def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
         reasons.append(f"retracement({dist:.4f})")
 
     # ★修正5: SHORT最適帯 RSI 30-55 で下降中
-    if 30 <= rsi <= 55 and rsi < prev_rsi:
+    if np.isfinite(rsi) and np.isfinite(prev_rsi) and 30 <= rsi <= 55 and rsi < prev_rsi:
         score += 0.7
         reasons.append(f"rsi_optimal_short({rsi:.1f})")
-    elif 55 < rsi <= 70 and rsi < prev_rsi:
+    elif np.isfinite(rsi) and np.isfinite(prev_rsi) and 55 < rsi <= 70 and rsi < prev_rsi:
         # RSI 55-70 はまだ許容（戻りが深い）
         score += 0.3
         reasons.append(f"rsi_declining({rsi:.1f})")
 
     # ★修正5: RSI<30 は減点（追いかけ危険）
-    if rsi < 30:
+    if np.isfinite(rsi) and rsi < 30:
         score -= 0.5
         reasons.append(f"rsi_oversold_penalty({rsi:.1f})")
 
     # ★修正5: RSI>70 も減点（SHORTには逆風）
     # 実績: SHORT × RSI 70+ = WR 13.4%
-    if rsi > 70:
+    if np.isfinite(rsi) and rsi > 70:
         score -= 0.8
         reasons.append(f"rsi_high_penalty({rsi:.1f})")
 
