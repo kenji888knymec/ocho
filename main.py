@@ -2270,6 +2270,18 @@ V2_FR_WEIGHT       = _env_float("V2_FR_WEIGHT", 0.8)
 # --- Pillar3: 出来高 ---
 V2_VOL_CONFIRM     = _env_float("V2_VOL_CONFIRM", 1.2)
 
+# --- レジーム転換検出 ---
+V2_REGIME_CHECK_ENABLE     = str(os.environ.get("V2_REGIME_CHECK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_REGIME_LTF_EMA_FAST     = int(float(os.environ.get("V2_REGIME_LTF_EMA_FAST", "5")))
+V2_REGIME_LTF_EMA_SLOW     = int(float(os.environ.get("V2_REGIME_LTF_EMA_SLOW", "13")))
+
+# --- BTC矛盾チェック閾値 ---
+V2_BTC_CONFLICT_STRONG_TH  = _env_float("V2_BTC_CONFLICT_STRONG_TH", 0.8)
+
+# --- TP倍率 ---
+V2_TP_MULT_FIXED           = _env_float("V2_TP_MULT_FIXED", 2.0)
+V2_TP_SCORE_DEPENDENT      = str(os.environ.get("V2_TP_SCORE_DEPENDENT", "0")).strip().lower() in ("1", "true", "yes", "on")
+
 # --- 合計スコア ---
 V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.3)
 V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
@@ -2396,6 +2408,65 @@ def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
     return {"direction": direction, "strength": float(strength), "ema_spread": float(spread)}
 
 
+def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
+    """
+    BTC 1H方向と 15m短期EMA の矛盾を方向別に返す。
+    short_conflict: 1H=SHORT なのに 15m EMA5 > EMA13
+    long_conflict:  1H=LONG なのに 15m EMA5 < EMA13
+    判定不能なら、両方 False を返す。
+    """
+    result = {
+        "short_conflict": False,
+        "long_conflict": False,
+        "reason": "no_conflict",
+        "ltf_ema_fast": np.nan,
+        "ltf_ema_slow": np.nan,
+    }
+
+    if not V2_REGIME_CHECK_ENABLE:
+        result["reason"] = "disabled"
+        return result
+
+    try:
+        btc_ltf = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+        if not btc_ltf or len(btc_ltf) < V2_REGIME_LTF_EMA_SLOW + 3:
+            result["reason"] = "btc_ltf_insufficient"
+            return result
+
+        btc_ltf_df = pd.DataFrame(btc_ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        ema_fast = _ema(btc_ltf_df["Close"], V2_REGIME_LTF_EMA_FAST)
+        ema_slow = _ema(btc_ltf_df["Close"], V2_REGIME_LTF_EMA_SLOW)
+
+        ltf_ema_f = float(ema_fast.iloc[-2])
+        ltf_ema_s = float(ema_slow.iloc[-2])
+
+        result["ltf_ema_fast"] = ltf_ema_f
+        result["ltf_ema_slow"] = ltf_ema_s
+
+        if not (np.isfinite(ltf_ema_f) and np.isfinite(ltf_ema_s)):
+            result["reason"] = "ema_not_finite"
+            return result
+
+        if htf_direction == "SHORT" and ltf_ema_f > ltf_ema_s:
+            spread = (ltf_ema_f - ltf_ema_s) / ltf_ema_s if ltf_ema_s != 0 else 0.0
+            result["short_conflict"] = True
+            result["reason"] = f"short_conflict spread={spread:.6f}"
+            return result
+
+        if htf_direction == "LONG" and ltf_ema_f < ltf_ema_s:
+            spread = (ltf_ema_f - ltf_ema_s) / ltf_ema_s if ltf_ema_s != 0 else 0.0
+            result["long_conflict"] = True
+            result["reason"] = f"long_conflict spread={spread:.6f}"
+            return result
+
+        return result
+
+    except Exception as e:
+        print(f"[V2-REGIME] detect failed: {e}")
+        result["reason"] = f"error:{e}"
+        return result
+
+
 def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     """
     ★修正2: LONG専用のLTF評価。
@@ -2432,7 +2503,7 @@ def assess_ltf_long(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     # ★修正5: RSI>65 のモメンタム追従
     # 実績データ: LONG × RSI 70+ = WR 41.9%（最良グループ）
     # ただし LONG × RSI 70+ × 13-18時 = WR 11.8%（壊滅）
-    # → Pillar0 で時間帯は先に弾いているので、ここでは加点してOK
+    # 注意: 時間帯フィルターは未実装。将来追加を検討。
     if np.isfinite(rsi) and rsi > 65:
         score += 0.7
         reasons.append(f"momentum({rsi:.1f})")
@@ -2513,16 +2584,38 @@ def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
 # ==========================================
 
 def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
-    """ccxt で FR 取得。失敗なら None。"""
-    try:
-        result = exchange.fetch_funding_rate(symbol)
-        if result and "fundingRate" in result:
-            fr = result["fundingRate"]
-            if fr is not None:
-                return float(fr)
-    except Exception as e:
-        # 取れない銘柄もある → None で返してPillar2無効化するだけ
-        pass
+    """
+    ccxt で FR 取得。失敗なら None（Pillar2無効化するだけ）。
+    OKX swap は BTC/USDT:USDT 形式が必要なケースがあるため、
+    元の形式で失敗したら :USDT 付きでリトライする。
+    """
+    candidates = [symbol]
+    if ":" not in symbol and "/USDT" in symbol:
+        candidates.append(symbol + ":USDT")
+
+    last_err = ""
+    for sym in candidates:
+        try:
+            result = exchange.fetch_funding_rate(sym)
+            if result and "fundingRate" in result:
+                fr = result["fundingRate"]
+                if fr is not None:
+                    v = float(fr)
+                    if np.isfinite(v):
+                        if V2_DEBUG_REJECTS:
+                            print(f"[V2-FR] success sym={symbol} used={sym} fr={v}")
+                        return v
+                    last_err = f"non_finite fr={fr}"
+                else:
+                    last_err = "fundingRate is None"
+            else:
+                last_err = f"no fundingRate key in result"
+        except Exception as e:
+            last_err = f"{type(e).__name__}:{e}"
+            continue
+
+    if V2_DEBUG_REJECTS:
+        print(f"[V2-FR] unavailable sym={symbol} candidates={candidates} last_err={last_err}")
     return None
 
 
@@ -2603,7 +2696,10 @@ def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_sco
         atr_val = abs(entry * 0.005)
 
     sl_mult = 1.5
-    tp_mult = 2.0 + min(total_score / 5.0, 1.5)
+    if V2_TP_SCORE_DEPENDENT:
+        tp_mult = 2.0 + min(total_score / 5.0, 1.5)
+    else:
+        tp_mult = V2_TP_MULT_FIXED
 
     if direction == "LONG":
         sl = entry - atr_val * sl_mult
@@ -2629,6 +2725,7 @@ def v2_generate_signal(
     symbol: str,
     btc_htf: Dict[str, Any],
     now_jst: datetime,
+    regime_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     1銘柄を評価。合意なければ None。
@@ -2640,7 +2737,7 @@ def v2_generate_signal(
     raw_symbol = str(symbol).strip()
     base_symbol = raw_symbol.split(":", 1)[0]
     sym = base_symbol.split("/", 1)[0].strip().upper()
-    hour = now_jst.hour
+    hour = None
 
     def _v2_reject(reason: str, extra: str = "") -> None:
         if V2_DEBUG_REJECTS:
@@ -2655,6 +2752,14 @@ def v2_generate_signal(
         _v2_reject("ltf_insufficient", f"len={0 if not ltf else len(ltf)} need=30")
         return None
     ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
+    try:
+        closed_bar_time_ms = int(ltf_df["Time"].iloc[-2])
+        closed_bar_dt = datetime.fromtimestamp(closed_bar_time_ms / 1000, JST)
+        hour = closed_bar_dt.hour
+    except Exception as e:
+        _v2_reject("closed_bar_time_invalid", f"e={e}")
+        return None
 
     htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
     if not htf or len(htf) < V2_EMA_SLOW + 5:
@@ -2694,10 +2799,20 @@ def v2_generate_signal(
     # BTC整合チェック
     btc_dir = btc_htf.get("direction", "NEUTRAL")
     btc_str = btc_htf.get("strength", 0.0)
-    if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= 0.8:
+    if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= V2_BTC_CONFLICT_STRONG_TH:
         _v2_reject(
             "btc_conflict_block",
-            f"direction={direction} btc_dir={btc_dir} btc_str={btc_str}"
+            f"direction={direction} btc_dir={btc_dir} btc_str={btc_str} min={V2_BTC_CONFLICT_STRONG_TH}"
+        )
+        return None
+
+    # レジーム転換ガード: 方向別。SHORTだけ今は止める。
+    short_regime_conflict = bool((regime_info or {}).get("short_conflict", False))
+
+    if short_regime_conflict and direction == "SHORT":
+        _v2_reject(
+            "regime_conflict_block",
+            f"direction={direction} btc_dir={btc_dir} short_regime_conflict=True"
         )
         return None
 
@@ -2773,8 +2888,8 @@ def v2_generate_signal(
         "rsi": ltf_eval.get("rsi", np.nan),
         "hour": hour,
         "btc_mode_compat": btc_mode_compat,
-        "time_ms": int(ltf_df["Time"].iloc[-2]),
-        "dt": datetime.fromtimestamp(int(ltf_df["Time"].iloc[-2]) / 1000, JST),
+        "time_ms": closed_bar_time_ms,
+        "dt": closed_bar_dt,
     }
 
 
@@ -2786,11 +2901,21 @@ def v2_generate_signal(
 # Stage C: 15分スロットごとに上位N件のみ残す
 # ==========================================
 
+def _safe_float_or_nan(value: Any) -> float:
+    try:
+        if value is None:
+            return np.nan
+        return float(value)
+    except Exception:
+        return np.nan
+
+
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
     SHORT専用の最低品質ライン。
     LONGは今は触らないので、そのまま通す。
+    欠損は 0 扱いにせず、明示的に reject する。
     """
     direction = str(sig.get("direction", "")).upper()
     if direction != "SHORT":
@@ -2799,14 +2924,22 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not V2_SHORT_DEF_ENABLE:
         return True, "short_def_disabled"
 
-    p1 = float(sig.get("p1_score", 0.0) or 0.0)
-    total = float(sig.get("total_score", 0.0) or 0.0)
-    btcstr = float(sig.get("btc_htf_strength", 0.0) or 0.0)
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    total = _safe_float_or_nan(sig.get("total_score"))
+    btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
 
-    try:
-        rsi = float(sig.get("rsi", np.nan))
-    except Exception:
-        rsi = np.nan
+    if not np.isfinite(p1):
+        return False, "missing_p1_score"
+
+    if not np.isfinite(total):
+        return False, "missing_total_score"
+
+    if not np.isfinite(btcstr):
+        return False, "missing_btc_htf_strength"
+
+    if not np.isfinite(rsi):
+        return False, "missing_rsi"
 
     if p1 < V2_SHORT_DEF_P1_MIN:
         return False, f"p1_below_min p1={p1:.4f} min={V2_SHORT_DEF_P1_MIN:.4f}"
@@ -2817,9 +2950,9 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if btcstr < V2_SHORT_DEF_BTCSTR_MIN:
         return False, f"btcstr_below_min btcstr={btcstr:.4f} min={V2_SHORT_DEF_BTCSTR_MIN:.4f}"
 
-    if (not np.isfinite(rsi)) or (rsi < V2_SHORT_DEF_RSI_MIN) or (rsi > V2_SHORT_DEF_RSI_MAX):
+    if rsi < V2_SHORT_DEF_RSI_MIN or rsi > V2_SHORT_DEF_RSI_MAX:
         return False, (
-            f"rsi_out_of_range rsi={rsi} "
+            f"rsi_out_of_range rsi={rsi:.4f} "
             f"min={V2_SHORT_DEF_RSI_MIN:.1f} max={V2_SHORT_DEF_RSI_MAX:.1f}"
         )
 
@@ -2849,20 +2982,33 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     Stage B:
     将来AIに差し替える唯一の場所。
     今はルールベースの仮スコア。
-    将来はこの中身だけ model.predict_proba(...) に差し替える。
+
+    注意:
+    - total_score には p1_score の影響がすでに入っているため、
+      p1 をそのまま total と二重に強く効かせすぎないようにする。
+    - other_score = total - p1 を使って、二重カウントを減らす。
     """
-    p1 = float(sig.get("p1_score", 0.0) or 0.0)
-    total = float(sig.get("total_score", 0.0) or 0.0)
-    btcstr = float(sig.get("btc_htf_strength", 0.0) or 0.0)
-    rsi = sig.get("rsi", np.nan)
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    total = _safe_float_or_nan(sig.get("total_score"))
+    btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    if not np.isfinite(p1):
+        p1 = 0.0
+    if not np.isfinite(total):
+        total = 0.0
+    if not np.isfinite(btcstr):
+        btcstr = 0.0
 
     rsi_zone_bonus = _calc_rsi_zone_bonus(rsi)
+    other_score = total - p1
+    other_score = max(-1.5, min(other_score, 1.5))
 
     qs = (
         (p1 * 1.0) +
-        (rsi_zone_bonus * 0.8) +
         (btcstr * 0.5) +
-        (total * 0.3)
+        (other_score * 0.3) +
+        (rsi_zone_bonus * 0.2)
     )
     return float(qs)
 
@@ -3584,7 +3730,20 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_htf_df = pd.DataFrame(btc_htf_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     btc_htf = assess_htf_trend(btc_htf_df)
 
-    print(f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f} mode={engine_mode}")
+    # レジーム転換検出
+    regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
+    if regime["short_conflict"] or regime["long_conflict"]:
+        print(
+            f"[V2-REGIME] CONFLICT DETECTED: reason={regime['reason']} "
+            f"short_conflict={regime['short_conflict']} long_conflict={regime['long_conflict']}"
+        )
+    else:
+        print(f"[V2-REGIME] no conflict: {regime['reason']}")
+
+    print(
+        f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f} "
+        f"mode={engine_mode} short_conflict={regime['short_conflict']} long_conflict={regime['long_conflict']}"
+    )
 
     symbols = [
         "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
@@ -3600,7 +3759,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     for symbol in symbols:
         try:
-            sig = v2_generate_signal(exchange, symbol, btc_htf, now_jst)
+            sig = v2_generate_signal(exchange, symbol, btc_htf, now_jst, regime_info=regime)
             if sig is not None:
                 sig["v2_version"] = "V2-Shadow"
                 sig["note"] = ""
