@@ -2293,9 +2293,9 @@ V2_SHORT_SYMBOL_BLOCKLIST  = [s.strip().upper() for s in str(os.environ.get("V2_
 
 # --- V2 SHORT Selection Pipeline ---
 V2_SHORT_DEF_ENABLE        = str(os.environ.get("V2_SHORT_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_SHORT_DEF_P1_MIN        = _env_float("V2_SHORT_DEF_P1_MIN", 2.0)
-V2_SHORT_DEF_SCORE_MIN     = _env_float("V2_SHORT_DEF_SCORE_MIN", 3.0)
-V2_SHORT_DEF_BTCSTR_MIN    = _env_float("V2_SHORT_DEF_BTCSTR_MIN", 0.7)
+V2_SHORT_DEF_P1_MIN        = _env_float("V2_SHORT_DEF_P1_MIN", 1.5)
+V2_SHORT_DEF_SCORE_MIN     = _env_float("V2_SHORT_DEF_SCORE_MIN", 2.5)
+V2_SHORT_DEF_BTCSTR_MIN    = _env_float("V2_SHORT_DEF_BTCSTR_MIN", 0.3)
 V2_SHORT_DEF_RSI_MIN       = _env_float("V2_SHORT_DEF_RSI_MIN", 40.0)
 V2_SHORT_DEF_RSI_MAX       = _env_float("V2_SHORT_DEF_RSI_MAX", 60.0)
 
@@ -2310,7 +2310,8 @@ V2_SHORT_RSI_SWEET_MAX     = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
 V2_LONG_DEF_ENABLE         = str(os.environ.get("V2_LONG_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 1.5)
 V2_LONG_DEF_RSI_MIN        = _env_float("V2_LONG_DEF_RSI_MIN", 40.0)
-V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 55.0)
+V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
+V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 60.0)
 
 V2_LONG_RANK_ENABLE        = str(os.environ.get("V2_LONG_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RANK_TOP_N         = int(float(os.environ.get("V2_LONG_RANK_TOP_N", "2")))
@@ -3088,7 +3089,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
     SHORTはここでは触らない。
-    LONGは最初は P1 と RSI だけで gate する。
+    チェック順: bad_symbol → P1 → total_score → RSI
     """
     direction = str(sig.get("direction", "")).upper()
     if direction != "LONG":
@@ -3097,17 +3098,28 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not V2_LONG_DEF_ENABLE:
         return True, "long_def_disabled"
 
+    sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+    if sym in V2_LONG_BAD_SYMBOLS:
+        return False, f"bad_symbol sym={sym}"
+
     p1 = _safe_float_or_nan(sig.get("p1_score"))
+    total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
 
     if not np.isfinite(p1):
         return False, "missing_p1_score"
+
+    if not np.isfinite(total):
+        return False, "missing_total_score"
 
     if not np.isfinite(rsi):
         return False, "missing_rsi"
 
     if p1 < V2_LONG_DEF_P1_MIN:
         return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
+
+    if total < V2_LONG_DEF_SCORE_MIN:
+        return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
 
     if rsi < V2_LONG_DEF_RSI_MIN or rsi > V2_LONG_DEF_RSI_MAX:
         return False, (
