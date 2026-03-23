@@ -2325,6 +2325,7 @@ V2_LONG_DEF_RSI_MIN        = _env_float("V2_LONG_DEF_RSI_MIN", 40.0)
 V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
 V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 60.0)
 V2_LONG_BLOCK_RANGE        = str(os.environ.get("V2_LONG_BLOCK_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_REGIME_CONFLICT_HARD_SPREAD = _env_float("V2_LONG_REGIME_CONFLICT_HARD_SPREAD", -0.0010)
 V2_LONG_RANK_ENABLE        = str(os.environ.get("V2_LONG_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RANK_TOP_N         = int(float(os.environ.get("V2_LONG_RANK_TOP_N", "2")))
 V2_LONG_QS_MIN             = _env_float("V2_LONG_QS_MIN", float("-inf"))
@@ -2453,14 +2454,20 @@ def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
     BTC 1H方向と 15m短期EMA の矛盾を方向別に返す。
     short_conflict: 1H=SHORT なのに 15m EMA5 > EMA13
     long_conflict:  1H=LONG なのに 15m EMA5 < EMA13
-    判定不能なら、両方 False を返す。
+    変更点:
+    - SHORT は従来どおり
+    - LONG は「少しでも逆行」で即hard blockせず、
+      spread が V2_LONG_REGIME_CONFLICT_HARD_SPREAD 以下のときだけ hard conflict にする
+    - hard に満たない逆行は long_conflict_soft=True で返し、ログで追えるようにする
     """
     result = {
         "short_conflict": False,
         "long_conflict": False,
+        "long_conflict_soft": False,
         "reason": "no_conflict",
         "ltf_ema_fast": np.nan,
         "ltf_ema_slow": np.nan,
+        "spread": np.nan,
     }
 
     if not V2_REGIME_CHECK_ENABLE:
@@ -2489,14 +2496,26 @@ def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
 
         if htf_direction == "SHORT" and ltf_ema_f > ltf_ema_s:
             spread = (ltf_ema_f - ltf_ema_s) / ltf_ema_s if ltf_ema_s != 0 else 0.0
+            result["spread"] = float(spread)
             result["short_conflict"] = True
             result["reason"] = f"short_conflict spread={spread:.6f}"
             return result
 
         if htf_direction == "LONG" and ltf_ema_f < ltf_ema_s:
             spread = (ltf_ema_f - ltf_ema_s) / ltf_ema_s if ltf_ema_s != 0 else 0.0
-            result["long_conflict"] = True
-            result["reason"] = f"long_conflict spread={spread:.6f}"
+            result["spread"] = float(spread)
+            if spread <= V2_LONG_REGIME_CONFLICT_HARD_SPREAD:
+                result["long_conflict"] = True
+                result["reason"] = (
+                    f"long_conflict_hard spread={spread:.6f} "
+                    f"hard={V2_LONG_REGIME_CONFLICT_HARD_SPREAD:.6f}"
+                )
+                return result
+            result["long_conflict_soft"] = True
+            result["reason"] = (
+                f"long_conflict_soft spread={spread:.6f} "
+                f"hard={V2_LONG_REGIME_CONFLICT_HARD_SPREAD:.6f}"
+            )
             return result
 
         return result
@@ -4355,17 +4374,32 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
-    if regime["short_conflict"] or regime["long_conflict"]:
+    short_conflict = bool(regime.get("short_conflict", False))
+    long_conflict = bool(regime.get("long_conflict", False))
+    long_conflict_soft = bool(regime.get("long_conflict_soft", False))
+    regime_spread = regime.get("spread", np.nan)
+    spread_str = "nan"
+    try:
+        if np.isfinite(float(regime_spread)):
+            spread_str = f"{float(regime_spread):.6f}"
+    except Exception:
+        pass
+    if short_conflict or long_conflict or long_conflict_soft:
         print(
             f"[V2-REGIME] CONFLICT DETECTED: reason={regime['reason']} "
-            f"short_conflict={regime['short_conflict']} long_conflict={regime['long_conflict']}"
+            f"short_conflict={short_conflict} "
+            f"long_conflict={long_conflict} "
+            f"long_conflict_soft={long_conflict_soft} "
+            f"spread={spread_str}"
         )
     else:
         print(f"[V2-REGIME] no conflict: {regime['reason']}")
-
     print(
         f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f} "
-        f"mode={engine_mode} short_conflict={regime['short_conflict']} long_conflict={regime['long_conflict']}"
+        f"mode={engine_mode} short_conflict={short_conflict} "
+        f"long_conflict={long_conflict} "
+        f"long_conflict_soft={long_conflict_soft} "
+        f"regime_spread={spread_str}"
     )
 
     symbols = [
