@@ -2320,31 +2320,30 @@ V2_SHORT_BRAKE_PROBE_TOP_N     = int(float(os.environ.get("V2_SHORT_BRAKE_PROBE_
 
 # --- V2 LONG Selection Pipeline ---
 V2_LONG_DEF_ENABLE         = str(os.environ.get("V2_LONG_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 1.5)
+V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 2.0)
 V2_LONG_DEF_RSI_MIN        = _env_float("V2_LONG_DEF_RSI_MIN", 40.0)
 V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
 V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 60.0)
-
+V2_LONG_BLOCK_RANGE        = str(os.environ.get("V2_LONG_BLOCK_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RANK_ENABLE        = str(os.environ.get("V2_LONG_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RANK_TOP_N         = int(float(os.environ.get("V2_LONG_RANK_TOP_N", "2")))
 V2_LONG_QS_MIN             = _env_float("V2_LONG_QS_MIN", float("-inf"))
-
 V2_LONG_RSI_SWEET_MIN      = _env_float("V2_LONG_RSI_SWEET_MIN", 40.0)
 V2_LONG_RSI_SWEET_MAX      = _env_float("V2_LONG_RSI_SWEET_MAX", 45.0)
 V2_LONG_BTCSTR_SOFT_MAX    = _env_float("V2_LONG_BTCSTR_SOFT_MAX", 0.5)
 V2_LONG_BTCSTR_HARD_MAX    = _env_float("V2_LONG_BTCSTR_HARD_MAX", 0.7)
-
 V2_LONG_QS_W_P1            = _env_float("V2_LONG_QS_W_P1", 1.0)
 V2_LONG_QS_W_RSI           = _env_float("V2_LONG_QS_W_RSI", 0.6)
 V2_LONG_QS_W_P3            = _env_float("V2_LONG_QS_W_P3", 0.5)
 V2_LONG_QS_W_BTC           = _env_float("V2_LONG_QS_W_BTC", 0.2)
 V2_LONG_QS_W_OTHER         = _env_float("V2_LONG_QS_W_OTHER", 0.2)
 V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.3)
-V2_LONG_QS_W_MODE          = _env_float("V2_LONG_QS_W_MODE", 0.5)
-V2_LONG_MODE_UP_PENALTY    = _env_float("V2_LONG_MODE_UP_PENALTY", -1.0)
-V2_LONG_MODE_RANGE_BONUS   = _env_float("V2_LONG_MODE_RANGE_BONUS", 0.3)
-V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.3)
-
+# LONG mode bonus は一旦無効化
+# 現在のデータでは Up を罰し、Range/Down を優遇する既定値が逆向きなので、まずはニュートラルに戻す
+V2_LONG_QS_W_MODE          = _env_float("V2_LONG_QS_W_MODE", 0.0)
+V2_LONG_MODE_UP_PENALTY    = _env_float("V2_LONG_MODE_UP_PENALTY", 0.0)
+V2_LONG_MODE_RANGE_BONUS   = _env_float("V2_LONG_MODE_RANGE_BONUS", 0.0)
+V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.0)
 V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
 
 # --- V2 Shadow 出力先シート ---
@@ -3173,7 +3172,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
     SHORTはここでは触らない。
-    チェック順: bad_symbol → P1 → total_score → RSI
+    チェック順: bad_symbol → btc_mode_compat → P1 → total_score → RSI
     """
     direction = str(sig.get("direction", "")).upper()
     if direction != "LONG":
@@ -3185,6 +3184,10 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
     if sym in V2_LONG_BAD_SYMBOLS:
         return False, f"bad_symbol sym={sym}"
+
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
+        return False, "range_mode_block"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
@@ -3316,6 +3319,29 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
     return float(qs)
 
 
+def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
+    """
+    LONG研究用タグ。
+    本番判定には使わず、v2_shadow_ai の AI_Note に残して後から集計しやすくする。
+    """
+    tags: List[str] = []
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    if np.isfinite(p1) and np.isfinite(rsi):
+        if p1 >= 2.0 and rsi < 60 and btc_mode_compat == "UP":
+            tags.append("LONG_CORE_P20_RSI60_UP")
+        elif p1 >= 1.8 and rsi < 60 and btc_mode_compat == "UP":
+            tags.append("LONG_CORE_P18_RSI60_UP")
+        if rsi >= 70:
+            tags.append("LONG_DANGER_RSI70")
+        elif rsi >= 60:
+            tags.append("LONG_WARN_RSI60")
+    if btc_mode_compat == "RANGE":
+        tags.append("LONG_DANGER_RANGE")
+    return tags
+
+
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     LONG候補を QualityScore 降順に並べる。
@@ -3424,6 +3450,8 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             continue
 
         if direction == "LONG":
+            research_tags = _get_long_research_tags(sig)
+            research_note = "|".join(research_tags)
             ok, reason = defensive_filter_long(sig)
 
             if not ok:
@@ -3432,7 +3460,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_band"] = "REJECTED"
                 sig["ai_model_version"] = "LONG_QS_v2"
                 sig["ai_model_type"] = "LONG_RULE_RANK"
-                sig["ai_note"] = f"REJECTED:{reason}"
+                sig["ai_note"] = f"REJECTED:{reason};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={reason}")
                 continue
@@ -3445,7 +3473,10 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_band"] = "REJECTED"
                 sig["ai_model_version"] = "LONG_QS_v2"
                 sig["ai_model_type"] = "LONG_RULE_RANK"
-                sig["ai_note"] = f"REJECTED:qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
+                sig["ai_note"] = (
+                    f"REJECTED:qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f};"
+                    f"research_tags={research_note}"
+                )
                 output.append(sig)
                 print(
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
@@ -3465,7 +3496,8 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"p3={float(sig.get('p3_score', 0.0) or 0.0):.4f};"
                 f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
                 f"btc_mode={sig.get('btc_mode_compat', '')};"
-                f"rsi={sig.get('rsi', '')}"
+                f"rsi={sig.get('rsi', '')};"
+                f"research_tags={research_note}"
             )
 
             long_passed.append(sig)
