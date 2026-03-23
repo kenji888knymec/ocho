@@ -3259,12 +3259,12 @@ def _calc_long_btc_bonus(btcstr: float) -> float:
 
 
 def _calc_long_mode_bonus(btc_mode_compat: str) -> float:
-    mode = str(btc_mode_compat or "").strip()
-    if mode == "Up":
+    mode = str(btc_mode_compat or "").strip().upper()
+    if mode == "UP":
         return V2_LONG_MODE_UP_PENALTY
-    if mode == "Range":
+    if mode == "RANGE":
         return V2_LONG_MODE_RANGE_BONUS
-    if mode == "Down":
+    if mode == "DOWN":
         return V2_LONG_MODE_DOWN_BONUS
     return 0.0
 
