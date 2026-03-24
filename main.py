@@ -2341,7 +2341,7 @@ V2_LONG_QS_W_RSI           = _env_float("V2_LONG_QS_W_RSI", 0.6)
 V2_LONG_QS_W_P3            = _env_float("V2_LONG_QS_W_P3", 0.5)
 V2_LONG_QS_W_BTC           = _env_float("V2_LONG_QS_W_BTC", 0.2)
 V2_LONG_QS_W_OTHER         = _env_float("V2_LONG_QS_W_OTHER", 0.2)
-V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.3)
+V2_LONG_QS_W_BAD_SYMBOL    = _env_float("V2_LONG_QS_W_BAD_SYMBOL", -0.8)
 # LONG mode bonus は一旦無効化
 # 現在のデータでは Up を罰し、Range/Down を優遇する既定値が逆向きなので、まずはニュートラルに戻す
 V2_LONG_QS_W_MODE          = _env_float("V2_LONG_QS_W_MODE", 0.0)
@@ -3250,8 +3250,6 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return True, "long_def_disabled"
 
     sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
-    if sym in V2_LONG_BAD_SYMBOLS:
-        return False, f"bad_symbol sym={sym}"
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
