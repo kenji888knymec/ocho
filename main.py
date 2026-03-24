@@ -2326,6 +2326,9 @@ V2_LONG_DEF_SCORE_MIN      = _env_float("V2_LONG_DEF_SCORE_MIN", 1.5)
 V2_LONG_DEF_RSI_MAX        = _env_float("V2_LONG_DEF_RSI_MAX", 60.0)
 V2_LONG_BLOCK_RANGE        = str(os.environ.get("V2_LONG_BLOCK_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_REGIME_CONFLICT_HARD_SPREAD = _env_float("V2_LONG_REGIME_CONFLICT_HARD_SPREAD", -0.0010)
+V2_LONG_P1_RESCUE_ENABLE   = str(os.environ.get("V2_LONG_P1_RESCUE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_P1_RESCUE_MIN      = _env_float("V2_LONG_P1_RESCUE_MIN", 1.8)
+V2_LONG_P1_RESCUE_RSI_MAX  = _env_float("V2_LONG_P1_RESCUE_RSI_MAX", 60.0)
 V2_LONG_RANK_ENABLE        = str(os.environ.get("V2_LONG_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RANK_TOP_N         = int(float(os.environ.get("V2_LONG_RANK_TOP_N", "2")))
 V2_LONG_QS_MIN             = _env_float("V2_LONG_QS_MIN", float("-inf"))
@@ -2418,7 +2421,16 @@ def _safe_float(x, default=np.nan):
 def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
     """1H足のEMAトレンド方向と強度。"""
     if len(htf_df) < V2_EMA_SLOW + 5:
-        return {"direction": "NEUTRAL", "strength": 0.0, "ema_spread": 0.0}
+        return {
+            "direction": "NEUTRAL",
+            "strength": 0.0,
+            "ema_spread": 0.0,
+            "ema_fast": np.nan,
+            "ema_slow": np.nan,
+            "close": np.nan,
+            "slope": np.nan,
+            "strength_raw": 0.0,
+        }
 
     htf_df = htf_df.copy()
     htf_df["EMA_F"] = _ema(htf_df["Close"], V2_EMA_FAST)
@@ -2428,8 +2440,9 @@ def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
     ema_s = float(htf_df["EMA_S"].iloc[-1])
     close = float(htf_df["Close"].iloc[-1])
 
-    spread = (ema_f - ema_s) / ema_s if ema_s != 0 else 0
-    strength = min(abs(spread) / 0.005, 1.0)
+    spread = (ema_f - ema_s) / ema_s if ema_s != 0 else 0.0
+    strength_raw = abs(spread) / 0.005
+    strength = min(strength_raw, 1.0)
 
     if ema_f > ema_s and close > ema_s:
         direction = "LONG"
@@ -2438,6 +2451,7 @@ def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
     else:
         direction = "NEUTRAL"
 
+    slope = np.nan
     # EMAの傾き（減速検出）
     if len(htf_df) >= 4:
         slope = float(htf_df["EMA_F"].iloc[-1] - htf_df["EMA_F"].iloc[-3])
@@ -2446,7 +2460,16 @@ def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
         elif direction == "SHORT" and slope > 0:
             strength *= 0.5
 
-    return {"direction": direction, "strength": float(strength), "ema_spread": float(spread)}
+    return {
+        "direction": direction,
+        "strength": float(strength),
+        "ema_spread": float(spread),
+        "ema_fast": float(ema_f),
+        "ema_slow": float(ema_s),
+        "close": float(close),
+        "slope": float(slope) if np.isfinite(slope) else np.nan,
+        "strength_raw": float(strength_raw),
+    }
 
 
 def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
@@ -3187,6 +3210,32 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return ranked
 
 
+def _allow_long_p1_rescue(sig: Dict[str, Any]) -> bool:
+    """
+    LONG の P1 1.8〜2.0 帯を条件付きで救う。
+    何でも救うのではなく、UP・低RSI・研究タグが良いものだけ。
+    """
+    if not V2_LONG_P1_RESCUE_ENABLE:
+        return False
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    if not np.isfinite(p1) or not np.isfinite(rsi):
+        return False
+    if p1 < V2_LONG_P1_RESCUE_MIN or p1 >= V2_LONG_DEF_P1_MIN:
+        return False
+    if rsi >= V2_LONG_P1_RESCUE_RSI_MAX:
+        return False
+    if btc_mode_compat != "UP":
+        return False
+    tags = _get_long_research_tags(sig)
+    if "LONG_CORE_P18_RSI60_UP" not in tags and "LONG_CORE_P20_RSI60_UP" not in tags:
+        return False
+    if "LONG_DANGER_RSI70" in tags or "LONG_DANGER_RANGE" in tags:
+        return False
+    return True
+
+
 def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
@@ -3222,7 +3271,10 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "missing_rsi"
 
     if p1 < V2_LONG_DEF_P1_MIN:
-        return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
+        if _allow_long_p1_rescue(sig):
+            pass
+        else:
+            return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
 
     if total < V2_LONG_DEF_SCORE_MIN:
         return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
@@ -3471,6 +3523,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if direction == "LONG":
             research_tags = _get_long_research_tags(sig)
             research_note = "|".join(research_tags)
+            rescued_p1 = _allow_long_p1_rescue(sig)
             ok, reason = defensive_filter_long(sig)
 
             if not ok:
@@ -3479,7 +3532,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_band"] = "REJECTED"
                 sig["ai_model_version"] = "LONG_QS_v2"
                 sig["ai_model_type"] = "LONG_RULE_RANK"
-                sig["ai_note"] = f"REJECTED:{reason};research_tags={research_note}"
+                sig["ai_note"] = f"REJECTED:{reason};rescued_p1={rescued_p1};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={reason}")
                 continue
@@ -3494,6 +3547,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_model_type"] = "LONG_RULE_RANK"
                 sig["ai_note"] = (
                     f"REJECTED:qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f};"
+                    f"rescued_p1={rescued_p1};"
                     f"research_tags={research_note}"
                 )
                 output.append(sig)
@@ -3516,6 +3570,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
                 f"btc_mode={sig.get('btc_mode_compat', '')};"
                 f"rsi={sig.get('rsi', '')};"
+                f"rescued_p1={rescued_p1};"
                 f"research_tags={research_note}"
             )
 
@@ -4395,8 +4450,16 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     else:
         print(f"[V2-REGIME] no conflict: {regime['reason']}")
     print(
-        f"[V2] BTC HTF: {btc_htf['direction']} str={btc_htf['strength']:.3f} "
-        f"mode={engine_mode} short_conflict={short_conflict} "
+        f"[V2] BTC HTF: {btc_htf['direction']} "
+        f"str={btc_htf['strength']:.3f} "
+        f"str_raw={float(btc_htf.get('strength_raw', np.nan)):.3f} "
+        f"ema_spread={float(btc_htf.get('ema_spread', np.nan)):.6f} "
+        f"ema_fast={float(btc_htf.get('ema_fast', np.nan)):.2f} "
+        f"ema_slow={float(btc_htf.get('ema_slow', np.nan)):.2f} "
+        f"close={float(btc_htf.get('close', np.nan)):.2f} "
+        f"slope={float(btc_htf.get('slope', np.nan)):.6f} "
+        f"mode={engine_mode} "
+        f"short_conflict={short_conflict} "
         f"long_conflict={long_conflict} "
         f"long_conflict_soft={long_conflict_soft} "
         f"regime_spread={spread_str}"
