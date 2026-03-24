@@ -2283,13 +2283,22 @@ V2_TP_MULT_FIXED           = _env_float("V2_TP_MULT_FIXED", 2.0)
 V2_TP_SCORE_DEPENDENT      = str(os.environ.get("V2_TP_SCORE_DEPENDENT", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- 合計スコア ---
-V2_MIN_SCORE               = _env_float("V2_MIN_SCORE", 1.3)
-V2_JUDGE_MAX_BARS          = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
-V2_JUDGE_LOOKBACK_ROWS     = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
-V2_JUDGE_CLOSE_WINDOW_SEC  = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "90")))
-V2_DEBUG_REJECTS           = str(os.environ.get("V2_DEBUG_REJECTS", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_SYMBOL_BLOCKLIST   = [s.strip().upper() for s in str(os.environ.get("V2_LONG_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
-V2_SHORT_SYMBOL_BLOCKLIST  = [s.strip().upper() for s in str(os.environ.get("V2_SHORT_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
+V2_MIN_SCORE                    = _env_float("V2_MIN_SCORE", 1.3)
+V2_JUDGE_MAX_BARS               = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
+V2_JUDGE_LOOKBACK_ROWS          = int(float(os.environ.get("V2_JUDGE_LOOKBACK_ROWS", "2500")))
+V2_JUDGE_CLOSE_WINDOW_SEC       = int(float(os.environ.get("V2_JUDGE_CLOSE_WINDOW_SEC", "240")))
+V2_JUDGE_MAX_ROWS               = int(float(os.environ.get("V2_JUDGE_MAX_ROWS", "300")))
+V2_JUDGE_BACKFILL_ENABLE        = str(os.environ.get("V2_JUDGE_BACKFILL_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_JUDGE_BACKFILL_MAX_ROWS      = int(float(os.environ.get("V2_JUDGE_BACKFILL_MAX_ROWS", "150")))
+V2_JUDGE_BACKFILL_LOOKBACK_ROWS = int(float(os.environ.get("V2_JUDGE_BACKFILL_LOOKBACK_ROWS", "20000")))
+V2_JUDGE_PRIORITY_BANDS         = [
+    s.strip().upper()
+    for s in str(os.environ.get("V2_JUDGE_PRIORITY_BANDS", "RULE_QS,RULE_QS_CAUTION,RULE_QS_NO_RANK")).split(",")
+    if s.strip()
+]
+V2_DEBUG_REJECTS                = str(os.environ.get("V2_DEBUG_REJECTS", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_SYMBOL_BLOCKLIST        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
+V2_SHORT_SYMBOL_BLOCKLIST       = [s.strip().upper() for s in str(os.environ.get("V2_SHORT_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
 
 # --- V2 SHORT Selection Pipeline ---
 V2_SHORT_DEF_ENABLE        = str(os.environ.get("V2_SHORT_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
@@ -6988,6 +6997,9 @@ def judge_v2_sheet(
     sheet_name: str = V2_SHADOW_SHEET,
     lookback_rows: int = V2_JUDGE_LOOKBACK_ROWS,
     max_judge: int = 100,
+    priority_bands: Optional[List[str]] = None,
+    include_deferred: bool = True,
+    oldest_first: bool = False,
 ) -> int:
     service = get_sheet_service()
     exchange = build_exchange()
@@ -7025,6 +7037,8 @@ def judge_v2_sheet(
     col_sl = _resolve_col_idx(hm, "SL_Price")
     col_tp_pct = _resolve_col_idx(hm, "TP_Pct")
     col_sl_pct = _resolve_col_idx(hm, "SL_Pct")
+    col_ai_pass = _resolve_col_idx(hm, "AI_Pass")
+    col_ai_band = _resolve_col_idx(hm, "AI_Band")
 
     col_eval = _resolve_col_idx(hm, "EvalStatus")
     col_exit_time = _resolve_col_idx(hm, "ExitTime")
@@ -7043,6 +7057,12 @@ def judge_v2_sheet(
     if any(c == -1 for c in must):
         print(f"[WARN] judge_v2_sheet missing required columns in {sheet_name}")
         return 0
+
+    priority_band_set: Set[str] = {
+        str(x).strip().upper()
+        for x in (priority_bands or [])
+        if str(x).strip()
+    }
 
     updates = []
     judged = 0
@@ -7067,19 +7087,56 @@ def judge_v2_sheet(
         put_one(row_idx_1based, col_winlose, "")
         put_one(row_idx_1based, col_holdmin, "")
 
-    pending_offsets = []
-    open_offsets = []
+    def mark_invalid_data(row_idx_1based: int, reason: str):
+        put_one(row_idx_1based, col_eval, "INVALID_DATA")
+        put_one(row_idx_1based, col_exit_time, "")
+        put_one(row_idx_1based, col_exit_price, "")
+        put_one(row_idx_1based, col_exit_reason, reason)
+        put_one(row_idx_1based, col_pnl, "")
+        put_one(row_idx_1based, col_winlose, "")
+        put_one(row_idx_1based, col_holdmin, "")
+
+    pending_priority_offsets: List[int] = []
+    open_priority_offsets: List[int] = []
+    pending_deferred_offsets: List[int] = []
+    open_deferred_offsets: List[int] = []
 
     for offset in range(len(rows)):
         row = rows[offset]
         status = get_cell(row, col_eval).upper()
 
-        if status == "":
-            pending_offsets.append(offset)
-        elif status == "OPEN":
-            open_offsets.append(offset)
+        if status not in ("", "OPEN"):
+            continue
 
-    target_offsets = pending_offsets + open_offsets
+        ai_pass = get_cell(row, col_ai_pass)
+        ai_band = get_cell(row, col_ai_band).upper()
+        is_priority = (ai_pass == "1") or (ai_band in priority_band_set)
+
+        if is_priority:
+            if status == "":
+                pending_priority_offsets.append(offset)
+            else:
+                open_priority_offsets.append(offset)
+        elif include_deferred:
+            if status == "":
+                pending_deferred_offsets.append(offset)
+            else:
+                open_deferred_offsets.append(offset)
+
+    if oldest_first:
+        target_offsets = (
+            pending_priority_offsets +
+            open_priority_offsets +
+            pending_deferred_offsets +
+            open_deferred_offsets
+        )
+    else:
+        target_offsets = (
+            list(reversed(pending_priority_offsets)) +
+            list(reversed(open_priority_offsets)) +
+            list(reversed(pending_deferred_offsets)) +
+            list(reversed(open_deferred_offsets))
+        )
 
     for offset in target_offsets:
         if judged >= max_judge:
@@ -7087,8 +7144,6 @@ def judge_v2_sheet(
 
         row = rows[offset]
         sheet_row_idx = start_row + offset
-
-        status = get_cell(row, col_eval).upper()
 
         sym = get_cell(row, col_symbol)
         tstr = get_cell(row, col_time)
@@ -7099,12 +7154,49 @@ def judge_v2_sheet(
         tp_pct = to_float(get_cell(row, col_tp_pct), default=None)
         sl_pct = to_float(get_cell(row, col_sl_pct), default=None)
 
-        if (not sym) or (not tstr) or entry is None or tp is None or sl is None:
+        if not sym:
+            mark_invalid_data(sheet_row_idx, "symbol_missing")
+            judged += 1
+            time.sleep(0.12)
+            continue
+
+        if not tstr:
+            mark_invalid_data(sheet_row_idx, "time_missing")
+            judged += 1
+            time.sleep(0.12)
+            continue
+
+        if entry is None:
+            mark_invalid_data(sheet_row_idx, "entry_missing")
+            judged += 1
+            time.sleep(0.12)
+            continue
+
+        if entry <= 0:
+            mark_invalid_data(sheet_row_idx, "entry_nonpositive")
+            judged += 1
+            time.sleep(0.12)
+            continue
+
+        if tp is None:
+            mark_invalid_data(sheet_row_idx, "tp_missing")
+            judged += 1
+            time.sleep(0.12)
+            continue
+
+        if sl is None:
+            mark_invalid_data(sheet_row_idx, "sl_missing")
+            judged += 1
+            time.sleep(0.12)
             continue
 
         dt0 = parse_dt_any(tstr)
         if dt0 is None:
+            mark_invalid_data(sheet_row_idx, "invalid_datetime")
+            judged += 1
+            time.sleep(0.12)
             continue
+
         if getattr(dt0, "tzinfo", None) is None:
             dt_jst = dt0.replace(tzinfo=JST)
         else:
@@ -7241,13 +7333,32 @@ def judge_v2_sheet(
 
 
 def judge_v2_main() -> str:
-    max_judge = int(float(os.environ.get("V2_JUDGE_MAX_ROWS", "100")))
-    total = judge_v2_sheet(
+    recent_total = judge_v2_sheet(
         V2_SHADOW_SHEET,
         lookback_rows=V2_JUDGE_LOOKBACK_ROWS,
-        max_judge=max_judge,
+        max_judge=V2_JUDGE_MAX_ROWS,
+        priority_bands=V2_JUDGE_PRIORITY_BANDS,
+        include_deferred=True,
+        oldest_first=False,
     )
-    return f"Judged {total} rows ({V2_SHADOW_SHEET})"
+
+    backfill_total = 0
+    if V2_JUDGE_BACKFILL_ENABLE and V2_JUDGE_BACKFILL_MAX_ROWS > 0:
+        backfill_total = judge_v2_sheet(
+            V2_SHADOW_SHEET,
+            lookback_rows=max(V2_JUDGE_BACKFILL_LOOKBACK_ROWS, V2_JUDGE_LOOKBACK_ROWS),
+            max_judge=V2_JUDGE_BACKFILL_MAX_ROWS,
+            priority_bands=V2_JUDGE_PRIORITY_BANDS,
+            include_deferred=True,
+            oldest_first=True,
+        )
+
+    total = recent_total + backfill_total
+    return (
+        f"Judged recent={recent_total} "
+        f"backfill={backfill_total} "
+        f"total={total} rows ({V2_SHADOW_SHEET})"
+    )
 
 
 @app.route("/v2_report", methods=["GET", "POST"])
