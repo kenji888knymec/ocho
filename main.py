@@ -2358,6 +2358,9 @@ V2_LONG_MODE_UP_PENALTY    = _env_float("V2_LONG_MODE_UP_PENALTY", 0.0)
 V2_LONG_MODE_RANGE_BONUS   = _env_float("V2_LONG_MODE_RANGE_BONUS", 0.0)
 V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.0)
 V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
+V2_LONG_REJECT_MODE_DOWN   = str(os.environ.get("V2_LONG_REJECT_MODE_DOWN", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_DEF_RSI_HARD_MAX   = _env_float("V2_LONG_DEF_RSI_HARD_MAX", 55.0)
+V2_LONG_DEF_P1_HARD_MAX    = _env_float("V2_LONG_DEF_P1_HARD_MAX", 2.5)
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
@@ -3270,6 +3273,9 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
         return False, "range_mode_block"
 
+    if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
+        return False, "down_mode_block"
+
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
@@ -3289,6 +3295,12 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         else:
             return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
 
+    if p1 >= V2_LONG_DEF_P1_HARD_MAX:
+        return False, (
+            f"p1_above_hard_max p1={p1:.4f} "
+            f"hard_max={V2_LONG_DEF_P1_HARD_MAX:.4f}"
+        )
+
     if total < V2_LONG_DEF_SCORE_MIN:
         return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
 
@@ -3296,6 +3308,12 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, (
             f"rsi_out_of_range rsi={rsi:.4f} "
             f"min={V2_LONG_DEF_RSI_MIN:.1f} max={V2_LONG_DEF_RSI_MAX:.1f}"
+        )
+
+    if rsi > V2_LONG_DEF_RSI_HARD_MAX:
+        return False, (
+            f"rsi_above_hard_max rsi={rsi:.4f} "
+            f"hard_max={V2_LONG_DEF_RSI_HARD_MAX:.1f}"
         )
 
     return True, "pass"
@@ -3406,6 +3424,16 @@ def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+
+    if btc_mode_compat == "DOWN":
+        tags.append("mode_down")
+
+    if np.isfinite(rsi) and rsi > V2_LONG_DEF_RSI_HARD_MAX:
+        tags.append("rsi_gt_hard_max")
+
+    if np.isfinite(p1) and p1 >= V2_LONG_DEF_P1_HARD_MAX:
+        tags.append("p1_ge_hard_max")
+
     if np.isfinite(p1) and np.isfinite(rsi):
         if p1 >= 2.0 and rsi < 60 and btc_mode_compat == "UP":
             tags.append("LONG_CORE_P20_RSI60_UP")
