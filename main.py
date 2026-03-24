@@ -2993,6 +2993,14 @@ def _safe_float_or_nan(value: Any) -> float:
         return np.nan
 
 
+def _fmt_sig_num_or_blank(sig: Dict[str, Any], key: str, fmt: str = ".4f") -> str:
+    """sig から key の値を取り出し、finite なら指定フォーマットで文字列化、非 finite なら空文字を返す。"""
+    v = _safe_float_or_nan(sig.get(key))
+    if np.isfinite(v):
+        return format(v, fmt)
+    return ""
+
+
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
@@ -3240,7 +3248,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
     SHORTはここでは触らない。
-    チェック順: bad_symbol → btc_mode_compat → P1 → total_score → RSI
+    チェック順: btc_mode_compat → P1 → total_score → RSI
     """
     direction = str(sig.get("direction", "")).upper()
     if direction != "LONG":
@@ -3248,8 +3256,6 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     if not V2_LONG_DEF_ENABLE:
         return True, "long_def_disabled"
-
-    sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
@@ -3357,14 +3363,8 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
     rsi = _safe_float_or_nan(sig.get("rsi"))
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "")
 
-    if not np.isfinite(p1):
-        p1 = 0.0
-    if not np.isfinite(total):
-        total = 0.0
-    if not np.isfinite(p3_score):
-        p3_score = 0.0
-    if not np.isfinite(btcstr):
-        btcstr = 0.0
+    if not np.isfinite(p1) or not np.isfinite(total):
+        return float("nan")
 
     rsi_bonus = _calc_long_rsi_bonus(rsi)
     p3_bonus = _calc_long_p3_bonus(p3_score)
@@ -3509,9 +3509,9 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             sig["ai_model_type"] = "SHORT_RULE_RANK"
             sig["ai_note"] = (
                 f"qs={qs:.4f};"
-                f"p1={float(sig.get('p1_score', 0.0) or 0.0):.4f};"
-                f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
-                f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
+                f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
                 f"rsi={sig.get('rsi', '')}"
             )
 
@@ -3536,6 +3536,17 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
 
             qs = calc_long_quality_score(sig)
+
+            if not np.isfinite(qs):
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "LONG_QS_v2"
+                sig["ai_model_type"] = "LONG_RULE_RANK"
+                sig["ai_note"] = f"REJECTED:missing_qs_feature;rescued_p1={rescued_p1};research_tags={research_note}"
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason=missing_qs_feature")
+                continue
 
             if qs < V2_LONG_QS_MIN:
                 sig["ai_prob_win"] = round(qs, 6)
@@ -3562,10 +3573,10 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             sig["ai_model_type"] = "LONG_RULE_RANK"
             sig["ai_note"] = (
                 f"qs={qs:.4f};"
-                f"p1={float(sig.get('p1_score', 0.0) or 0.0):.4f};"
-                f"total={float(sig.get('total_score', 0.0) or 0.0):.4f};"
-                f"p3={float(sig.get('p3_score', 0.0) or 0.0):.4f};"
-                f"btcstr={float(sig.get('btc_htf_strength', 0.0) or 0.0):.4f};"
+                f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
+                f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
                 f"btc_mode={sig.get('btc_mode_compat', '')};"
                 f"rsi={sig.get('rsi', '')};"
                 f"rescued_p1={rescued_p1};"
