@@ -365,6 +365,12 @@ print(
 
 )
 
+# --- V2 AI 推論設定 ---
+V2_LONG_AI_MIN = float(os.environ.get("V2_LONG_AI_MIN", str(LONG_AI_TH)))
+V2_SHORT_AI_MIN = float(os.environ.get("V2_SHORT_AI_MIN", str(SHORT_AI_TH)))
+V2_AI_FAIL_OPEN = (os.environ.get("V2_AI_FAIL_OPEN", "0").strip() == "1")
+V2_AI_NOTE_DBG_MAXLEN = int(float(os.environ.get("V2_AI_NOTE_DBG_MAXLEN", "220")))
+
 
 # ==========================================
 # 期待ヘッダー
@@ -3286,12 +3292,10 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
 def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Stage C:
-    SHORT候補を QualityScore 降順に並べる。
-    追加仕様:
-    - v2_shadow_ai の直近 SHORT / DONE 実績からブレーキ状態を判定する
-    - NORMAL  : 通常の TOP_N
-    - CAUTION : TOP_N を probe 値まで絞る
-    - STOP    : 通知は止めるが、上位 probe 件だけ観測用に残す
+    SHORT候補を ai_prob_win 降順に並べる。
+    - SHORT AI が入っていれば ai_prob_win は AI確率
+    - bypass/fallback のときは RULE fallback の値
+    - SHORT brake は従来通り適用
     """
     if not short_signals:
         return []
@@ -3306,92 +3310,54 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     probe_top_n = max(1, int(V2_SHORT_BRAKE_PROBE_TOP_N))
     brake = get_v2_short_brake_state(datetime.now(JST))
     brake_mode = str(brake.get("mode", "NORMAL") or "NORMAL").upper()
+    effective_top_n = int(brake.get("effective_top_n", base_top_n) or base_top_n)
 
-    if brake_mode == "STOP":
-        effective_top_n = 0
-        observe_top_n = probe_top_n
-    elif brake_mode == "CAUTION":
-        effective_top_n = max(1, int(brake.get("effective_top_n", probe_top_n) or probe_top_n))
-        observe_top_n = effective_top_n
-    else:
-        effective_top_n = base_top_n
-        observe_top_n = effective_top_n
-
-    wr = brake.get("wr", float("nan"))
-    avg_pnl = brake.get("avg_pnl", float("nan"))
-    wr_str = "nan" if pd.isna(wr) else f"{float(wr):.1f}"
-    pnl_str = "nan" if pd.isna(avg_pnl) else f"{float(avg_pnl):+.4f}"
-    slot_list = "|".join(brake.get("slots", []) or [])
-
-    print(
-        f"[V2-SHORT-BRAKE] mode={brake_mode} "
-        f"base_top_n={base_top_n} effective_top_n={effective_top_n} observe_top_n={observe_top_n} "
-        f"n={int(brake.get('n', 0) or 0)} slots={int(brake.get('slot_count', 0) or 0)} "
-        f"wr={wr_str} avg_pnl={pnl_str} reason={brake.get('reason', '')} "
-        f"slot_list={slot_list}"
-    )
-
-    if (not V2_SHORT_RANK_ENABLE) and brake_mode == "NORMAL":
+    if not V2_SHORT_RANK_ENABLE:
         for rank_idx, sig in enumerate(ranked, start=1):
             slot_total = len(ranked)
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = _v2_rank_selected_band(sig)
             current_note = str(sig.get("ai_note", "") or "")
-            sig["ai_band"] = "RULE_QS_NO_RANK"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n=ALL;selected=true;rank_disabled=true;"
-                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
-                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
-                f"brake_reason={brake.get('reason', '')}"
+                f"top_n=ALL;selected=true;rank_disabled=true;brake_mode={brake_mode}"
             )
         return ranked
 
+    slot_total = len(ranked)
+
     for rank_idx, sig in enumerate(ranked, start=1):
-        slot_total = len(ranked)
         current_note = str(sig.get("ai_note", "") or "")
 
         if brake_mode == "STOP":
             sig["ai_pass"] = "0"
-            if rank_idx <= observe_top_n:
-                sig["ai_band"] = "BRAKE_PROBE"
-                reject_reason = "short_brake_probe"
+            if rank_idx <= probe_top_n:
+                sig["ai_band"] = "BRAKE_STOP_OBSERVE"
+                sig["ai_note"] = (
+                    f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=true"
+                )
             else:
-                sig["ai_band"] = "BRAKE_STOP"
-                reject_reason = "short_brake_stop"
-            sig["ai_note"] = (
-                f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};probe_top_n={observe_top_n};selected=false;reason={reject_reason};"
-                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
-                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
-                f"brake_reason={brake.get('reason', '')}"
-            )
+                sig["ai_band"] = "BRAKE_STOP_DROP"
+                sig["ai_note"] = (
+                    f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=false"
+                )
             continue
 
         if rank_idx <= effective_top_n:
-            if brake_mode == "CAUTION":
-                sig["ai_band"] = "RULE_QS_CAUTION"
-            else:
-                sig["ai_band"] = "RULE_QS"
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = _v2_rank_selected_band(sig)
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=true;"
-                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
-                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
-                f"brake_reason={brake.get('reason', '')}"
+                f"top_n={effective_top_n};selected=true;brake_mode={brake_mode}"
             )
         else:
             sig["ai_pass"] = "0"
-            if brake_mode == "CAUTION":
-                sig["ai_band"] = "BRAKE_CAUTION"
-                reject_reason = "short_brake_caution"
-            else:
-                sig["ai_band"] = "RANK_REJECT"
-                reject_reason = "rank_exceeded"
+            sig["ai_band"] = _v2_rank_reject_band(sig)
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=false;reason={reject_reason};"
-                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
-                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
-                f"brake_reason={brake.get('reason', '')}"
+                f"top_n={effective_top_n};selected=false;reason=rank_exceeded;brake_mode={brake_mode}"
             )
 
     return ranked
@@ -3615,12 +3581,239 @@ def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
     return tags
 
 
+def _v2_bool01(x: Any) -> float:
+    s = ("" if x is None else str(x)).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return 1.0
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return 0.0
+    return np.nan
+
+
+def _v2_mode_onehot(mode_raw: Any) -> Tuple[float, float, float]:
+    mode = ("" if mode_raw is None else str(mode_raw)).strip().upper()
+    if mode == "UP":
+        return 1.0, 0.0, 0.0
+    if mode == "RANGE":
+        return 0.0, 1.0, 0.0
+    if mode == "DOWN":
+        return 0.0, 0.0, 1.0
+    return np.nan, np.nan, np.nan
+
+
+def _v2_sig_symbol_code(sig: Dict[str, Any]) -> str:
+    raw = str(sig.get("symbol", "") or "").strip().upper()
+    base = raw.split(":", 1)[0]
+    return base.split("/", 1)[0].strip().upper()
+
+
+def _v2_sig_hour(sig: Dict[str, Any]) -> float:
+    h = _safe_float_or_nan(sig.get("hour"))
+    if np.isfinite(h):
+        return float(h)
+
+    dt = sig.get("dt")
+    try:
+        if dt is not None and hasattr(dt, "hour"):
+            return float(dt.hour)
+    except Exception:
+        pass
+
+    return np.nan
+
+
+def _v2_compact_dbg(dbg: Any) -> str:
+    d = dbg if isinstance(dbg, dict) else {"dbg": str(dbg)}
+    parts: List[str] = []
+
+    err = str(d.get("error", "") or "").strip()
+    if err:
+        parts.append(f"error={err}")
+
+    detail = str(d.get("detail", "") or "").strip()
+    if detail:
+        parts.append(f"detail={detail}")
+
+    miss = d.get("missing_columns")
+    if isinstance(miss, (list, tuple)) and miss:
+        miss_txt = ",".join(str(x) for x in list(miss)[:8])
+        if len(miss) > 8:
+            miss_txt += ",..."
+        parts.append(f"missing={miss_txt}")
+
+    nan_cols = d.get("nan_columns")
+    if isinstance(nan_cols, (list, tuple)) and nan_cols:
+        nan_txt = ",".join(str(x) for x in list(nan_cols)[:8])
+        if len(nan_cols) > 8:
+            nan_txt += ",..."
+        parts.append(f"nan={nan_txt}")
+
+    if not parts:
+        raw = str(d.get("dbg", "") or "").strip()
+        parts.append(raw if raw else "bypass")
+
+    txt = ";".join(parts)
+    maxlen = max(60, int(V2_AI_NOTE_DBG_MAXLEN))
+    return txt[:maxlen]
+
+
+def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> pd.DataFrame:
+    mode_up, mode_range, mode_down = _v2_mode_onehot(sig.get("btc_mode_compat"))
+
+    return pd.DataFrame([{
+        "TotalScore": _safe_float_or_nan(sig.get("total_score")),
+        "P1_TrendScore": _safe_float_or_nan(sig.get("p1_score")),
+        "P2_FundingScore": _safe_float_or_nan(sig.get("p2_score")),
+        "P3_VolumeScore": _safe_float_or_nan(sig.get("p3_score")),
+        "SymHTF_Strength": _safe_float_or_nan(sig.get("sym_htf_strength")),
+        "BTC_HTF_Strength": _safe_float_or_nan(sig.get("btc_htf_strength")),
+        "VolRatio": _safe_float_or_nan(sig.get("vol_ratio")),
+        "ATR": _safe_float_or_nan(sig.get("atr")),
+        "RSI": _safe_float_or_nan(sig.get("rsi")),
+        "Hour_JST": _v2_sig_hour(sig),
+        "LTF_Aligned": _v2_bool01(sig.get("ltf_aligned")),
+        "FR_Available": _v2_bool01(sig.get("fr_available")),
+        "VolConfirmed": _v2_bool01(sig.get("vol_confirmed")),
+        "BTC_Mode_UP": mode_up,
+        "BTC_Mode_RANGE": mode_range,
+        "BTC_Mode_DOWN": mode_down,
+    }])
+
+
+def _v2_rank_selected_band(sig: Dict[str, Any]) -> str:
+    mt = str(sig.get("ai_model_type", "") or "").strip().upper()
+    if mt == "LONG_AI":
+        return "LONG_AI_RANK"
+    if mt == "SHORT_AI":
+        return "SHORT_AI_RANK"
+    if mt == "LONG_AI_FALLBACK":
+        return "LONG_AI_FALLBACK_RANK"
+    if mt == "SHORT_AI_FALLBACK":
+        return "SHORT_AI_FALLBACK_RANK"
+    return "RULE_QS"
+
+
+def _v2_rank_reject_band(sig: Dict[str, Any]) -> str:
+    mt = str(sig.get("ai_model_type", "") or "").strip().upper()
+    if mt == "LONG_AI":
+        return "LONG_AI_RANK_REJECT"
+    if mt == "SHORT_AI":
+        return "SHORT_AI_RANK_REJECT"
+    if mt == "LONG_AI_FALLBACK":
+        return "LONG_AI_FALLBACK_RANK_REJECT"
+    if mt == "SHORT_AI_FALLBACK":
+        return "SHORT_AI_FALLBACK_RANK_REJECT"
+    return "RANK_REJECT"
+
+
+def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) -> Dict[str, Any]:
+    """
+    V2 sig から事前特徴量だけを使って side別AI推論。
+    欠損は埋めない。safe_predict_proba() に渡して bypass させる。
+    """
+    side_u = str(side or "").strip().upper()
+    sym_code = _v2_sig_symbol_code(sig)
+    feats = _build_v2_ai_feature_frame(sig)
+    threshold = V2_LONG_AI_MIN if side_u == "LONG" else V2_SHORT_AI_MIN
+
+    model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(side_u, sym_code)
+    invert_for_side = _get_side_model_invert(side_u)
+
+    base = {
+        "side": side_u,
+        "score": np.nan,
+        "ok": False,
+        "used_fallback": False,
+        "model_version": model_ver_side or "",
+        "model_source": model_src_side or "",
+        "model_type": f"{side_u}_AI",
+        "note": "",
+    }
+
+    if model_for_side is None:
+        if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
+            base["score"] = float(fallback_score)
+            base["ok"] = True
+            base["used_fallback"] = True
+            base["model_type"] = f"{side_u}_AI_FALLBACK"
+            base["note"] = "ai_model_none_rule_fallback"
+            return base
+        base["note"] = "ai_model_none"
+        return base
+
+    proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_side, feats)
+    dbg = (dbg_x or {})
+    if not isinstance(dbg, dict):
+        dbg = {"dbg": str(dbg)}
+
+    if bypass_x or proba_x is None:
+        if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
+            base["score"] = float(fallback_score)
+            base["ok"] = True
+            base["used_fallback"] = True
+            base["model_type"] = f"{side_u}_AI_FALLBACK"
+            base["note"] = f"ai_bypass_rule_fallback:{_v2_compact_dbg(dbg)}"
+            return base
+        base["note"] = f"ai_bypass:{_v2_compact_dbg(dbg)}"
+        return base
+
+    try:
+        p = np.asarray(proba_x, dtype=float)
+
+        win_idx = 1
+        cls_list = None
+        try:
+            cls = getattr(model_for_side, "classes_", None)
+            cls_list = list(cls) if cls is not None else []
+            if cls_list and (1 in cls_list):
+                win_idx = cls_list.index(1)
+        except Exception:
+            win_idx = 1
+
+        s_raw = float(p[0][win_idx])
+        if not np.isfinite(s_raw):
+            raise ValueError("non_finite_proba")
+
+        s_used = (1.0 - s_raw) if invert_for_side else s_raw
+        if not np.isfinite(s_used):
+            raise ValueError("non_finite_score_used")
+
+        if float(s_used) < float(threshold):
+            base["score"] = float(s_used)
+            base["ok"] = False
+            base["note"] = (
+                f"ai_below_min ai={float(s_used):.6f};min={float(threshold):.6f};"
+                f"raw={float(s_raw):.6f};invert={int(bool(invert_for_side))}"
+            )
+            return base
+
+        base["score"] = float(s_used)
+        base["ok"] = True
+        base["note"] = (
+            f"ai={float(s_used):.6f};min={float(threshold):.6f};"
+            f"raw={float(s_raw):.6f};invert={int(bool(invert_for_side))};"
+            f"win_idx={int(win_idx)}"
+        )
+        return base
+
+    except Exception as e:
+        if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
+            base["score"] = float(fallback_score)
+            base["ok"] = True
+            base["used_fallback"] = True
+            base["model_type"] = f"{side_u}_AI_FALLBACK"
+            base["note"] = f"ai_parse_failed_rule_fallback err={type(e).__name__}:{e}"
+            return base
+
+        base["note"] = f"ai_parse_failed err={type(e).__name__}:{e}"
+        return base
+
+
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    LONG候補を QualityScore 降順に並べる。
-    上位N件は ai_pass="1" のまま通し、
-    上位に入らなかったものは ai_pass="0" / ai_band="RANK_REJECT" にして
-    記録用に残したまま返す。
+    LONG候補を ai_prob_win 降順に並べる。
+    - LONG AI が入っていれば ai_prob_win は AI確率
+    - bypass/fallback のときは RULE fallback の値
     """
     if not long_signals:
         return []
@@ -3634,9 +3827,13 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
     if not V2_LONG_RANK_ENABLE:
         for rank_idx, sig in enumerate(ranked, start=1):
             slot_total = len(ranked)
-            sig["ai_band"] = "RULE_QS_NO_RANK"
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = _v2_rank_selected_band(sig)
             current_note = str(sig.get("ai_note", "") or "")
-            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n=ALL;selected=true;rank_disabled=true"
+            sig["ai_note"] = (
+                f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                f"top_n=ALL;selected=true;rank_disabled=true"
+            )
         return ranked
 
     top_n = max(1, int(V2_LONG_RANK_TOP_N))
@@ -3646,12 +3843,18 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
         current_note = str(sig.get("ai_note", "") or "")
         if rank_idx <= top_n:
             sig["ai_pass"] = "1"
-            sig["ai_band"] = "RULE_QS"
-            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n={top_n};selected=true"
+            sig["ai_band"] = _v2_rank_selected_band(sig)
+            sig["ai_note"] = (
+                f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                f"top_n={top_n};selected=true"
+            )
         else:
             sig["ai_pass"] = "0"
-            sig["ai_band"] = "RANK_REJECT"
-            sig["ai_note"] = f"{current_note};rank={rank_idx};slot_total={slot_total};top_n={top_n};selected=false;reason=rank_exceeded"
+            sig["ai_band"] = _v2_rank_reject_band(sig)
+            sig["ai_note"] = (
+                f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                f"top_n={top_n};selected=false;reason=rank_exceeded"
+            )
 
     return ranked
 
@@ -3660,9 +3863,9 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     """
     Stage A -> B -> C
     SHORT:
-        defensive_filter -> calc_quality_score -> rank_and_select
+        defensive_filter -> calc_quality_score -> V2 side-AI score -> rank_and_select
     LONG:
-        defensive_filter_long -> calc_long_quality_score -> rank_and_select_long
+        defensive_filter_long -> calc_long_quality_score -> V2 side-AI score -> rank_and_select_long
 
     REJECT も rank落ちも記録用に残す。
     """
@@ -3674,7 +3877,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     long_passed: List[Dict[str, Any]] = []
 
     for sig in signals:
-        direction = str(sig.get("direction", "")).upper()
+        direction = str(sig.get("direction", "")).strip().upper()
 
         if direction == "SHORT":
             ok, reason = defensive_filter(sig)
@@ -3706,12 +3909,35 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 continue
 
-            sig["ai_prob_win"] = round(qs, 6)
+            ai_res = _predict_v2_ai_score(sig, "SHORT", qs)
+
+            if not bool(ai_res.get("ok")):
+                ai_score = ai_res.get("score", np.nan)
+                sig["ai_prob_win"] = round(float(ai_score), 6) if np.isfinite(ai_score) else ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = str(ai_res.get("model_version", "") or "")
+                sig["ai_model_type"] = str(ai_res.get("model_type", "SHORT_AI") or "SHORT_AI")
+                sig["ai_note"] = (
+                    f"REJECTED:{ai_res.get('note', 'ai_reject')};"
+                    f"qs={qs:.4f};"
+                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                    f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                    f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
+                    f"rsi={sig.get('rsi', '')}"
+                )
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={ai_res.get('note', 'ai_reject')}")
+                continue
+
+            ai_score = float(ai_res["score"])
+            sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
-            sig["ai_band"] = "RULE_QS"
-            sig["ai_model_version"] = "QS_v1"
-            sig["ai_model_type"] = "SHORT_RULE_RANK"
+            sig["ai_band"] = "SHORT_AI_SCORE" if not ai_res.get("used_fallback") else "SHORT_AI_FALLBACK_SCORE"
+            sig["ai_model_version"] = str(ai_res.get("model_version", "") or "")
+            sig["ai_model_type"] = str(ai_res.get("model_type", "SHORT_AI") or "SHORT_AI")
             sig["ai_note"] = (
+                f"{ai_res.get('note', '')};"
                 f"qs={qs:.4f};"
                 f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
                 f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
@@ -3770,12 +3996,39 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 continue
 
-            sig["ai_prob_win"] = round(qs, 6)
+            ai_res = _predict_v2_ai_score(sig, "LONG", qs)
+
+            if not bool(ai_res.get("ok")):
+                ai_score = ai_res.get("score", np.nan)
+                sig["ai_prob_win"] = round(float(ai_score), 6) if np.isfinite(ai_score) else ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = str(ai_res.get("model_version", "") or "")
+                sig["ai_model_type"] = str(ai_res.get("model_type", "LONG_AI") or "LONG_AI")
+                sig["ai_note"] = (
+                    f"REJECTED:{ai_res.get('note', 'ai_reject')};"
+                    f"qs={qs:.4f};"
+                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                    f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                    f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
+                    f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
+                    f"btc_mode={sig.get('btc_mode_compat', '')};"
+                    f"rsi={sig.get('rsi', '')};"
+                    f"rescued_p1={rescued_p1};"
+                    f"research_tags={research_note}"
+                )
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={ai_res.get('note', 'ai_reject')}")
+                continue
+
+            ai_score = float(ai_res["score"])
+            sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
-            sig["ai_band"] = "RULE_QS"
-            sig["ai_model_version"] = "LONG_QS_v2"
-            sig["ai_model_type"] = "LONG_RULE_RANK"
+            sig["ai_band"] = "LONG_AI_SCORE" if not ai_res.get("used_fallback") else "LONG_AI_FALLBACK_SCORE"
+            sig["ai_model_version"] = str(ai_res.get("model_version", "") or "")
+            sig["ai_model_type"] = str(ai_res.get("model_type", "LONG_AI") or "LONG_AI")
             sig["ai_note"] = (
+                f"{ai_res.get('note', '')};"
                 f"qs={qs:.4f};"
                 f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
                 f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
