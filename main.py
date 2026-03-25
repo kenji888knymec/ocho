@@ -264,6 +264,19 @@ MODEL_MAP = os.environ.get("MODEL_MAP", "")
 MODEL_VERSION_MAP = os.environ.get("MODEL_VERSION_MAP", "")
 MODEL_CACHE_TTL_SEC = int(float(os.environ.get("MODEL_CACHE_TTL_SEC", "3600")))
 
+# --- Side別AIモデル設定 ---
+LONG_AI_ENABLE = (os.environ.get("LONG_AI_ENABLE", "1").strip() == "1")
+SHORT_AI_ENABLE = (os.environ.get("SHORT_AI_ENABLE", "1").strip() == "1")
+
+LONG_MODEL_GCS_URI = os.environ.get("LONG_MODEL_GCS_URI", "").strip()
+SHORT_MODEL_GCS_URI = os.environ.get("SHORT_MODEL_GCS_URI", "").strip()
+
+LONG_MODEL_VERSION = os.environ.get("LONG_MODEL_VERSION", "").strip()
+SHORT_MODEL_VERSION = os.environ.get("SHORT_MODEL_VERSION", "").strip()
+
+LONG_AI_PROBA_INVERT = (os.environ.get("LONG_AI_PROBA_INVERT", "1" if AI_PROBA_INVERT else "0").strip() == "1")
+SHORT_AI_PROBA_INVERT = (os.environ.get("SHORT_AI_PROBA_INVERT", "1" if AI_PROBA_INVERT else "0").strip() == "1")
+
 ENABLE_JUDGE = os.environ.get("ENABLE_JUDGE", "1") == "1"
 AUTO_JUDGE_AFTER_RUN = os.environ.get("AUTO_JUDGE_AFTER_RUN", "0") == "1"
 FAIL_CLOSED_ON_AI_BYPASS = os.environ.get("FAIL_CLOSED_ON_AI_BYPASS", "1") == "1"
@@ -417,6 +430,8 @@ TABLE_REQUIRED_FIELDS = [
 # グローバル
 # ==========================================
 ai_model = None
+ai_model_long = None
+ai_model_short = None
 
 last_alert_records: Dict[str, int] = {}
 last_candidate_records: Dict[str, int] = {}
@@ -1540,10 +1555,16 @@ def compute_dynamic_ai_th(base_th: float, btc_mode: str, median_sigma: float, bt
 # ==========================================
 MODEL_LOCAL_PATH = "trade_ai_model.pkl"
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "")
-MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "")
+MODEL_GCS_URI = os.environ.get("MODEL_GCS_URI", "").strip()
 
 AI_MODEL_VERSION_RUNTIME = MODEL_VERSION
 AI_MODEL_SOURCE_RUNTIME = "none"
+
+AI_MODEL_VERSION_RUNTIME_LONG = LONG_MODEL_VERSION
+AI_MODEL_SOURCE_RUNTIME_LONG = "none"
+
+AI_MODEL_VERSION_RUNTIME_SHORT = SHORT_MODEL_VERSION
+AI_MODEL_SOURCE_RUNTIME_SHORT = "none"
 
 _model_cache: Dict[str, Dict[str, Any]] = {}  # key: uri -> {model, ts, version, source}
 
@@ -2223,6 +2244,121 @@ def get_ai_model_for_symbol(symbol_code: str):
         pass
     
     return m, ver, "gcs"
+
+
+def _get_side_model_uri(side: str) -> str:
+    s = str(side or "").strip().upper()
+    if s == "LONG":
+        return LONG_MODEL_GCS_URI
+    if s == "SHORT":
+        return SHORT_MODEL_GCS_URI
+    return ""
+
+def _get_side_model_version(side: str) -> str:
+    s = str(side or "").strip().upper()
+    if s == "LONG":
+        return LONG_MODEL_VERSION
+    if s == "SHORT":
+        return SHORT_MODEL_VERSION
+    return ""
+
+def _get_side_model_invert(side: str) -> bool:
+    s = str(side or "").strip().upper()
+    if s == "LONG":
+        return bool(LONG_AI_PROBA_INVERT)
+    if s == "SHORT":
+        return bool(SHORT_AI_PROBA_INVERT)
+    return bool(AI_PROBA_INVERT)
+
+def _is_side_ai_enabled(side: str) -> bool:
+    s = str(side or "").strip().upper()
+    if s == "LONG":
+        return bool(LONG_AI_ENABLE)
+    if s == "SHORT":
+        return bool(SHORT_AI_ENABLE)
+    return True
+
+def get_ai_model_for_side(side: str, sym_code: str):
+    """
+    優先順位:
+      1) side専用モデル
+      2) 既存の銘柄別モデル
+      3) 既存の単一モデル
+    """
+    global ai_model_long, ai_model_short
+    global AI_MODEL_VERSION_RUNTIME_LONG, AI_MODEL_SOURCE_RUNTIME_LONG
+    global AI_MODEL_VERSION_RUNTIME_SHORT, AI_MODEL_SOURCE_RUNTIME_SHORT
+
+    s = str(side or "").strip().upper()
+
+    if not _is_side_ai_enabled(s):
+        return None, "", "disabled"
+
+    side_uri = _get_side_model_uri(s)
+    side_ver = _get_side_model_version(s)
+
+    if side_uri.startswith("gs://"):
+        cached = _model_cache.get(side_uri)
+        now_ts = time.time()
+
+        if cached and (now_ts - float(cached.get("ts", 0.0)) <= float(MODEL_CACHE_TTL_SEC)):
+            model = cached.get("model")
+            ver = str(cached.get("version", side_ver))
+            src = str(cached.get("source", side_uri))
+            if s == "LONG":
+                ai_model_long = model
+                AI_MODEL_VERSION_RUNTIME_LONG = ver
+                AI_MODEL_SOURCE_RUNTIME_LONG = src
+            elif s == "SHORT":
+                ai_model_short = model
+                AI_MODEL_VERSION_RUNTIME_SHORT = ver
+                AI_MODEL_SOURCE_RUNTIME_SHORT = src
+            return model, ver, src
+
+        tmp_path = _safe_tmp_path_for_uri(side_uri)
+        ok_dl = _gcs_download_to(side_uri, tmp_path)
+        if ok_dl and os.path.exists(tmp_path):
+            model = _load_model_from_path(tmp_path)
+            if model is not None:
+                src = side_uri
+                ver = side_ver or ""
+                _model_cache[side_uri] = {
+                    "model": model,
+                    "ts": now_ts,
+                    "version": ver,
+                    "source": src,
+                }
+                if s == "LONG":
+                    ai_model_long = model
+                    AI_MODEL_VERSION_RUNTIME_LONG = ver
+                    AI_MODEL_SOURCE_RUNTIME_LONG = src
+                elif s == "SHORT":
+                    ai_model_short = model
+                    AI_MODEL_VERSION_RUNTIME_SHORT = ver
+                    AI_MODEL_SOURCE_RUNTIME_SHORT = src
+                print(f"[AI] Side-model loaded side={s} uri={side_uri} ver={ver}")
+                try:
+                    fn = getattr(model, "feature_names_in_", None)
+                    if fn is not None:
+                        print(f"[AI] model_feature_names_in_({s})={list(fn)}")
+                except Exception:
+                    pass
+                return model, ver, src
+
+    if ENABLE_MULTI_MODEL:
+        try:
+            model_for_sym, ver_sym, src_sym = get_ai_model_for_symbol(sym_code)
+            if model_for_sym is not None:
+                return model_for_sym, ver_sym, src_sym
+        except Exception as e:
+            print(f"[AI] get_ai_model_for_side symbol fallback failed side={s} sym={sym_code} err={type(e).__name__}: {e}")
+
+    try:
+        model = get_ai_model()
+        return model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+    except Exception as e:
+        print(f"[AI] get_ai_model_for_side fallback failed side={s} err={type(e).__name__}: {e}")
+        return None, "", "none"
 
 
 
@@ -4849,38 +4985,32 @@ def logic_main(force: bool = False):
             if DYNAMIC_AI_TH:
                 ai_th_used = compute_dynamic_ai_th(AI_TH, btc_mode, median_sigma, btc_ok, BTC_CALM)
             
-            # 銘柄別モデル（既存仕様）
-            model_for_sym = ai_model
+            # side別AIモデル
             sym_code = symbol.replace("/USDT", "")
-            if ENABLE_MULTI_MODEL:
-                model_for_sym, _ver, _src = get_ai_model_for_symbol(sym_code)
-            
+
             # AIでside選択を有効化（envでOFF可）
             AI_SIDE_SELECT = (os.environ.get("AI_SIDE_SELECT", "1").strip() == "1")
-            # AI_PROBA_INVERT はグローバル定義を使う（ここでは再定義しない）
-            
+
             # --- NameError防止：AIブロック突入時点で必ず初期値を持たせる（挙動は変えない）---
             dbg = {}
             ai_debug_str = ""
-            
+
             proba_raw_val = ""
             proba_used_val = ""
             invert_applied_val = ""
-            
+
             ai_proba_base_val = ""
             ai_proba_flip_val = ""
             ai_proba_used_val = ""
             ai_margin_val = ""
-            
+
             base_side = "LONG" if is_buy else "SHORT"
             flip_side = "SHORT" if base_side == "LONG" else "LONG"
             flip_allowed = (ALLOW_SHORT if flip_side == "SHORT" else ALLOW_LONG)
-            
+
             # 学習側と整合：Sideに応じて Rise/Drop のどちらか一方だけに寄せる
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
-
-            # 修正後（交互作用項追加）
             def _make_feats(side: str) -> pd.DataFrame:
                 _is_long = float(1.0 if side == "LONG" else 0.0)
                 return pd.DataFrame([{
@@ -4897,89 +5027,92 @@ def logic_main(force: bool = False):
                     "Long x RSI": _is_long * float(row["RSI"]),
                 }])
 
-
-
             def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
                 """
                 戻り:
-                  - score_used: 判定に使うスコア（AI_PROBA_INVERT を反映）
+                  - score_used: 判定に使うスコア（side別 invert を反映）
                   - score_raw : model.predict_proba の生値（反転前）
                   - bypass    : Trueなら予測できていない
                   - dbg       : safe_predict_proba のデバッグ（追跡用情報を必ず追記）
                 """
-                proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_sym, _make_feats(side))
-            
+                model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(side, sym_code)
+                invert_for_side = _get_side_model_invert(side)
+
+                d_base: Dict[str, Any] = {
+                    "side": str(side),
+                    "model_version": model_ver_side,
+                    "model_source": model_src_side,
+                    "model_type": f"{str(side).strip().upper()}_AI",
+                }
+
+                proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_side, _make_feats(side))
+
                 d = (dbg_x or {})
                 if not isinstance(d, dict):
                     d = {"dbg": str(d)}
-            
+                d.update(d_base)
+
                 # bypass なら予測しない（固定値判定もしない）
                 if bypass_x:
-                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_enabled"] = bool(invert_for_side)
                     d["ai_proba_invert_applied"] = False
                     d["proba_raw"] = None
                     d["proba_used"] = None
-                    d["side"] = str(side)
                     return None, None, True, d
-            
-                # 念のため：None は絶対にパースしない（事故率低下）
+
+                # 念のため：None は絶対にパースしない
                 if proba_x is None:
                     d["error"] = "no_proba"
-                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_enabled"] = bool(invert_for_side)
                     d["ai_proba_invert_applied"] = False
                     d["proba_raw"] = None
                     d["proba_used"] = None
-                    d["side"] = str(side)
                     return None, None, True, d
-            
+
                 try:
                     p = np.asarray(proba_x, dtype=float)
-            
+
                     # 1列目が「Win」だと決め打ちせず、classes_ を見て win_idx を確定
                     win_idx = 1
                     cls_list = None
                     try:
-                        cls = getattr(model_for_sym, "classes_", None)
+                        cls = getattr(model_for_side, "classes_", None)
                         cls_list = list(cls) if cls is not None else []
                         if cls_list and (1 in cls_list):
                             win_idx = cls_list.index(1)
                     except Exception:
                         win_idx = 1
-            
+
                     s_raw = float(p[0][win_idx])
                     if not np.isfinite(s_raw):
-                        raise ValueError("non_finite_score_raw")
-            
-                    # ★反転（必要なときだけ）
-                    if bool(AI_PROBA_INVERT):
-                        s_used = 1.0 - float(s_raw)
-                        invert_applied = True
-                    else:
-                        s_used = float(s_raw)
-                        invert_applied = False
-            
-                    if not np.isfinite(s_used):
-                        raise ValueError("non_finite_score_used")
-            
-                    # ★追跡用ログを必ず残す（後で分かる）
-                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
-                    d["ai_proba_invert_applied"] = bool(invert_applied)
+                        d["error"] = "non_finite_proba"
+                        d["ai_proba_invert_enabled"] = bool(invert_for_side)
+                        d["ai_proba_invert_applied"] = False
+                        d["proba_raw"] = None
+                        d["proba_used"] = None
+                        return None, None, True, d
+
+                    s_used = (1.0 - s_raw) if invert_for_side else s_raw
+
+                    d["classes_"] = [int(x) for x in cls_list] if cls_list is not None else None
+                    d["win_index"] = int(win_idx)
+                    d["ai_proba_invert_enabled"] = bool(invert_for_side)
+                    d["ai_proba_invert_applied"] = bool(invert_for_side)
                     d["proba_raw"] = float(s_raw)
                     d["proba_used"] = float(s_used)
-                    d["win_index"] = int(win_idx)
-                    d["classes_"] = [int(x) for x in cls_list] if cls_list is not None else None
-                    d["side"] = str(side)
-            
+                    d["score_raw"] = float(s_raw)
+                    d["score_used"] = float(s_used)
+                    d["invert_applied"] = bool(invert_for_side)
+
                     return float(s_used), float(s_raw), False, d
-            
+
                 except Exception as e:
                     d["error"] = "proba_parse_failed"
                     d["detail"] = str(e)
-                    d["ai_proba_invert_enabled"] = bool(AI_PROBA_INVERT)
+                    d["ai_proba_invert_enabled"] = bool(invert_for_side)
                     d["ai_proba_invert_applied"] = False
                     d["proba_raw"] = None
                     d["proba_used"] = None
-                    d["side"] = str(side)
                     return None, None, True, d
 
 
