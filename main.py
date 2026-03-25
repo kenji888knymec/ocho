@@ -5577,124 +5577,178 @@ def logic_main(force: bool = False):
 
 
 
-            # base 採点（used=判定用, raw=反転前）
-            score_b, score_b_raw, bypass_b, dbg_b = _score_side(base_side)
+            # AI_SIDE_SELECT=0 のときは、旧 logic_main 側の AI 判定を完全にスキップする。
+            # V2 selection pipeline 側の AI だけで判定させたいので、
+            # base/flip のどちらも _score_side() を呼ばない。
+            if not AI_SIDE_SELECT:
+                score_b = None
+                score_b_raw = None
+                bypass_b = True
+                dbg_b: Dict[str, Any] = {"skipped": True, "reason": "AI_SIDE_SELECT=0(base_disabled)"}
 
-            # Crash/Trend 判定：荒れ相場（強トレンド/高ボラ）では flip（逆張り側）を禁止する
-            crash_forbid_flip = False
-            try:
-                crash_forbid_flip = (float(sig_score) >= float(CRASH_SIGMA)) or (float(row["Dynamic_Sigma"]) >= float(CRASH_VOLSIGMA))
-            except Exception:
                 crash_forbid_flip = False
+                try:
+                    crash_forbid_flip = (float(sig_score) >= float(CRASH_SIGMA)) or (float(row["Dynamic_Sigma"]) >= float(CRASH_VOLSIGMA))
+                except Exception:
+                    crash_forbid_flip = False
 
-            # flip 採点（許可 & 有効 & 荒れ相場でない時だけ）
-            score_f = None
-            score_f_raw = None
-            bypass_f = True
-            dbg_f: Dict[str, Any] = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
-            if AI_SIDE_SELECT and bool(flip_allowed) and (not crash_forbid_flip):
-                score_f, score_f_raw, bypass_f, dbg_f = _score_side(flip_side)
-            else:
+                score_f = None
+                score_f_raw = None
+                bypass_f = True
                 if crash_forbid_flip:
-                    dbg_f = {"skipped": True, "reason": "crash_forbid_flip"}
+                    dbg_f: Dict[str, Any] = {"skipped": True, "reason": "crash_forbid_flip"}
                 else:
-                    dbg_f = {"skipped": True, "reason": ("flip_not_allowed" if (not flip_allowed) else "AI_SIDE_SELECT=0")}
+                    dbg_f: Dict[str, Any] = {"skipped": True, "reason": "AI_SIDE_SELECT=0(flip_disabled)"}
 
-            # 採用判定：採点できた方があれば「高い方」。
-            # ただし flip を採用するには、Baseより AI_SIDE_MARGIN 以上よいことを要求（ノイズ反転を減らす）
-            chosen_side = base_side
-            chosen_score = None
-
-            if (not bypass_b) and (score_b is not None):
                 chosen_side = base_side
-                chosen_score = float(score_b)
+                chosen_score = None
+                flipped = False
 
-            if (not bypass_f) and (score_f is not None):
-                if chosen_score is None:
-                    chosen_side = flip_side
-                    chosen_score = float(score_f)
+                dbg = {
+                    "ai_side_select": bool(AI_SIDE_SELECT),
+                    "ai_side_margin": float(AI_SIDE_MARGIN),
+                    "crash_forbid_flip": bool(crash_forbid_flip),
+                    "crash_sig_score": float(sig_score),
+                    "crash_volsigma": float(row["Dynamic_Sigma"]),
+                    "crash_sig_th": float(CRASH_SIGMA),
+                    "crash_vol_th": float(CRASH_VOLSIGMA),
+                    "base_side": base_side,
+                    "flip_side": flip_side,
+                    "flip_allowed": bool(flip_allowed),
+                    "score_base": score_b,
+                    "score_flip": score_f,
+                    "bypassed_base": bool(bypass_b),
+                    "bypassed_flip": bool(bypass_f),
+                    "dbg_base": dbg_b,
+                    "dbg_flip": dbg_f,
+                    "chosen_side": chosen_side,
+                    "flipped": bool(flipped),
+                    "chosen_score": chosen_score,
+                    "ai_th_used": float(ai_th_used),
+                    "old_logic_ai_skipped": True,
+                }
+
+                ai_score = None
+                bypassed = False
+                ai_pass = True
+
+            else:
+                # base 採点（used=判定用, raw=反転前）
+                score_b, score_b_raw, bypass_b, dbg_b = _score_side(base_side)
+
+                # Crash/Trend 判定：荒れ相場（強トレンド/高ボラ）では flip（逆張り側）を禁止する
+                crash_forbid_flip = False
+                try:
+                    crash_forbid_flip = (float(sig_score) >= float(CRASH_SIGMA)) or (float(row["Dynamic_Sigma"]) >= float(CRASH_VOLSIGMA))
+                except Exception:
+                    crash_forbid_flip = False
+
+                # flip 採点（許可 & 有効 & 荒れ相場でない時だけ）
+                score_f = None
+                score_f_raw = None
+                bypass_f = True
+                dbg_f: Dict[str, Any] = {"skipped": True, "reason": "flip_disabled_or_not_allowed"}
+                if AI_SIDE_SELECT and bool(flip_allowed) and (not crash_forbid_flip):
+                    score_f, score_f_raw, bypass_f, dbg_f = _score_side(flip_side)
                 else:
-                    if float(score_f) > (float(chosen_score) + float(AI_SIDE_MARGIN)):
+                    if crash_forbid_flip:
+                        dbg_f = {"skipped": True, "reason": "crash_forbid_flip"}
+                    else:
+                        dbg_f = {"skipped": True, "reason": ("flip_not_allowed" if (not flip_allowed) else "AI_SIDE_SELECT=0")}
+
+                # 採用判定：採点できた方があれば「高い方」。
+                # ただし flip を採用するには、Baseより AI_SIDE_MARGIN 以上よいことを要求（ノイズ反転を減らす）
+                chosen_side = base_side
+                chosen_score = None
+
+                if (not bypass_b) and (score_b is not None):
+                    chosen_side = base_side
+                    chosen_score = float(score_b)
+
+                if (not bypass_f) and (score_f is not None):
+                    if chosen_score is None:
                         chosen_side = flip_side
                         chosen_score = float(score_f)
+                    else:
+                        if float(score_f) > (float(chosen_score) + float(AI_SIDE_MARGIN)):
+                            chosen_side = flip_side
+                            chosen_score = float(score_f)
 
-            flipped = (chosen_side != base_side)
+                flipped = (chosen_side != base_side)
 
-            # dbg は item["ai_debug"] に入れる前提
-            dbg = {
-                "ai_side_select": bool(AI_SIDE_SELECT),
-                "ai_side_margin": float(AI_SIDE_MARGIN),
-                "crash_forbid_flip": bool(crash_forbid_flip),
-                "crash_sig_score": float(sig_score),
-                "crash_volsigma": float(row["Dynamic_Sigma"]),
-                "crash_sig_th": float(CRASH_SIGMA),
-                "crash_vol_th": float(CRASH_VOLSIGMA),
-                "base_side": base_side,
-                "flip_side": flip_side,
-                "flip_allowed": bool(flip_allowed),
-                "score_base": score_b,
-                "score_flip": score_f,
-                "bypassed_base": bool(bypass_b),
-                "bypassed_flip": bool(bypass_f),
-                "dbg_base": dbg_b,
-                "dbg_flip": dbg_f,
-                "chosen_side": chosen_side,
-                "flipped": bool(flipped),
-                "chosen_score": chosen_score,
-                "ai_th_used": float(ai_th_used),
-            }
+                # dbg は item["ai_debug"] に入れる前提
+                dbg = {
+                    "ai_side_select": bool(AI_SIDE_SELECT),
+                    "ai_side_margin": float(AI_SIDE_MARGIN),
+                    "crash_forbid_flip": bool(crash_forbid_flip),
+                    "crash_sig_score": float(sig_score),
+                    "crash_volsigma": float(row["Dynamic_Sigma"]),
+                    "crash_sig_th": float(CRASH_SIGMA),
+                    "crash_vol_th": float(CRASH_VOLSIGMA),
+                    "base_side": base_side,
+                    "flip_side": flip_side,
+                    "flip_allowed": bool(flip_allowed),
+                    "score_base": score_b,
+                    "score_flip": score_f,
+                    "bypassed_base": bool(bypass_b),
+                    "bypassed_flip": bool(bypass_f),
+                    "dbg_base": dbg_b,
+                    "dbg_flip": dbg_f,
+                    "chosen_side": chosen_side,
+                    "flipped": bool(flipped),
+                    "chosen_score": chosen_score,
+                    "ai_th_used": float(ai_th_used),
+                }
 
-            # side 確定（以降のTP/SL・Sheet・Discordがこのsideになる）
-            if flipped:
-                if chosen_side == "LONG":
-                    is_buy = True
-                    is_sell = False
-                    signal_type = "LONG"
+                # side 確定（以降のTP/SL・Sheet・Discordがこのsideになる）
+                if flipped:
+                    if chosen_side == "LONG":
+                        is_buy = True
+                        is_sell = False
+                        signal_type = "LONG"
+                    else:
+                        is_buy = False
+                        is_sell = True
+                        signal_type = "SHORT"
+
+                # bypassed / ai_score を確定
+                if (chosen_score is not None) and np.isfinite(float(chosen_score)):
+                    ai_score = float(chosen_score)
+                    bypassed = False
                 else:
-                    is_buy = False
-                    is_sell = True
-                    signal_type = "SHORT"
+                    ai_score = None
+                    bypassed = True
 
+                # ai_pass 判定（方針：bypass時は「予測しない」＝通知しない）
 
-            # bypassed / ai_score を確定
-            if (chosen_score is not None) and np.isfinite(float(chosen_score)):
-                ai_score = float(chosen_score)
-                bypassed = False
-            else:
-                ai_score = None
-                bypassed = True
+                if bypassed:
 
-            # ai_pass 判定（方針：bypass時は「予測しない」＝通知しない）
+                    ai_pass = False
 
-            if bypassed:
-
-                ai_pass = False
-
-                print(f"[AI] bypassed -> SKIP (no alert) in logic_main sym={sym_code}: {dbg}")
-
-            else:
-
-                # ★Phase1: 方向別閾値
-                # LONG  : ai_th_used と LONG_AI_TH の高い方を使う
-                #         → LONG を厳しくできる
-                # SHORT : 通常は ai_th_used と SHORT_AI_TH の低い方を使う
-                #         ただし BTC_Mode=Up の SHORT は SHORT_AI_TH_UP も考慮して厳しくする
-
-                if chosen_side == "LONG":
-
-                    ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
+                    print(f"[AI] bypassed -> SKIP (no alert) in logic_main sym={sym_code}: {dbg}")
 
                 else:
 
-                    ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
+                    # ★Phase1: 方向別閾値
+                    # LONG  : ai_th_used と LONG_AI_TH の高い方を使う
+                    #         → LONG を厳しくできる
+                    # SHORT : 通常は ai_th_used と SHORT_AI_TH の低い方を使う
+                    #         ただし BTC_Mode=Up の SHORT は SHORT_AI_TH_UP も考慮して厳しくする
 
-                    if str(btc_mode).strip() == "Up":
-                        ai_th_effective = max(float(ai_th_effective), float(SHORT_AI_TH_UP))
+                    if chosen_side == "LONG":
 
-                ai_pass = (float(ai_score) >= float(ai_th_effective))
+                        ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
+
+                    else:
+
+                        ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
+
+                        if str(btc_mode).strip() == "Up":
+                            ai_th_effective = max(float(ai_th_effective), float(SHORT_AI_TH_UP))
+
+                    ai_pass = (float(ai_score) >= float(ai_th_effective))
 
 
-            # ★Phase2: BTC_Up LONGバイパス（環境変数でON/OFF）
 
             if (not ai_pass) and (not bypassed) and LONG_BYPASS_ON_BTC_UP:
 
