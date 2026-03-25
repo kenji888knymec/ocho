@@ -4002,7 +4002,15 @@ def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tup
     work["_row_order"] = np.arange(len(work))
 
     work = work.sort_values("_row_order").drop_duplicates(
-        subset=["Datetime_JST", "Symbol", "Direction"],
+        subset=[
+            "Datetime_JST",
+            "Symbol",
+            "Direction",
+            "TotalScore",
+            "P1_TrendScore",
+            "P2_FundingScore",
+            "P3_VolumeScore",
+        ],
         keep="last",
     )
 
@@ -7263,22 +7271,48 @@ def _train_v2_side_process(side: str):
                 "info": info,
             }), 400
 
-        uniq = sorted(set(int(v) for v in np.unique(y)))
-        if uniq != [0, 1]:
+        uniq, cnt = np.unique(y, return_counts=True)
+        uniq_list = sorted(int(v) for v in uniq)
+
+        if uniq_list != [0, 1]:
             return jsonify({
                 "ok": False,
-                "error": f"need both classes 0/1, got {uniq}",
+                "error": f"need both classes 0/1, got {uniq_list}",
                 "version": VERSION,
                 "info": info,
             }), 400
 
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X,
-            y,
-            test_size=float(TRAIN_TEST_SIZE),
-            random_state=int(TRAIN_RANDOM_STATE),
-            stratify=y,
-        )
+        class_count = {int(k): int(v) for k, v in zip(uniq, cnt)}
+        min_class_n = min(class_count.get(0, 0), class_count.get(1, 0))
+
+        if min_class_n < 20:
+            return jsonify({
+                "ok": False,
+                "error": f"class imbalance too strong for training: class_count={class_count}, min_class_n={min_class_n} < 20",
+                "version": VERSION,
+                "info": info,
+            }), 400
+
+        test_size = float(TRAIN_TEST_SIZE)
+        if not (0.05 <= test_size <= 0.50):
+            test_size = 0.20
+
+        n_total = len(X)
+        n_test = max(1, int(round(n_total * test_size)))
+        n_train = n_total - n_test
+
+        if n_train < 20 or n_test < 10:
+            return jsonify({
+                "ok": False,
+                "error": f"not enough samples for time-order split: train={n_train}, test={n_test}",
+                "version": VERSION,
+                "side": side_u,
+            }), 400
+
+        X_tr = X.iloc[:n_train].copy()
+        X_te = X.iloc[n_train:].copy()
+        y_tr = y[:n_train]
+        y_te = y[n_train:]
 
         model = LogisticRegression(class_weight="balanced", solver="liblinear")
         model.fit(X_tr, y_tr)
