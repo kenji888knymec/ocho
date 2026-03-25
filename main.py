@@ -1581,6 +1581,14 @@ TRAIN_RANDOM_STATE = int(float(os.environ.get("TRAIN_RANDOM_STATE", "42")))
 TRAIN_GCS_BUCKET = os.environ.get("TRAIN_GCS_BUCKET", "")
 TRAIN_GCS_PREFIX = os.environ.get("TRAIN_GCS_PREFIX", "models")  # 例: models/<ver>/trade_ai_model.pkl
 
+# --- V2 side別学習設定 ---
+TRAIN_V2_LOOKBACK_ROWS = int(float(os.environ.get("TRAIN_V2_LOOKBACK_ROWS", "20000")))
+TRAIN_V2_LONG_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_LONG_MIN_SAMPLES", "80")))
+TRAIN_V2_SHORT_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_SHORT_MIN_SAMPLES", "80")))
+
+TRAIN_V2_LONG_GCS_PREFIX = os.environ.get("TRAIN_V2_LONG_GCS_PREFIX", "side_models/long")
+TRAIN_V2_SHORT_GCS_PREFIX = os.environ.get("TRAIN_V2_SHORT_GCS_PREFIX", "side_models/short")
+
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
     # "gs://bucket/path/to.obj" -> ("bucket", "path/to.obj")
     u = ("" if uri is None else str(uri)).strip()
@@ -1607,6 +1615,29 @@ def _build_train_output_uri(version: str) -> str:
         v = datetime.now(JST).strftime("v%Y-%m-%d_%H%M%S")
     obj = f"{TRAIN_GCS_PREFIX}/{v}/trade_ai_model.pkl"
     return f"gs://{bucket}/{obj}"
+
+def _build_train_output_uri_for_side(side: str, version: str) -> str:
+    bucket = _default_train_bucket()
+    if not bucket:
+        return ""
+
+    s = str(side or "").strip().upper()
+    v = ("" if version is None else str(version)).strip()
+    if not v:
+        ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+        v = f"v2_{s.lower()}_{ts}"
+
+    if s == "LONG":
+        prefix = str(TRAIN_V2_LONG_GCS_PREFIX).strip().strip("/")
+        obj = f"{prefix}/{v}/long_model.pkl"
+        return f"gs://{bucket}/{obj}"
+
+    if s == "SHORT":
+        prefix = str(TRAIN_V2_SHORT_GCS_PREFIX).strip().strip("/")
+        obj = f"{prefix}/{v}/short_model.pkl"
+        return f"gs://{bucket}/{obj}"
+
+    return ""
 
 def _sheet_rows_as_df(sheet_name: str, lookback_rows: int) -> pd.DataFrame:
     """
@@ -3883,6 +3914,174 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     n_cols = len(headers)
     fixed = [r[:n_cols] + [""] * max(0, n_cols - len(r)) for r in rows]
     return pd.DataFrame(fixed, columns=headers)
+
+
+def _normalize_bool01(x: Any):
+    s = ("" if x is None else str(x)).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return 1.0
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return 0.0
+    return np.nan
+
+
+def _normalize_v2_winlose(x: Any) -> str:
+    s = ("" if x is None else str(x)).strip().lower()
+    if s in {"win", "w", "1", "true"}:
+        return "Win"
+    if s in {"lose", "l", "0", "false"}:
+        return "Lose"
+    return ""
+
+
+def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    """
+    v2_shadow_ai から、LONG/SHORT 別の学習用 X, y を作る。
+    方針:
+      - DONE + Win/Lose確定行だけ使う
+      - Datetime_JST + Symbol + Direction で重複除去（keep='last'）
+      - 欠損は埋めない
+      - AI列 / 結果列は特徴量に使わない
+    """
+    side_u = str(side or "").strip().upper()
+
+    info: Dict[str, Any] = {
+        "policy": "v2_shadow_ai_done_only_drop_blank_no_imputation_no_leakage",
+        "side": side_u,
+        "required_cols": [
+            "Datetime_JST", "Symbol", "Direction", "EvalStatus", "WinLose",
+            "TotalScore", "P1_TrendScore", "P2_FundingScore", "P3_VolumeScore",
+            "SymHTF_Strength", "BTC_HTF_Strength",
+            "VolRatio", "ATR", "RSI", "Hour_JST",
+            "LTF_Aligned", "FR_Available", "VolConfirmed", "BTC_Mode_Compat",
+        ],
+        "missing_cols": [],
+        "rows_total": 0,
+        "rows_after_side": 0,
+        "rows_after_done": 0,
+        "rows_labeled": 0,
+        "rows_skipped_blank_required": 0,
+        "rows_used": 0,
+        "feature_columns": [
+            "TotalScore",
+            "P1_TrendScore",
+            "P2_FundingScore",
+            "P3_VolumeScore",
+            "SymHTF_Strength",
+            "BTC_HTF_Strength",
+            "VolRatio",
+            "ATR",
+            "RSI",
+            "Hour_JST",
+            "LTF_Aligned",
+            "FR_Available",
+            "VolConfirmed",
+            "BTC_Mode_UP",
+            "BTC_Mode_RANGE",
+            "BTC_Mode_DOWN",
+        ],
+        "notes": [
+            "NO IMPUTATION: rows with blank/non-numeric values in required features are dropped.",
+            "NO LEAKAGE: AI_* and post-exit columns are not used as features.",
+            "WinLose is target only.",
+        ],
+    }
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
+    info["rows_total"] = int(len(df))
+
+    needed = list(info["required_cols"])
+    missing = [c for c in needed if c not in df.columns]
+    info["missing_cols"] = list(missing)
+    if missing:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
+    work = df.copy()
+    work["_row_order"] = np.arange(len(work))
+
+    work = work.sort_values("_row_order").drop_duplicates(
+        subset=["Datetime_JST", "Symbol", "Direction"],
+        keep="last",
+    )
+
+    work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+    work = work[work["Direction"] == side_u].copy()
+    info["rows_after_side"] = int(len(work))
+    if work.empty:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
+    work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+    work = work[work["EvalStatus"] == "DONE"].copy()
+    info["rows_after_done"] = int(len(work))
+    if work.empty:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
+    work["__winlose__"] = work["WinLose"].apply(_normalize_v2_winlose)
+    work = work[work["__winlose__"].isin(["Win", "Lose"])].copy()
+    info["rows_labeled"] = int(len(work))
+    if work.empty:
+        return pd.DataFrame(columns=info["feature_columns"]), np.array([], dtype=int), info
+
+    # 数値化（事前特徴量のみ）
+    work["TotalScore"] = pd.to_numeric(work["TotalScore"], errors="coerce")
+    work["P1_TrendScore"] = pd.to_numeric(work["P1_TrendScore"], errors="coerce")
+    work["P2_FundingScore"] = pd.to_numeric(work["P2_FundingScore"], errors="coerce")
+    work["P3_VolumeScore"] = pd.to_numeric(work["P3_VolumeScore"], errors="coerce")
+    work["SymHTF_Strength"] = pd.to_numeric(work["SymHTF_Strength"], errors="coerce")
+    work["BTC_HTF_Strength"] = pd.to_numeric(work["BTC_HTF_Strength"], errors="coerce")
+    work["VolRatio"] = pd.to_numeric(work["VolRatio"], errors="coerce")
+    work["ATR"] = pd.to_numeric(work["ATR"], errors="coerce")
+    work["RSI"] = pd.to_numeric(work["RSI"], errors="coerce")
+    work["Hour_JST"] = pd.to_numeric(work["Hour_JST"], errors="coerce")
+
+    work["LTF_Aligned"] = work["LTF_Aligned"].apply(_normalize_bool01)
+    work["FR_Available"] = work["FR_Available"].apply(_normalize_bool01)
+    work["VolConfirmed"] = work["VolConfirmed"].apply(_normalize_bool01)
+
+    mode = work["BTC_Mode_Compat"].astype(str).str.strip().str.upper()
+    work["BTC_Mode_UP"] = np.where(mode == "UP", 1.0, np.where(mode.isin(["RANGE", "DOWN"]), 0.0, np.nan))
+    work["BTC_Mode_RANGE"] = np.where(mode == "RANGE", 1.0, np.where(mode.isin(["UP", "DOWN"]), 0.0, np.nan))
+    work["BTC_Mode_DOWN"] = np.where(mode == "DOWN", 1.0, np.where(mode.isin(["UP", "RANGE"]), 0.0, np.nan))
+
+    X = work[info["feature_columns"]].replace([np.inf, -np.inf], np.nan)
+    y = (work["__winlose__"] == "Win").astype(int).to_numpy()
+
+    blank_mask_any = X.isna().any(axis=1)
+    info["rows_skipped_blank_required"] = int(blank_mask_any.sum())
+
+    X = X[~blank_mask_any].copy()
+    y = y[~blank_mask_any.to_numpy()]
+
+    info["rows_used"] = int(len(X))
+    return X, y, info
+
+
+def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+    """
+    v2_shadow_ai から LONG/SHORT 別の学習用 X, y を作るラッパー。
+    """
+    meta: Dict[str, Any] = {"rows_scanned": 0, "rows_used": 0, "class_balance": {}, "side": str(side).upper()}
+
+    df = get_v2_shadow_ai_data()
+    if df is None or df.empty:
+        raise RuntimeError("v2_shadow_ai is empty")
+
+    if lookback_rows is not None and int(lookback_rows) > 0:
+        df = df.tail(int(lookback_rows)).copy()
+
+    meta["rows_scanned"] = int(len(df))
+
+    X, y, info = _build_training_matrix_from_v2_shadow_ai(df, side)
+
+    meta["rows_used"] = int(len(X))
+    if len(y) > 0:
+        uniq, cnt = np.unique(y, return_counts=True)
+        meta["class_balance"] = {str(int(k)): int(v) for k, v in zip(uniq, cnt)}
+
+    meta["build_info"] = info
+    return X, y, meta
 
 
 def get_v2_done_records(df: pd.DataFrame) -> pd.DataFrame:
@@ -6937,6 +7136,7 @@ def train_process():
       - version: 任意のモデルバージョン名（未指定なら vYYYYMMDD_HHMMSS）
     """
     global ai_model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
+    # 既存処理はそのまま
 
     # 同時実行ガード（run/judge/train）
     if not _run_lock.acquire(blocking=False):
@@ -7009,6 +7209,177 @@ def train_process():
         except RuntimeError:
             # 万一 release 済み or acquire 前なら無視
             pass
+
+
+def _train_v2_side_process(side: str):
+    """
+    v2_shadow_ai から LONG / SHORT 別に学習する。
+    URL例:
+      /train_v2_long?lookback=20000&min_samples=80&hot_reload=1&upload=1
+      /train_v2_short?lookback=20000&min_samples=80&hot_reload=1&upload=1
+    """
+    global ai_model_long, ai_model_short
+    global AI_MODEL_VERSION_RUNTIME_LONG, AI_MODEL_SOURCE_RUNTIME_LONG
+    global AI_MODEL_VERSION_RUNTIME_SHORT, AI_MODEL_SOURCE_RUNTIME_SHORT
+
+    side_u = str(side or "").strip().upper()
+    if side_u not in {"LONG", "SHORT"}:
+        return jsonify({"ok": False, "error": f"invalid side: {side}", "version": VERSION}), 400
+
+    if not TRAIN_ENABLED:
+        return jsonify({"ok": False, "error": "TRAIN_ENABLED=0", "version": VERSION}), 400
+
+    if not SKLEARN_OK:
+        return jsonify({"ok": False, "error": "scikit-learn unavailable", "version": VERSION}), 500
+
+    if not _run_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Busy (run/judge/train already in progress).", "version": VERSION}), 409
+
+    mutex_token = ""
+    try:
+        ok, msg = self_heal_prerequisites()
+        if not ok:
+            return jsonify({"ok": False, "error": f"preflight failed: {msg}", "version": VERSION}), 500
+
+        lock_ok, mutex_token = acquire_run_mutex()
+        if not lock_ok:
+            return jsonify({"ok": False, "error": "Busy (distributed mutex locked).", "version": VERSION}), 409
+
+        lookback = int(float(request.args.get("lookback", str(TRAIN_V2_LOOKBACK_ROWS))))
+        default_min_samples = TRAIN_V2_LONG_MIN_SAMPLES if side_u == "LONG" else TRAIN_V2_SHORT_MIN_SAMPLES
+        min_samples = int(float(request.args.get("min_samples", str(default_min_samples))))
+        hot_reload = str(request.args.get("hot_reload", "1")).strip() == "1"
+        upload = str(request.args.get("upload", "1")).strip() == "1"
+        out_version = str(request.args.get("version", "")).strip()
+
+        X, y, info = _build_training_dataset_from_v2_shadow_ai(side_u, lookback)
+
+        n = int(len(y))
+        if n < int(min_samples):
+            return jsonify({
+                "ok": False,
+                "error": f"not enough labeled samples: {n} < {min_samples}",
+                "version": VERSION,
+                "info": info,
+            }), 400
+
+        uniq = sorted(set(int(v) for v in np.unique(y)))
+        if uniq != [0, 1]:
+            return jsonify({
+                "ok": False,
+                "error": f"need both classes 0/1, got {uniq}",
+                "version": VERSION,
+                "info": info,
+            }), 400
+
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=float(TRAIN_TEST_SIZE),
+            random_state=int(TRAIN_RANDOM_STATE),
+            stratify=y,
+        )
+
+        model = LogisticRegression(class_weight="balanced", solver="liblinear")
+        model.fit(X_tr, y_tr)
+
+        y_pred = model.predict(X_te)
+        acc = float(accuracy_score(y_te, y_pred)) if accuracy_score is not None else None
+
+        auc = None
+        try:
+            proba = model.predict_proba(X_te)[:, 1]
+            auc = float(roc_auc_score(y_te, proba)) if roc_auc_score is not None else None
+        except Exception:
+            auc = None
+
+        ts_ver_raw = out_version if out_version else datetime.now(JST).strftime(f"v2_{side_u.lower()}_%Y%m%d_%H%M%S")
+        ts_ver = _sanitize_version_tag(ts_ver_raw) or datetime.now(JST).strftime(f"v2_{side_u.lower()}_%Y%m%d_%H%M%S")
+
+        tmp_local = f"/tmp/{side_u.lower()}_model_{ts_ver}.pkl"
+        try:
+            joblib.dump(model, tmp_local)
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"joblib.dump failed: {e}", "version": VERSION}), 500
+
+        out_uri = ""
+        if upload:
+            out_uri = _build_train_output_uri_for_side(side_u, ts_ver)
+            if not out_uri:
+                return jsonify({
+                    "ok": False,
+                    "error": "cannot determine GCS output uri for side model",
+                    "version": VERSION,
+                }), 500
+
+            ok_up, up_msg = _gcs_upload_from(tmp_local, out_uri)
+            if not ok_up:
+                return jsonify({
+                    "ok": False,
+                    "error": f"GCS upload failed: {out_uri} ({up_msg})",
+                    "version": VERSION,
+                }), 500
+
+        reloaded = False
+        if hot_reload:
+            try:
+                if side_u == "LONG":
+                    ai_model_long = model
+                    AI_MODEL_VERSION_RUNTIME_LONG = ts_ver
+                    AI_MODEL_SOURCE_RUNTIME_LONG = "trained_v2_long" if upload else "trained_v2_long(no-upload)"
+                else:
+                    ai_model_short = model
+                    AI_MODEL_VERSION_RUNTIME_SHORT = ts_ver
+                    AI_MODEL_SOURCE_RUNTIME_SHORT = "trained_v2_short" if upload else "trained_v2_short(no-upload)"
+                reloaded = True
+            except Exception as e:
+                print(f"[TRAIN_V2_{side_u}] hot_reload failed: {e}")
+                reloaded = False
+
+        next_env_vars = {}
+        if upload and side_u == "LONG":
+            next_env_vars = {"LONG_MODEL_VERSION": ts_ver, "LONG_MODEL_GCS_URI": out_uri}
+        elif upload and side_u == "SHORT":
+            next_env_vars = {"SHORT_MODEL_VERSION": ts_ver, "SHORT_MODEL_GCS_URI": out_uri}
+
+        return jsonify({
+            "ok": True,
+            "version": VERSION,
+            "side": side_u,
+            "trained_samples": n,
+            "metrics": {"accuracy": acc, "auc": auc},
+            "info": info,
+            "new_model": {
+                "model_version_suggest": ts_ver,
+                "model_gcs_uri": out_uri,
+                "uploaded": bool(upload),
+                "hot_reloaded_in_this_instance": bool(reloaded),
+            },
+            "next_env_vars": next_env_vars,
+        }), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "version": VERSION, "side": side_u}), 500
+    finally:
+        if mutex_token:
+            try:
+                release_run_mutex(mutex_token)
+            except Exception as e:
+                print(f"[WARN] /train_v2_{side_u.lower()} release_run_mutex failed: {type(e).__name__}: {e}")
+        try:
+            _run_lock.release()
+        except RuntimeError:
+            pass
+
+
+@app.route("/train_v2_long", methods=["GET", "POST"])
+def train_v2_long_process():
+    return _train_v2_side_process("LONG")
+
+
+@app.route("/train_v2_short", methods=["GET", "POST"])
+def train_v2_short_process():
+    return _train_v2_side_process("SHORT")
 
 
 @app.route("/label_market", methods=["GET", "POST"])
