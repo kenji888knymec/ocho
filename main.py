@@ -3853,45 +3853,55 @@ def _get_long_sig_hour(sig: Dict[str, Any]):
     return None
 
 
-def _assess_long_ai_bad_regime(sig: Dict[str, Any]) -> str:
+def _assess_long_ai_bad_regime(sig: Dict[str, Any]) -> Dict[str, Any]:
     """
     4条件をカウントして bad-regime を判定。
       - is_up_mode  : btc_mode_compat == "UP"
       - is_bad_hour : hour in V2_LONG_AI_BADREGIME_HOURS set
       - p2_weak     : p2_score <= V2_LONG_AI_BADREGIME_P2_MAX
       - p3_weak     : p3_score <= V2_LONG_AI_BADREGIME_P3_MAX
-    hits >= STOP_HITS  → "STOP"
-    hits >= CAUTION_HITS → "CAUTION"
-    それ以外 → ""
+    hits >= STOP_HITS    → mode="STOP"
+    hits >= CAUTION_HITS → mode="CAUTION"
+    それ以外             → mode="NORMAL"
+    戻り値: {"mode": str, "hit_count": int, "tags": list, "note": str}
     """
     if not V2_LONG_AI_BADREGIME_ENABLE:
-        return ""
+        return {"mode": "NORMAL", "hit_count": 0, "tags": [], "note": "disabled"}
 
     hits = 0
+    tags = []
 
     btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     if btc_mode == "UP":
         hits += 1
+        tags.append("up_mode")
 
     hour = _get_long_sig_hour(sig)
     if hour is not None:
         bad_hours = _parse_hour_csv_to_set(V2_LONG_AI_BADREGIME_HOURS)
         if hour in bad_hours:
             hits += 1
+            tags.append(f"bad_hour:{hour}")
 
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     if np.isfinite(p2) and p2 <= V2_LONG_AI_BADREGIME_P2_MAX:
         hits += 1
+        tags.append(f"p2_weak:{p2:.4f}")
 
     p3 = _safe_float_or_nan(sig.get("p3_score"))
     if np.isfinite(p3) and p3 <= V2_LONG_AI_BADREGIME_P3_MAX:
         hits += 1
+        tags.append(f"p3_weak:{p3:.4f}")
 
     if hits >= V2_LONG_AI_BADREGIME_STOP_HITS:
-        return "STOP"
-    if hits >= V2_LONG_AI_BADREGIME_CAUTION_HITS:
-        return "CAUTION"
-    return ""
+        mode = "STOP"
+    elif hits >= V2_LONG_AI_BADREGIME_CAUTION_HITS:
+        mode = "CAUTION"
+    else:
+        mode = "NORMAL"
+
+    note = f"hits={hits};stop_th={V2_LONG_AI_BADREGIME_STOP_HITS};caution_th={V2_LONG_AI_BADREGIME_CAUTION_HITS}"
+    return {"mode": mode, "hit_count": hits, "tags": tags, "note": note}
 
 
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4145,35 +4155,83 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 continue
 
-            # bad-regime veto / caution
-            if V2_LONG_AI_BADREGIME_ENABLE:
-                regime_mode = _assess_long_ai_bad_regime(sig)
-                sig["_long_bad_regime_mode"] = regime_mode
-                if regime_mode == "STOP":
-                    sig["ai_prob_win"] = round(qs, 6)
-                    sig["ai_pass"] = "0"
-                    sig["ai_band"] = "LONG_BADREGIME_VETO"
-                    sig["ai_model_version"] = "LONG_QS_v2"
-                    sig["ai_model_type"] = "LONG_RULE_RANK"
-                    sig["ai_note"] = (
-                        f"REJECTED:bad_regime_veto;"
-                        f"qs={qs:.4f};"
-                        f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
-                        f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
-                        f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
-                        f"btc_mode={sig.get('btc_mode_compat', '')};"
-                        f"rescued_p1={rescued_p1};"
-                        f"research_tags={research_note}"
-                    )
-                    output.append(sig)
-                    print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason=bad_regime_veto")
-                    continue
-                elif regime_mode == "CAUTION":
-                    qs = max(qs - V2_LONG_AI_BADREGIME_CAUTION_PENALTY, 0.0)
-            else:
-                sig["_long_bad_regime_mode"] = ""
+            bad_regime = _assess_long_ai_bad_regime(sig)
+            sig["_long_bad_regime_mode"] = str(bad_regime.get("mode", "NORMAL") or "NORMAL").upper()
+            sig["_long_bad_regime_hits"] = int(bad_regime.get("hit_count", 0) or 0)
+            sig["_long_bad_regime_tags"] = list(bad_regime.get("tags", []) or [])
+
+            bad_tags_text = "|".join(str(x) for x in sig["_long_bad_regime_tags"]) if sig["_long_bad_regime_tags"] else "none"
+            bad_regime_note = (
+                f"bad_mode={sig['_long_bad_regime_mode']};"
+                f"bad_hits={sig['_long_bad_regime_hits']};"
+                f"bad_tags={bad_tags_text};"
+                f"bad_note={bad_regime.get('note', '')}"
+            )
+
+            print(
+                f"[V2-LONG-BADREGIME] sym={sig.get('symbol')} "
+                f"mode={sig['_long_bad_regime_mode']} "
+                f"hits={sig['_long_bad_regime_hits']} "
+                f"tags={bad_tags_text} "
+                f"btc_mode={sig.get('btc_mode_compat', '')} "
+                f"hour={sig.get('hour', '')} "
+                f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')} "
+                f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')}"
+            )
+
+            if sig["_long_bad_regime_mode"] == "STOP":
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "LONG_QS_v2"
+                sig["ai_model_type"] = "LONG_RULE_RANK"
+                sig["ai_note"] = (
+                    f"REJECTED:bad_regime_stop;"
+                    f"{bad_regime_note};"
+                    f"qs={qs:.4f};"
+                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                    f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
+                    f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
+                    f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
+                    f"btc_mode={sig.get('btc_mode_compat', '')};"
+                    f"hour={sig.get('hour', '')};"
+                    f"rsi={sig.get('rsi', '')};"
+                    f"rescued_p1={rescued_p1};"
+                    f"research_tags={research_note}"
+                )
+                output.append(sig)
+                print(
+                    f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
+                    f"reason=bad_regime_stop;{bad_regime_note}"
+                )
+                continue
 
             ai_res = _predict_v2_ai_score(sig, "LONG", qs)
+
+            if sig["_long_bad_regime_mode"] == "CAUTION":
+                caution_penalty = float(V2_LONG_AI_BADREGIME_CAUTION_PENALTY)
+                caution_note = (
+                    f"{bad_regime_note};"
+                    f"bad_penalty={caution_penalty:.4f}"
+                )
+
+                if np.isfinite(float(ai_res.get("score", np.nan))) and bool(ai_res.get("ok")):
+                    raw_score_before_penalty = float(ai_res["score"])
+                    penalized_score = max(0.0, raw_score_before_penalty - caution_penalty)
+                    ai_res["score"] = float(penalized_score)
+                    ai_res["note"] = (
+                        f"{ai_res.get('note', '')};"
+                        f"{caution_note};"
+                        f"raw_before_penalty={raw_score_before_penalty:.6f}"
+                    )
+
+                    if penalized_score < float(V2_LONG_AI_MIN):
+                        ai_res["ok"] = False
+                        ai_res["note"] = f"{ai_res.get('note', '')};bad_regime_caution_below_min"
+                else:
+                    ai_res["note"] = f"{ai_res.get('note', '')};{caution_note};penalty_not_applied"
+            else:
+                ai_res["note"] = f"{ai_res.get('note', '')};{bad_regime_note}"
 
             if not bool(ai_res.get("ok")):
                 ai_score = ai_res.get("score", np.nan)
@@ -4186,16 +4244,20 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"REJECTED:{ai_res.get('note', 'ai_reject')};"
                     f"qs={qs:.4f};"
                     f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
-                    f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                    f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
                     f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
                     f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
                     f"btc_mode={sig.get('btc_mode_compat', '')};"
+                    f"hour={sig.get('hour', '')};"
                     f"rsi={sig.get('rsi', '')};"
                     f"rescued_p1={rescued_p1};"
                     f"research_tags={research_note}"
                 )
                 output.append(sig)
-                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={ai_res.get('note', 'ai_reject')}")
+                print(
+                    f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
+                    f"reason={ai_res.get('note', 'ai_reject')}"
+                )
                 continue
 
             ai_score = float(ai_res["score"])
@@ -4208,13 +4270,21 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"{ai_res.get('note', '')};"
                 f"qs={qs:.4f};"
                 f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
-                f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
+                f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
                 f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
                 f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
                 f"btc_mode={sig.get('btc_mode_compat', '')};"
+                f"hour={sig.get('hour', '')};"
                 f"rsi={sig.get('rsi', '')};"
                 f"rescued_p1={rescued_p1};"
                 f"research_tags={research_note}"
+            )
+
+            print(
+                f"[V2-LONG-AI] sym={sig.get('symbol')} "
+                f"ai_prob_win={sig.get('ai_prob_win', '')} "
+                f"band={sig.get('ai_band', '')} "
+                f"{bad_regime_note}"
             )
 
             long_passed.append(sig)
