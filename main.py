@@ -2548,6 +2548,15 @@ V2_LONG_REJECT_MODE_DOWN   = str(os.environ.get("V2_LONG_REJECT_MODE_DOWN", "1")
 V2_LONG_DEF_RSI_HARD_MAX   = _env_float("V2_LONG_DEF_RSI_HARD_MAX", 55.0)
 V2_LONG_DEF_P1_HARD_MAX    = _env_float("V2_LONG_DEF_P1_HARD_MAX", 2.5)
 
+# --- LONG AI bad-regime veto / caution ---
+V2_LONG_AI_BADREGIME_ENABLE           = str(os.environ.get("V2_LONG_AI_BADREGIME_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_AI_BADREGIME_HOURS            = os.environ.get("V2_LONG_AI_BADREGIME_HOURS", "23,1,2,4")
+V2_LONG_AI_BADREGIME_P2_MAX           = _env_float("V2_LONG_AI_BADREGIME_P2_MAX", 0.0)
+V2_LONG_AI_BADREGIME_P3_MAX           = _env_float("V2_LONG_AI_BADREGIME_P3_MAX", 0.0)
+V2_LONG_AI_BADREGIME_STOP_HITS        = int(float(os.environ.get("V2_LONG_AI_BADREGIME_STOP_HITS", "4")))
+V2_LONG_AI_BADREGIME_CAUTION_HITS     = int(float(os.environ.get("V2_LONG_AI_BADREGIME_CAUTION_HITS", "3")))
+V2_LONG_AI_BADREGIME_CAUTION_PENALTY  = _env_float("V2_LONG_AI_BADREGIME_CAUTION_PENALTY", 0.08)
+
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
 
@@ -3695,12 +3704,13 @@ def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> pd.DataFrame:
 
 def _v2_rank_selected_band(sig: Dict[str, Any]) -> str:
     mt = str(sig.get("ai_model_type", "") or "").strip().upper()
+    regime = str(sig.get("_long_bad_regime_mode", "") or "").strip().upper()
     if mt == "LONG_AI":
-        return "LONG_AI_RANK"
+        return "LONG_AI_CAUTION_RANK" if regime == "CAUTION" else "LONG_AI_RANK"
     if mt == "SHORT_AI":
         return "SHORT_AI_RANK"
     if mt == "LONG_AI_FALLBACK":
-        return "LONG_AI_FALLBACK_RANK"
+        return "LONG_AI_CAUTION_FALLBACK_RANK" if regime == "CAUTION" else "LONG_AI_FALLBACK_RANK"
     if mt == "SHORT_AI_FALLBACK":
         return "SHORT_AI_FALLBACK_RANK"
     return "RULE_QS"
@@ -3820,6 +3830,68 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
 
         base["note"] = f"ai_parse_failed err={type(e).__name__}:{e}"
         return base
+
+
+def _parse_hour_csv_to_set(csv_str: str) -> set:
+    """'23,1,2,4' → {23, 1, 2, 4}"""
+    result = set()
+    for tok in str(csv_str or "").split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                result.add(int(float(tok)))
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
+def _get_long_sig_hour(sig: Dict[str, Any]):
+    """sigからJST時刻(int)を取得。取得できない場合はNone。"""
+    h = _v2_sig_hour(sig)
+    if np.isfinite(h):
+        return int(h)
+    return None
+
+
+def _assess_long_ai_bad_regime(sig: Dict[str, Any]) -> str:
+    """
+    4条件をカウントして bad-regime を判定。
+      - is_up_mode  : btc_mode_compat == "UP"
+      - is_bad_hour : hour in V2_LONG_AI_BADREGIME_HOURS set
+      - p2_weak     : p2_score <= V2_LONG_AI_BADREGIME_P2_MAX
+      - p3_weak     : p3_score <= V2_LONG_AI_BADREGIME_P3_MAX
+    hits >= STOP_HITS  → "STOP"
+    hits >= CAUTION_HITS → "CAUTION"
+    それ以外 → ""
+    """
+    if not V2_LONG_AI_BADREGIME_ENABLE:
+        return ""
+
+    hits = 0
+
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    if btc_mode == "UP":
+        hits += 1
+
+    hour = _get_long_sig_hour(sig)
+    if hour is not None:
+        bad_hours = _parse_hour_csv_to_set(V2_LONG_AI_BADREGIME_HOURS)
+        if hour in bad_hours:
+            hits += 1
+
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    if np.isfinite(p2) and p2 <= V2_LONG_AI_BADREGIME_P2_MAX:
+        hits += 1
+
+    p3 = _safe_float_or_nan(sig.get("p3_score"))
+    if np.isfinite(p3) and p3 <= V2_LONG_AI_BADREGIME_P3_MAX:
+        hits += 1
+
+    if hits >= V2_LONG_AI_BADREGIME_STOP_HITS:
+        return "STOP"
+    if hits >= V2_LONG_AI_BADREGIME_CAUTION_HITS:
+        return "CAUTION"
+    return ""
 
 
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4072,6 +4144,34 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"reason=qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
                 )
                 continue
+
+            # bad-regime veto / caution
+            if V2_LONG_AI_BADREGIME_ENABLE:
+                regime_mode = _assess_long_ai_bad_regime(sig)
+                sig["_long_bad_regime_mode"] = regime_mode
+                if regime_mode == "STOP":
+                    sig["ai_prob_win"] = round(qs, 6)
+                    sig["ai_pass"] = "0"
+                    sig["ai_band"] = "LONG_BADREGIME_VETO"
+                    sig["ai_model_version"] = "LONG_QS_v2"
+                    sig["ai_model_type"] = "LONG_RULE_RANK"
+                    sig["ai_note"] = (
+                        f"REJECTED:bad_regime_veto;"
+                        f"qs={qs:.4f};"
+                        f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                        f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
+                        f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
+                        f"btc_mode={sig.get('btc_mode_compat', '')};"
+                        f"rescued_p1={rescued_p1};"
+                        f"research_tags={research_note}"
+                    )
+                    output.append(sig)
+                    print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason=bad_regime_veto")
+                    continue
+                elif regime_mode == "CAUTION":
+                    qs = max(qs - V2_LONG_AI_BADREGIME_CAUTION_PENALTY, 0.0)
+            else:
+                sig["_long_bad_regime_mode"] = ""
 
             ai_res = _predict_v2_ai_score(sig, "LONG", qs)
 
