@@ -2500,6 +2500,19 @@ V2_SHORT_BRAKE_RECOVER_WINRATE = _env_float("V2_SHORT_BRAKE_RECOVER_WINRATE", 55
 V2_SHORT_BRAKE_RECOVER_AVGPNL  = _env_float("V2_SHORT_BRAKE_RECOVER_AVGPNL", 0.05)
 V2_SHORT_BRAKE_PROBE_TOP_N     = int(float(os.environ.get("V2_SHORT_BRAKE_PROBE_TOP_N", "1")))
 
+# --- V2 LONG Brake / Recovery ---
+V2_LONG_BRAKE_ENABLE          = str(os.environ.get("V2_LONG_BRAKE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_BRAKE_LOOKBACK_SLOTS  = int(float(os.environ.get("V2_LONG_BRAKE_LOOKBACK_SLOTS", "2")))
+V2_LONG_BRAKE_MIN_SLOTS       = int(float(os.environ.get("V2_LONG_BRAKE_MIN_SLOTS", "2")))
+V2_LONG_BRAKE_MIN_DONE        = int(float(os.environ.get("V2_LONG_BRAKE_MIN_DONE", "10")))
+V2_LONG_BRAKE_STOP_WINRATE    = _env_float("V2_LONG_BRAKE_STOP_WINRATE", 20.0)
+V2_LONG_BRAKE_STOP_AVGPNL     = _env_float("V2_LONG_BRAKE_STOP_AVGPNL", -0.30)
+V2_LONG_BRAKE_CAUTION_WINRATE = _env_float("V2_LONG_BRAKE_CAUTION_WINRATE", 35.0)
+V2_LONG_BRAKE_CAUTION_AVGPNL  = _env_float("V2_LONG_BRAKE_CAUTION_AVGPNL", -0.10)
+V2_LONG_BRAKE_RECOVER_WINRATE = _env_float("V2_LONG_BRAKE_RECOVER_WINRATE", 50.0)
+V2_LONG_BRAKE_RECOVER_AVGPNL  = _env_float("V2_LONG_BRAKE_RECOVER_AVGPNL", 0.00)
+V2_LONG_BRAKE_PROBE_TOP_N     = int(float(os.environ.get("V2_LONG_BRAKE_PROBE_TOP_N", "1")))
+
 # --- V2 LONG Selection Pipeline ---
 V2_LONG_DEF_ENABLE         = str(os.environ.get("V2_LONG_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_DEF_P1_MIN         = _env_float("V2_LONG_DEF_P1_MIN", 2.0)
@@ -3812,8 +3825,11 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     LONG候補を ai_prob_win 降順に並べる。
-    - LONG AI が入っていれば ai_prob_win は AI確率
-    - bypass/fallback のときは RULE fallback の値
+    追加仕様:
+    - v2_shadow_ai の直近 LONG / DONE 実績からブレーキ状態を判定する
+    - NORMAL  : 通常の TOP_N
+    - CAUTION : TOP_N を probe 値まで絞る
+    - STOP    : 通知は止めるが、上位 probe 件だけ観測用に残す
     """
     if not long_signals:
         return []
@@ -3824,36 +3840,97 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
         reverse=True,
     )
 
-    if not V2_LONG_RANK_ENABLE:
+    base_top_n = max(1, int(V2_LONG_RANK_TOP_N))
+    probe_top_n = max(1, int(V2_LONG_BRAKE_PROBE_TOP_N))
+    brake = get_v2_long_brake_state(datetime.now(JST))
+    brake_mode = str(brake.get("mode", "NORMAL") or "NORMAL").upper()
+
+    if brake_mode == "STOP":
+        effective_top_n = 0
+        observe_top_n = probe_top_n
+    elif brake_mode == "CAUTION":
+        effective_top_n = max(1, int(brake.get("effective_top_n", probe_top_n) or probe_top_n))
+        observe_top_n = effective_top_n
+    else:
+        effective_top_n = base_top_n
+        observe_top_n = effective_top_n
+
+    wr = brake.get("wr", float("nan"))
+    avg_pnl = brake.get("avg_pnl", float("nan"))
+    wr_str = "nan" if pd.isna(wr) else f"{float(wr):.1f}"
+    pnl_str = "nan" if pd.isna(avg_pnl) else f"{float(avg_pnl):+.4f}"
+    slot_list = "|".join(brake.get("slots", []) or [])
+
+    print(
+        f"[V2-LONG-BRAKE] mode={brake_mode} "
+        f"base_top_n={base_top_n} effective_top_n={effective_top_n} observe_top_n={observe_top_n} "
+        f"n={int(brake.get('n', 0) or 0)} slots={int(brake.get('slot_count', 0) or 0)} "
+        f"wr={wr_str} avg_pnl={pnl_str} reason={brake.get('reason', '')} "
+        f"slot_list={slot_list}"
+    )
+
+    if (not V2_LONG_RANK_ENABLE) and brake_mode == "NORMAL":
         for rank_idx, sig in enumerate(ranked, start=1):
             slot_total = len(ranked)
-            sig["ai_pass"] = "1"
-            sig["ai_band"] = _v2_rank_selected_band(sig)
             current_note = str(sig.get("ai_note", "") or "")
+            sig["ai_band"] = "RULE_QS_NO_RANK"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n=ALL;selected=true;rank_disabled=true"
+                f"top_n=ALL;selected=true;rank_disabled=true;"
+                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
+                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
+                f"brake_reason={brake.get('reason', '')}"
             )
         return ranked
 
-    top_n = max(1, int(V2_LONG_RANK_TOP_N))
     slot_total = len(ranked)
 
     for rank_idx, sig in enumerate(ranked, start=1):
         current_note = str(sig.get("ai_note", "") or "")
-        if rank_idx <= top_n:
-            sig["ai_pass"] = "1"
-            sig["ai_band"] = _v2_rank_selected_band(sig)
+
+        if brake_mode == "STOP":
+            sig["ai_pass"] = "0"
+            if rank_idx <= observe_top_n:
+                sig["ai_band"] = "LONG_BRAKE_PROBE"
+                reject_reason = "long_brake_probe"
+            else:
+                sig["ai_band"] = "LONG_BRAKE_STOP"
+                reject_reason = "long_brake_stop"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={top_n};selected=true"
+                f"top_n={effective_top_n};probe_top_n={observe_top_n};selected=false;reason={reject_reason};"
+                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
+                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
+                f"brake_reason={brake.get('reason', '')}"
+            )
+            continue
+
+        if rank_idx <= effective_top_n:
+            sig["ai_pass"] = "1"
+            current_band = str(sig.get("ai_band", "") or "").strip().upper()
+            if current_band in {"", "RULE_QS", "AI_RANK", "AI_FALLBACK_RANK"}:
+                sig["ai_band"] = current_band if current_band else "RULE_QS"
+            sig["ai_note"] = (
+                f"{current_note};rank={rank_idx};slot_total={slot_total};"
+                f"top_n={effective_top_n};selected=true;"
+                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
+                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
+                f"brake_reason={brake.get('reason', '')}"
             )
         else:
             sig["ai_pass"] = "0"
-            sig["ai_band"] = _v2_rank_reject_band(sig)
+            if brake_mode == "CAUTION":
+                sig["ai_band"] = "LONG_BRAKE_CAUTION"
+                reject_reason = "long_brake_caution"
+            else:
+                sig["ai_band"] = "RANK_REJECT"
+                reject_reason = "rank_exceeded"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={top_n};selected=false;reason=rank_exceeded"
+                f"top_n={effective_top_n};selected=false;reason={reject_reason};"
+                f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
+                f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
+                f"brake_reason={brake.get('reason', '')}"
             )
 
     return ranked
@@ -4370,15 +4447,16 @@ def _prepare_v2_short_done_for_brake(df: pd.DataFrame) -> pd.DataFrame:
     SHORTブレーキ判定に使う観測対象だけを取り出して
     Datetime_JST × Symbol × Direction の最後の行に正規化する。
     観測対象:
+      - SHORT_AI_RANK
+      - SHORT_AI_FALLBACK_RANK
+      - SHORT_BRAKE_PROBE
       - RULE_QS
-      - RULE_QS_CAUTION
-      - BRAKE_PROBE
       - RULE_QS_NO_RANK
     除外:
-      - RANK_REJECT
+      - SHORT_AI_RANK_REJECT
       - REJECTED
-      - BRAKE_STOP
-      - BRAKE_CAUTION
+      - SHORT_BRAKE_STOP
+      - SHORT_BRAKE_CAUTION
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -4398,9 +4476,10 @@ def _prepare_v2_short_done_for_brake(df: pd.DataFrame) -> pd.DataFrame:
     work["AI_Band"] = work["AI_Band"].astype(str).str.strip().str.upper()
     work["AI_Model_Version"] = work["AI_Model_Version"].astype(str).str.strip()
     observe_bands = {
+        "SHORT_AI_RANK",
+        "SHORT_AI_FALLBACK_RANK",
+        "SHORT_BRAKE_PROBE",
         "RULE_QS",
-        "RULE_QS_CAUTION",
-        "BRAKE_PROBE",
         "RULE_QS_NO_RANK",
     }
     work = work[
@@ -4526,6 +4605,184 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
             "reason": f"brake_eval_error:{type(e).__name__}",
             "slots": [],
         }
+
+
+def _prepare_v2_long_done_for_brake(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    v2_shadow_ai 全件から、LONG / DONE のうち
+    LONGブレーキ判定に使う観測対象だけを取り出して
+    Datetime_JST × Symbol × Direction の最後の行に正規化する。
+    観測対象:
+      - LONG_AI_RANK
+      - LONG_AI_FALLBACK_RANK
+      - LONG_BRAKE_PROBE
+      - RULE_QS
+      - RULE_QS_NO_RANK
+    除外:
+      - LONG_AI_RANK_REJECT
+      - REJECTED
+      - LONG_BRAKE_STOP
+      - LONG_BRAKE_CAUTION
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    need_cols = {
+        "Datetime_JST", "Symbol", "Direction", "EvalStatus",
+        "PnL_Pct", "WinLose", "AI_Band", "AI_Model_Version"
+    }
+    if not need_cols.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["_row_order"] = np.arange(len(work))
+    work["Datetime_JST"] = _series_to_jst_naive(work["Datetime_JST"])
+    if "ExitTime" in work.columns:
+        work["ExitTime"] = _series_to_jst_naive(work["ExitTime"])
+
+    work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+    work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+    work["AI_Band"] = work["AI_Band"].astype(str).str.strip().str.upper()
+    work["AI_Model_Version"] = work["AI_Model_Version"].astype(str).str.strip()
+
+    observe_bands = {
+        "LONG_AI_RANK",
+        "LONG_AI_FALLBACK_RANK",
+        "LONG_BRAKE_PROBE",
+        "RULE_QS",
+        "RULE_QS_NO_RANK",
+    }
+
+    work = work[
+        (work["Direction"] == "LONG") &
+        (work["EvalStatus"] == "DONE") &
+        (work["AI_Model_Version"] != "") &
+        (work["AI_Band"].isin(observe_bands))
+    ].copy()
+
+    if work.empty:
+        return work
+
+    work = work.sort_values("_row_order").drop_duplicates(
+        subset=["Datetime_JST", "Symbol", "Direction"],
+        keep="last",
+    )
+
+    work["_pnl"] = pd.to_numeric(
+        work["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    wl = work["WinLose"].astype(str).str.strip().str.lower()
+    work["_win"] = wl.isin(["win", "w", "1", "true"])
+    work["_lose"] = wl.isin(["lose", "l", "0", "false"])
+    work = work[work["Datetime_JST"].notna()].copy()
+    return work
+
+
+def get_v2_long_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    v2_shadow_ai の最近の LONG / DONE 実績から、LONG のブレーキ状態を返す。
+    mode:
+      - NORMAL  : 通常運転
+      - CAUTION : TOP_N を絞る（probe 運転）
+      - STOP    : 今回の LONG 選抜は停止し、記録だけ残す
+    """
+    base_top_n = max(1, int(V2_LONG_RANK_TOP_N))
+    probe_top_n = max(1, int(V2_LONG_BRAKE_PROBE_TOP_N))
+
+    default_state = {
+        "enabled": bool(V2_LONG_BRAKE_ENABLE),
+        "mode": "NORMAL",
+        "base_top_n": base_top_n,
+        "effective_top_n": base_top_n,
+        "n": 0,
+        "slot_count": 0,
+        "wr": float("nan"),
+        "avg_pnl": float("nan"),
+        "reason": "brake_disabled" if not V2_LONG_BRAKE_ENABLE else "insufficient_done_data",
+        "slots": [],
+    }
+
+    if not V2_LONG_BRAKE_ENABLE:
+        return default_state
+
+    if now_jst is None:
+        now_jst = datetime.now(JST)
+
+    try:
+        current_slot = pd.Timestamp(now_jst.astimezone(JST).replace(tzinfo=None)).floor("15min")
+        df = get_v2_shadow_ai_data()
+        done = _prepare_v2_long_done_for_brake(df)
+
+        if done.empty:
+            return default_state
+
+        done = done[done["Datetime_JST"] < current_slot].copy()
+        if done.empty:
+            return default_state
+
+        unique_slots = sorted(done["Datetime_JST"].dropna().unique())
+        lookback_slots = max(1, int(V2_LONG_BRAKE_LOOKBACK_SLOTS))
+        slots = unique_slots[-lookback_slots:]
+        sample = done[done["Datetime_JST"].isin(slots)].copy()
+
+        slot_count = len(slots)
+        n = len(sample)
+
+        if slot_count < max(1, int(V2_LONG_BRAKE_MIN_SLOTS)) or n < max(1, int(V2_LONG_BRAKE_MIN_DONE)):
+            state = dict(default_state)
+            state["n"] = n
+            state["slot_count"] = slot_count
+            state["reason"] = "insufficient_done_data"
+            state["slots"] = [pd.Timestamp(s).strftime("%Y-%m-%d %H:%M") for s in slots]
+            return state
+
+        wins = int(sample["_win"].sum())
+        losses = int(sample["_lose"].sum())
+        wr = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else float("nan")
+        avg_pnl = float(sample["_pnl"].mean()) if n > 0 else float("nan")
+
+        stop_wr = float(V2_LONG_BRAKE_STOP_WINRATE)
+        stop_pnl = float(V2_LONG_BRAKE_STOP_AVGPNL)
+        caution_wr = float(V2_LONG_BRAKE_CAUTION_WINRATE)
+        caution_pnl = float(V2_LONG_BRAKE_CAUTION_AVGPNL)
+        recover_wr = float(V2_LONG_BRAKE_RECOVER_WINRATE)
+        recover_pnl = float(V2_LONG_BRAKE_RECOVER_AVGPNL)
+
+        mode = "NORMAL"
+        effective_top_n = base_top_n
+        reason = "normal"
+
+        if (not pd.isna(wr)) and (not pd.isna(avg_pnl)):
+            if (wr <= stop_wr) or (avg_pnl <= stop_pnl):
+                mode = "STOP"
+                effective_top_n = 0
+                reason = "stop_threshold_hit"
+            elif (wr <= caution_wr) or (avg_pnl <= caution_pnl):
+                mode = "CAUTION"
+                effective_top_n = probe_top_n
+                reason = "caution_threshold_hit"
+            elif (wr >= recover_wr) and (avg_pnl >= recover_pnl):
+                mode = "NORMAL"
+                effective_top_n = base_top_n
+                reason = "recovered"
+
+        return {
+            "enabled": True,
+            "mode": mode,
+            "base_top_n": base_top_n,
+            "effective_top_n": int(effective_top_n),
+            "n": int(n),
+            "slot_count": int(slot_count),
+            "wr": float(wr) if not pd.isna(wr) else float("nan"),
+            "avg_pnl": float(avg_pnl) if not pd.isna(avg_pnl) else float("nan"),
+            "reason": reason,
+            "slots": [pd.Timestamp(s).strftime("%Y-%m-%d %H:%M") for s in slots],
+        }
+
+    except Exception as e:
+        state = dict(default_state)
+        state["reason"] = f"exception:{type(e).__name__}"
+        return state
 
 
 def _build_short_selection_report(df_done: pd.DataFrame, now_jst: str) -> str:
