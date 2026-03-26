@@ -4374,12 +4374,57 @@ def v2_ensure_shadow_sheet(svc, spreadsheet_id: str):
 
 
 def v2_write_shadow_rows(rows: List[List[Any]]):
-    """v2_shadow シートに行を追記。"""
+    """v2_shadow シートに行を追記（Datetime_JST + Symbol + Direction で重複排除）。"""
     if not rows:
         return
+
     try:
-        append_rows_to_sheet(V2_SHADOW_SHEET, rows, V2_HEADERS)
-        print(f"[V2] wrote {len(rows)} rows to {V2_SHADOW_SHEET}")
+        # 既存シートの直近キーを拾う（Datetime_JST, Symbol, Direction）
+        existing = set()
+        try:
+            service = get_sheet_service()
+            last_row = _get_row_count_cached(V2_SHADOW_SHEET)
+            if last_row >= 2:
+                start = max(2, last_row - int(DEDUP_LOOKBACK_ROWS) + 1)
+                res = service.spreadsheets().values().get(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{V2_SHADOW_SHEET}!A{start}:C{last_row}",
+                ).execute()
+                vals = res.get("values", []) or []
+                for r in vals:
+                    dt_raw = str(r[0]).strip() if len(r) > 0 else ""
+                    sym = str(r[1]).strip() if len(r) > 1 else ""
+                    direction = str(r[2]).strip().upper() if len(r) > 2 else ""
+                    if not dt_raw or not sym or not direction:
+                        continue
+                    dt_key = normalize_dt_str(dt_raw)
+                    existing.add(f"{sym}|{dt_key}|{direction}")
+        except Exception as e:
+            print(f"[WARN] v2 shadow dedup pre-scan failed: {e}")
+            existing = set()
+
+        # 今回書く分も重複排除（同じバッチ内の重複も除外）
+        filtered: List[List[Any]] = []
+        for row in rows:
+            dt_raw = str(row[0]).strip() if len(row) > 0 else ""
+            sym = str(row[1]).strip() if len(row) > 1 else ""
+            direction = str(row[2]).strip().upper() if len(row) > 2 else ""
+            if not dt_raw or not sym or not direction:
+                continue
+            dt_key = normalize_dt_str(dt_raw)
+            k = f"{sym}|{dt_key}|{direction}"
+            if k in existing:
+                continue
+            existing.add(k)
+            filtered.append(row)
+
+        if not filtered:
+            print(f"[V2] wrote 0 rows to {V2_SHADOW_SHEET} (all deduped)")
+            return
+
+        append_rows_to_sheet(V2_SHADOW_SHEET, filtered, V2_HEADERS)
+        print(f"[V2] wrote {len(filtered)} rows to {V2_SHADOW_SHEET} (deduped)")
+
     except Exception as e:
         print(f"[V2-ERR] shadow write failed: {e}")
 
