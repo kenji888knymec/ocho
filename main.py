@@ -2564,6 +2564,16 @@ V2_LONG_QS_W_MODE          = _env_float("V2_LONG_QS_W_MODE", 0.0)
 V2_LONG_MODE_UP_PENALTY    = _env_float("V2_LONG_MODE_UP_PENALTY", 0.0)
 V2_LONG_MODE_RANGE_BONUS   = _env_float("V2_LONG_MODE_RANGE_BONUS", 0.0)
 V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.0)
+
+# --- LONG raw rescue ---
+V2_LONG_RAW_RESCUE_ENABLE          = str(os.environ.get("V2_LONG_RAW_RESCUE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RAW_RESCUE_ONLY_BTC_LONG   = str(os.environ.get("V2_LONG_RAW_RESCUE_ONLY_BTC_LONG", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RAW_RESCUE_LTF_MIN         = _env_float("V2_LONG_RAW_RESCUE_LTF_MIN", 0.8)
+V2_LONG_RAW_RESCUE_RSI_MAX         = _env_float("V2_LONG_RAW_RESCUE_RSI_MAX", 55.0)
+V2_LONG_RAW_RESCUE_SHORT_HTF_MAX   = _env_float("V2_LONG_RAW_RESCUE_SHORT_HTF_MAX", 0.8)
+
+# --- LONG guard soften in UP ---
+V2_LONG_DEF_REQUIRE_VOLCONF_UP     = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOLCONF_UP", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
 V2_LONG_REJECT_MODE_DOWN   = str(os.environ.get("V2_LONG_REJECT_MODE_DOWN", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_DEF_RSI_HARD_MAX   = _env_float("V2_LONG_DEF_RSI_HARD_MAX", 55.0)
@@ -3081,12 +3091,58 @@ def v2_generate_signal(
 
     # ---- Pillar1: 多時間足トレンド ----
     sym_htf = assess_htf_trend(htf_df)
-    direction = sym_htf["direction"]
+    direction = str(sym_htf.get("direction", "") or "").strip().upper()
+    sym_htf_strength = float(sym_htf.get("strength", 0.0) or 0.0)
+
+    # BTC整合チェック用を先に取る
+    btc_dir = str(btc_htf.get("direction", "NEUTRAL") or "").strip().upper()
+    btc_str = float(btc_htf.get("strength", 0.0) or 0.0)
+
+    # レジーム転換ガード: 方向別。SHORT/LONG の両方を見る。
+    short_regime_conflict = bool((regime_info or {}).get("short_conflict", False))
+    long_regime_conflict = bool((regime_info or {}).get("long_conflict", False))
+
+    # 先に両方向LTF評価を作る
+    ltf_eval_long = assess_ltf_long(ltf_df)
+    ltf_eval_short = assess_ltf_short(ltf_df)
+
+    long_rescue = False
+    long_rescue_reason = ""
+
+    # LONG raw rescue:
+    # HTFがNEUTRALまたは弱いSHORTでも、BTCがLONG寄りでLTF_LONGが十分強ければLONG候補を救う
+    if V2_LONG_RAW_RESCUE_ENABLE:
+        btc_long_ok = (btc_dir == "LONG")
+        if (not V2_LONG_RAW_RESCUE_ONLY_BTC_LONG) or btc_long_ok:
+            ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
+            ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
+
+            weak_short_ok = (
+                direction == "SHORT"
+                and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
+            )
+            neutral_ok = (direction == "NEUTRAL")
+
+            if (
+                (neutral_ok or weak_short_ok)
+                and (not long_regime_conflict)
+                and ltf_long_score >= V2_LONG_RAW_RESCUE_LTF_MIN
+                and np.isfinite(ltf_long_rsi)
+                and ltf_long_rsi <= V2_LONG_RAW_RESCUE_RSI_MAX
+            ):
+                direction = "LONG"
+                long_rescue = True
+                long_rescue_reason = (
+                    f"long_raw_rescue from={sym_htf.get('direction')} "
+                    f"sym_htf_strength={sym_htf_strength:.4f} "
+                    f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
+                    f"ltf_long_score={ltf_long_score:.4f} rsi={ltf_long_rsi:.4f}"
+                )
 
     if direction == "NEUTRAL":
         _v2_reject(
             "sym_htf_neutral",
-            f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf.get('strength')}"
+            f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf_strength}"
         )
         return None
 
@@ -3109,18 +3165,12 @@ def v2_generate_signal(
         return None
 
     # BTC整合チェック
-    btc_dir = btc_htf.get("direction", "NEUTRAL")
-    btc_str = btc_htf.get("strength", 0.0)
     if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= V2_BTC_CONFLICT_STRONG_TH:
         _v2_reject(
             "btc_conflict_block",
             f"direction={direction} btc_dir={btc_dir} btc_str={btc_str} min={V2_BTC_CONFLICT_STRONG_TH}"
         )
         return None
-
-    # レジーム転換ガード: 方向別。SHORT/LONG の両方を見る。
-    short_regime_conflict = bool((regime_info or {}).get("short_conflict", False))
-    long_regime_conflict = bool((regime_info or {}).get("long_conflict", False))
 
     if short_regime_conflict and direction == "SHORT":
         _v2_reject(
@@ -3136,15 +3186,18 @@ def v2_generate_signal(
         )
         return None
 
-    # ★修正2: 方向別LTF評価
+    # 方向別LTF評価
     if direction == "LONG":
-        ltf_eval = assess_ltf_long(ltf_df)
+        ltf_eval = ltf_eval_long
     else:
-        ltf_eval = assess_ltf_short(ltf_df)
+        ltf_eval = ltf_eval_short
 
-    p1_score = sym_htf["strength"] + ltf_eval["score"]
+    p1_score = sym_htf_strength + ltf_eval["score"]
     if btc_dir == direction:
         p1_score += btc_str * 0.5
+
+    if long_rescue:
+        print(f"[V2-LONG-RAW-RESCUE] sym={sym} {long_rescue_reason}")
 
     # ★修正1: Pillar1 必須ゲート
     if p1_score < V2_PILLAR1_MIN:
@@ -3512,7 +3565,8 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "missing_rsi"
 
     if V2_LONG_DEF_REQUIRE_VOLCONF and (not volconf):
-        return False, "vol_not_confirmed"
+        if not (btc_mode_compat == "UP" and (not V2_LONG_DEF_REQUIRE_VOLCONF_UP)):
+            return False, "vol_not_confirmed"
 
     if p1 < V2_LONG_DEF_P1_MIN:
         if _allow_long_p1_rescue(sig):
