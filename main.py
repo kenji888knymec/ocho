@@ -3198,12 +3198,14 @@ def v2_generate_signal(
         return None
 
     # BTC整合チェック
+    # LONG raw rescue で方向を LONG にした場合は、ここで即死させず後段に回す
     if btc_dir != "NEUTRAL" and btc_dir != direction and btc_str >= V2_BTC_CONFLICT_STRONG_TH:
-        _v2_reject(
-            "btc_conflict_block",
-            f"direction={direction} btc_dir={btc_dir} btc_str={btc_str} min={V2_BTC_CONFLICT_STRONG_TH}"
-        )
-        return None
+        if not (direction == "LONG" and long_rescue):
+            _v2_reject(
+                "btc_conflict_block",
+                f"direction={direction} btc_dir={btc_dir} btc_str={btc_str} min={V2_BTC_CONFLICT_STRONG_TH}"
+            )
+            return None
 
     if short_regime_conflict and direction == "SHORT":
         _v2_reject(
