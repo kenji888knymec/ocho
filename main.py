@@ -4675,6 +4675,9 @@ def get_v2_regime_health_snapshot(now_jst: Optional[datetime] = None) -> Dict[st
 
         if V2_REGIME_LOOKBACK_HOURS > 0:
             since = now_jst - timedelta(hours=int(V2_REGIME_LOOKBACK_HOURS))
+            since = pd.Timestamp(since)
+            if since.tzinfo is not None:
+                since = since.tz_localize(None)
             work = work[work["Datetime_JST"] >= since].copy()
 
         if work.empty:
