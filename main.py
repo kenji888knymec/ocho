@@ -3298,6 +3298,7 @@ def v2_generate_signal(
         "btc_mode_compat": btc_mode_compat,
         "time_ms": closed_bar_time_ms,
         "dt": closed_bar_dt,
+        "long_raw_rescue": bool(long_rescue),
     }
 
 
@@ -3580,8 +3581,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
         return False, "range_mode_block"
 
+    long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+
     if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
-        return False, "down_mode_block"
+        if not long_raw_rescue:
+            return False, "down_mode_block"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
