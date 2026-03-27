@@ -3126,16 +3126,36 @@ def v2_generate_signal(
         ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
         ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
 
-        allow_neutral = V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL and (direction == "NEUTRAL")
-        allow_short = (
-            V2_LONG_RAW_RESCUE_ALLOW_SHORT
-            and direction == "SHORT"
+        # いまのHTF判定が弱いSHORT/NEUTRALに倒れていても、
+        # 価格がEMA_Sを上回る・EMA差が小さい場合はLONG救済候補に含める
+        ema_fast = _safe_float_or_nan(sym_htf.get("ema_fast"))
+        ema_slow = _safe_float_or_nan(sym_htf.get("ema_slow"))
+        htf_close = _safe_float_or_nan(sym_htf.get("close"))
+
+        ema_close_ok = (
+            np.isfinite(htf_close)
+            and np.isfinite(ema_slow)
+            and htf_close >= ema_slow
+        )
+
+        ema_gap_small_ok = (
+            np.isfinite(ema_fast)
+            and np.isfinite(ema_slow)
+            and np.isfinite(htf_close)
+            and abs(ema_fast - ema_slow) / max(abs(htf_close), 1e-9) < 0.002
+        )
+
+        weak_short_ok = (
+            direction == "SHORT"
             and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
         )
+        neutral_ok = (direction == "NEUTRAL")
+
+        rescue_target_ok = neutral_ok or weak_short_ok or ema_close_ok or ema_gap_small_ok
 
         if (
             allow_by_btc
-            and (allow_neutral or allow_short)
+            and rescue_target_ok
             and (not long_regime_conflict)
             and ltf_long_score >= V2_LONG_RAW_RESCUE_LTF_MIN
             and ((not np.isfinite(ltf_long_rsi)) or ltf_long_rsi <= V2_LONG_RAW_RESCUE_RSI_MAX)
@@ -3147,7 +3167,9 @@ def v2_generate_signal(
                 f"sym_htf_strength={sym_htf_strength:.4f} "
                 f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
                 f"ltf_long_score={ltf_long_score:.4f} "
-                f"ltf_long_rsi={ltf_long_rsi}"
+                f"ltf_long_rsi={ltf_long_rsi} "
+                f"ema_close_ok={ema_close_ok} "
+                f"ema_gap_small_ok={ema_gap_small_ok}"
             )
 
     if direction == "NEUTRAL":
