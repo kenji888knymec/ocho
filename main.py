@@ -2567,10 +2567,12 @@ V2_LONG_MODE_DOWN_BONUS    = _env_float("V2_LONG_MODE_DOWN_BONUS", 0.0)
 
 # --- LONG raw rescue ---
 V2_LONG_RAW_RESCUE_ENABLE          = str(os.environ.get("V2_LONG_RAW_RESCUE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_RAW_RESCUE_ONLY_BTC_LONG   = str(os.environ.get("V2_LONG_RAW_RESCUE_ONLY_BTC_LONG", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_RAW_RESCUE_LTF_MIN         = _env_float("V2_LONG_RAW_RESCUE_LTF_MIN", 0.8)
-V2_LONG_RAW_RESCUE_RSI_MAX         = _env_float("V2_LONG_RAW_RESCUE_RSI_MAX", 55.0)
-V2_LONG_RAW_RESCUE_SHORT_HTF_MAX   = _env_float("V2_LONG_RAW_RESCUE_SHORT_HTF_MAX", 0.8)
+V2_LONG_RAW_RESCUE_ONLY_BTC_LONG   = str(os.environ.get("V2_LONG_RAW_RESCUE_ONLY_BTC_LONG", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RAW_RESCUE_LTF_MIN         = _env_float("V2_LONG_RAW_RESCUE_LTF_MIN", 0.0)
+V2_LONG_RAW_RESCUE_RSI_MAX         = _env_float("V2_LONG_RAW_RESCUE_RSI_MAX", 65.0)
+V2_LONG_RAW_RESCUE_SHORT_HTF_MAX   = _env_float("V2_LONG_RAW_RESCUE_SHORT_HTF_MAX", 2.0)
+V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL   = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RAW_RESCUE_ALLOW_SHORT     = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_SHORT", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- LONG guard soften in UP ---
 V2_LONG_DEF_REQUIRE_VOLCONF_UP     = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOLCONF_UP", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -3113,31 +3115,34 @@ def v2_generate_signal(
     # HTFがNEUTRALまたは弱いSHORTでも、BTCがLONG寄りでLTF_LONGが十分強ければLONG候補を救う
     if V2_LONG_RAW_RESCUE_ENABLE:
         btc_long_ok = (btc_dir == "LONG")
-        if (not V2_LONG_RAW_RESCUE_ONLY_BTC_LONG) or btc_long_ok:
-            ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
-            ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
+        allow_by_btc = (not V2_LONG_RAW_RESCUE_ONLY_BTC_LONG) or btc_long_ok
 
-            weak_short_ok = (
-                direction == "SHORT"
-                and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
+        ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
+        ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
+
+        allow_neutral = V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL and (direction == "NEUTRAL")
+        allow_short = (
+            V2_LONG_RAW_RESCUE_ALLOW_SHORT
+            and direction == "SHORT"
+            and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
+        )
+
+        if (
+            allow_by_btc
+            and (allow_neutral or allow_short)
+            and (not long_regime_conflict)
+            and ltf_long_score >= V2_LONG_RAW_RESCUE_LTF_MIN
+            and ((not np.isfinite(ltf_long_rsi)) or ltf_long_rsi <= V2_LONG_RAW_RESCUE_RSI_MAX)
+        ):
+            direction = "LONG"
+            long_rescue = True
+            long_rescue_reason = (
+                f"long_raw_rescue from={sym_htf.get('direction')} "
+                f"sym_htf_strength={sym_htf_strength:.4f} "
+                f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
+                f"ltf_long_score={ltf_long_score:.4f} "
+                f"ltf_long_rsi={ltf_long_rsi}"
             )
-            neutral_ok = (direction == "NEUTRAL")
-
-            if (
-                (neutral_ok or weak_short_ok)
-                and (not long_regime_conflict)
-                and ltf_long_score >= V2_LONG_RAW_RESCUE_LTF_MIN
-                and np.isfinite(ltf_long_rsi)
-                and ltf_long_rsi <= V2_LONG_RAW_RESCUE_RSI_MAX
-            ):
-                direction = "LONG"
-                long_rescue = True
-                long_rescue_reason = (
-                    f"long_raw_rescue from={sym_htf.get('direction')} "
-                    f"sym_htf_strength={sym_htf_strength:.4f} "
-                    f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
-                    f"ltf_long_score={ltf_long_score:.4f} rsi={ltf_long_rsi:.4f}"
-                )
 
     if direction == "NEUTRAL":
         _v2_reject(
