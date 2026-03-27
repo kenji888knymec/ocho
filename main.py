@@ -2581,6 +2581,15 @@ V2_LONG_AI_BADREGIME_CAUTION_PENALTY  = _env_float("V2_LONG_AI_BADREGIME_CAUTION
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
 
+# --- V2 regime-aware notify policy ---
+V2_REGIME_POLICY_ENABLE         = str(os.environ.get("V2_REGIME_POLICY_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_REGIME_SHORT_MODE            = str(os.environ.get("V2_REGIME_SHORT_MODE", "DOWN")).strip().upper()
+V2_REGIME_LONG_MODE             = str(os.environ.get("V2_REGIME_LONG_MODE", "UP")).strip().upper()
+V2_REGIME_LOOKBACK_HOURS        = int(float(os.environ.get("V2_REGIME_LOOKBACK_HOURS", "72")))
+V2_REGIME_MIN_DONE              = int(float(os.environ.get("V2_REGIME_MIN_DONE", "20")))
+V2_REGIME_MIN_UPLIFT_WINRATE    = _env_float("V2_REGIME_MIN_UPLIFT_WINRATE", 0.03)
+V2_REGIME_MIN_UPLIFT_PNL        = _env_float("V2_REGIME_MIN_UPLIFT_PNL", 0.0)
+
 # --- V2 Shadow ヘッダー（旧列を流用しない） ---
 V2_HEADERS = [
     "Datetime_JST", "Symbol", "Direction", "EntryPrice",
@@ -4365,6 +4374,30 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     output.extend(ranked_shorts)
     output.extend(ranked_longs)
 
+    snapshot = get_v2_regime_health_snapshot(datetime.now(JST))
+    output = v2_apply_regime_notify_policy(output, snapshot)
+
+    try:
+        print(
+            "[V2-REGIME-SNAPSHOT] "
+            f"SHORT mode={snapshot['SHORT']['target_mode']} "
+            f"enabled={snapshot['SHORT']['enabled']} "
+            f"reason={snapshot['SHORT']['reason']} "
+            f"selected_n={snapshot['SHORT']['selected']['n']} "
+            f"control_n={snapshot['SHORT']['control']['n']} "
+            f"wr_uplift={snapshot['SHORT']['uplift']['win_rate']} "
+            f"pnl_uplift={snapshot['SHORT']['uplift']['avg_pnl']} | "
+            f"LONG mode={snapshot['LONG']['target_mode']} "
+            f"enabled={snapshot['LONG']['enabled']} "
+            f"reason={snapshot['LONG']['reason']} "
+            f"selected_n={snapshot['LONG']['selected']['n']} "
+            f"control_n={snapshot['LONG']['control']['n']} "
+            f"wr_uplift={snapshot['LONG']['uplift']['win_rate']} "
+            f"pnl_uplift={snapshot['LONG']['uplift']['avg_pnl']}"
+        )
+    except Exception:
+        pass
+
     return output
 
 
@@ -4520,6 +4553,274 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     n_cols = len(headers)
     fixed = [r[:n_cols] + [""] * max(0, n_cols - len(r)) for r in rows]
     return pd.DataFrame(fixed, columns=headers)
+
+
+def _v2_shadow_last_per_key(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+
+    if "Datetime_JST" not in work.columns or "Symbol" not in work.columns or "Direction" not in work.columns:
+        return work
+
+    work["__dt__"] = pd.to_datetime(work["Datetime_JST"], errors="coerce")
+    work["__sym__"] = work["Symbol"].astype(str).str.strip().str.upper()
+    work["__side__"] = work["Direction"].astype(str).str.strip().str.upper()
+
+    work = work.sort_values("__dt__", kind="stable")
+    work = work.drop_duplicates(subset=["__dt__", "__sym__", "__side__"], keep="last")
+    return work
+
+
+def _v2_health_stats(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"n": 0, "win_rate": np.nan, "avg_pnl": np.nan}
+
+    work = df.copy()
+    winlose = work["WinLose"].apply(_normalize_v2_winlose) if "WinLose" in work.columns else pd.Series([], dtype=str)
+    pnl = pd.to_numeric(work["PnL_Pct"], errors="coerce") if "PnL_Pct" in work.columns else pd.Series([], dtype=float)
+
+    n = int(len(work))
+    win_n = int((winlose == "Win").sum()) if len(winlose) else 0
+    wr = (win_n / n) if n > 0 else np.nan
+    avg_pnl = float(pnl.dropna().mean()) if len(pnl.dropna()) > 0 else np.nan
+
+    return {
+        "n": n,
+        "win_rate": wr,
+        "avg_pnl": avg_pnl,
+    }
+
+
+def _v2_selected_bands_for_side(side: str) -> set:
+    side_u = str(side or "").strip().upper()
+    if side_u == "SHORT":
+        return {
+            "SHORT_AI_RANK",
+            "SHORT_AI_FALLBACK_RANK",
+            "RULE_QS",
+        }
+    if side_u == "LONG":
+        return {
+            "LONG_AI_RANK",
+            "LONG_AI_CAUTION_RANK",
+            "LONG_AI_FALLBACK_RANK",
+            "LONG_AI_CAUTION_FALLBACK_RANK",
+            "RULE_QS",
+        }
+    return set()
+
+
+def _v2_control_bands_for_side(side: str) -> set:
+    side_u = str(side or "").strip().upper()
+    if side_u == "SHORT":
+        return {
+            "SHORT_AI_RANK_REJECT",
+            "SHORT_AI_FALLBACK_RANK_REJECT",
+            "REJECTED",
+            "RANK_REJECT",
+        }
+    if side_u == "LONG":
+        return {
+            "LONG_AI_RANK_REJECT",
+            "LONG_AI_FALLBACK_RANK_REJECT",
+            "REJECTED",
+            "RANK_REJECT",
+        }
+    return set()
+
+
+def get_v2_regime_health_snapshot(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    v2_shadow_ai から regime内 uplift を計算して、
+    LONG/SHORT の通知可否を決めるためのスナップショットを返す。
+    """
+    now_jst = now_jst or datetime.now(JST)
+
+    out: Dict[str, Any] = {
+        "SHORT": {
+            "target_mode": str(V2_REGIME_SHORT_MODE),
+            "enabled": False,
+            "reason": "init",
+            "selected": {"n": 0, "win_rate": np.nan, "avg_pnl": np.nan},
+            "control": {"n": 0, "win_rate": np.nan, "avg_pnl": np.nan},
+            "uplift": {"win_rate": np.nan, "avg_pnl": np.nan},
+        },
+        "LONG": {
+            "target_mode": str(V2_REGIME_LONG_MODE),
+            "enabled": False,
+            "reason": "init",
+            "selected": {"n": 0, "win_rate": np.nan, "avg_pnl": np.nan},
+            "control": {"n": 0, "win_rate": np.nan, "avg_pnl": np.nan},
+            "uplift": {"win_rate": np.nan, "avg_pnl": np.nan},
+        },
+    }
+
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            out["SHORT"]["reason"] = "shadow_empty"
+            out["LONG"]["reason"] = "shadow_empty"
+            return out
+
+        work = df.copy()
+        if "Datetime_JST" not in work.columns:
+            out["SHORT"]["reason"] = "missing_datetime"
+            out["LONG"]["reason"] = "missing_datetime"
+            return out
+
+        work["Datetime_JST"] = pd.to_datetime(work["Datetime_JST"], errors="coerce")
+        work = work.dropna(subset=["Datetime_JST"]).copy()
+
+        if V2_REGIME_LOOKBACK_HOURS > 0:
+            since = now_jst - timedelta(hours=int(V2_REGIME_LOOKBACK_HOURS))
+            work = work[work["Datetime_JST"] >= since].copy()
+
+        if work.empty:
+            out["SHORT"]["reason"] = "no_rows_in_window"
+            out["LONG"]["reason"] = "no_rows_in_window"
+            return out
+
+        work = _v2_shadow_last_per_key(work)
+
+        if "EvalStatus" in work.columns:
+            work = work[work["EvalStatus"].astype(str).str.strip().str.upper() == "DONE"].copy()
+
+        if "WinLose" in work.columns:
+            work["WinLose"] = work["WinLose"].apply(_normalize_v2_winlose)
+            work = work[work["WinLose"].isin(["Win", "Lose"])].copy()
+
+        if work.empty:
+            out["SHORT"]["reason"] = "no_done_rows"
+            out["LONG"]["reason"] = "no_done_rows"
+            return out
+
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+        work["BTC_Mode_Compat"] = work["BTC_Mode_Compat"].astype(str).str.strip().str.upper()
+        work["AI_Band"] = work["AI_Band"].astype(str).str.strip().str.upper()
+
+        for side_u, target_mode in [("SHORT", str(V2_REGIME_SHORT_MODE)), ("LONG", str(V2_REGIME_LONG_MODE))]:
+            sub = work[
+                (work["Direction"] == side_u) &
+                (work["BTC_Mode_Compat"] == target_mode)
+            ].copy()
+
+            if sub.empty:
+                out[side_u]["reason"] = "no_rows_in_target_mode"
+                continue
+
+            selected_bands = _v2_selected_bands_for_side(side_u)
+            control_bands = _v2_control_bands_for_side(side_u)
+
+            selected = sub[sub["AI_Band"].isin(selected_bands)].copy()
+            control = sub[sub["AI_Band"].isin(control_bands)].copy()
+
+            s_stats = _v2_health_stats(selected)
+            c_stats = _v2_health_stats(control)
+
+            wr_uplift = np.nan
+            pnl_uplift = np.nan
+            if np.isfinite(s_stats["win_rate"]) and np.isfinite(c_stats["win_rate"]):
+                wr_uplift = float(s_stats["win_rate"] - c_stats["win_rate"])
+            if np.isfinite(s_stats["avg_pnl"]) and np.isfinite(c_stats["avg_pnl"]):
+                pnl_uplift = float(s_stats["avg_pnl"] - c_stats["avg_pnl"])
+
+            out[side_u]["selected"] = s_stats
+            out[side_u]["control"] = c_stats
+            out[side_u]["uplift"] = {
+                "win_rate": wr_uplift,
+                "avg_pnl": pnl_uplift,
+            }
+
+            if s_stats["n"] < int(V2_REGIME_MIN_DONE):
+                out[side_u]["enabled"] = False
+                out[side_u]["reason"] = f"selected_n_lt_min_done:{s_stats['n']}<{V2_REGIME_MIN_DONE}"
+                continue
+
+            if c_stats["n"] < int(V2_REGIME_MIN_DONE):
+                out[side_u]["enabled"] = False
+                out[side_u]["reason"] = f"control_n_lt_min_done:{c_stats['n']}<{V2_REGIME_MIN_DONE}"
+                continue
+
+            if not np.isfinite(wr_uplift) or wr_uplift < float(V2_REGIME_MIN_UPLIFT_WINRATE):
+                out[side_u]["enabled"] = False
+                out[side_u]["reason"] = (
+                    f"wr_uplift_lt_min:{wr_uplift}<{V2_REGIME_MIN_UPLIFT_WINRATE}"
+                )
+                continue
+
+            if not np.isfinite(pnl_uplift) or pnl_uplift < float(V2_REGIME_MIN_UPLIFT_PNL):
+                out[side_u]["enabled"] = False
+                out[side_u]["reason"] = (
+                    f"pnl_uplift_lt_min:{pnl_uplift}<{V2_REGIME_MIN_UPLIFT_PNL}"
+                )
+                continue
+
+            out[side_u]["enabled"] = True
+            out[side_u]["reason"] = "enabled_by_regime_uplift"
+
+        return out
+
+    except Exception as e:
+        out["SHORT"]["reason"] = f"snapshot_error:{type(e).__name__}:{e}"
+        out["LONG"]["reason"] = f"snapshot_error:{type(e).__name__}:{e}"
+        return out
+
+
+def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    ai_pass は shadow上の「選抜結果」として残し、
+    _notify_pass は実通知可否として別で持つ。
+    これで「通知停止」と「shadow記録停止」を分離する。
+    """
+    out: List[Dict[str, Any]] = []
+
+    for sig in signals:
+        side = str(sig.get("direction", "")).strip().upper()
+        mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+        ai_pass = str(sig.get("ai_pass", "")).strip()
+
+        notify_pass = "0"
+        notify_reason = "init"
+
+        if ai_pass != "1":
+            notify_pass = "0"
+            notify_reason = "ai_pass_0"
+        elif not V2_REGIME_POLICY_ENABLE:
+            notify_pass = "1"
+            notify_reason = "regime_policy_disabled"
+        elif side not in {"SHORT", "LONG"}:
+            notify_pass = "0"
+            notify_reason = "unsupported_side"
+        else:
+            side_policy = snapshot.get(side, {}) or {}
+            target_mode = str(side_policy.get("target_mode", "") or "").strip().upper()
+            enabled = bool(side_policy.get("enabled", False))
+            reason = str(side_policy.get("reason", "") or "")
+
+            if mode != target_mode:
+                notify_pass = "0"
+                notify_reason = f"mode_mismatch:{mode}!={target_mode}"
+            elif not enabled:
+                notify_pass = "0"
+                notify_reason = f"regime_off:{reason}"
+            else:
+                notify_pass = "1"
+                notify_reason = "notify_enabled"
+
+        sig["_notify_pass"] = notify_pass
+        sig["_notify_reason"] = notify_reason
+
+        cur_note = str(sig.get("ai_note", "") or "")
+        if cur_note:
+            sig["ai_note"] = f"{cur_note};notify_pass={notify_pass};notify_reason={notify_reason}"
+        else:
+            sig["ai_note"] = f"notify_pass={notify_pass};notify_reason={notify_reason}"
+
+        out.append(sig)
+
+    return out
 
 
 def _normalize_bool01(x: Any):
@@ -5767,15 +6068,26 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         if str(x.get("direction", "")).upper() == "LONG" and str(x.get("ai_pass", "")) == "0"
     )
 
+    n_short_notify = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("_notify_pass", "0")) == "1"
+    )
+    n_long_notify = sum(
+        1 for x in final_signals
+        if str(x.get("direction", "")).upper() == "LONG" and str(x.get("_notify_pass", "0")) == "1"
+    )
+
     print(
         f"[V2] RAW={len(raw_signals)} FINAL={len(final_signals)} "
-        f"SHORT_PASS={n_short_pass} SHORT_REJECT={n_short_reject} "
-        f"LONG_PASS={n_long_pass} LONG_REJECT={n_long_reject}"
+        f"SHORT_PASS={n_short_pass} SHORT_REJECT={n_short_reject} SHORT_NOTIFY={n_short_notify} "
+        f"LONG_PASS={n_long_pass} LONG_REJECT={n_long_reject} LONG_NOTIFY={n_long_notify}"
     )
 
     for sig in final_signals:
         direction = str(sig.get("direction", "")).upper()
         ai_pass = str(sig.get("ai_pass", ""))
+        notify_pass = str(sig.get("_notify_pass", "0"))
+        notify_reason = str(sig.get("_notify_reason", "") or "")
 
         if direction == "SHORT" and ai_pass == "1":
             print(
@@ -5783,7 +6095,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"total={sig['total_score']:.2f} "
                 f"P1={sig['p1_score']:.2f} "
                 f"QS={sig.get('ai_prob_win', '')} "
-                f"TYPE={sig.get('ai_model_type', '')}"
+                f"TYPE={sig.get('ai_model_type', '')} "
+                f"NOTIFY={notify_pass} "
+                f"NOTIFY_REASON={notify_reason}"
             )
         elif direction == "SHORT" and ai_pass == "0":
             print(
@@ -5796,7 +6110,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"total={sig['total_score']:.2f} "
                 f"P1={sig['p1_score']:.2f} "
                 f"QS={sig.get('ai_prob_win', '')} "
-                f"TYPE={sig.get('ai_model_type', '')}"
+                f"TYPE={sig.get('ai_model_type', '')} "
+                f"NOTIFY={notify_pass} "
+                f"NOTIFY_REASON={notify_reason}"
             )
         elif direction == "LONG" and ai_pass == "0":
             print(
@@ -5809,7 +6125,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     v2_write_shadow_rows(rows)
 
     if engine_mode == "v2_live":
-        print("[V2] engine_mode=v2_live (notification hook not implemented yet)")
+        notify_candidates = [
+            x for x in final_signals
+            if str(x.get("_notify_pass", "0")) == "1"
+        ]
+        print(
+            f"[V2] engine_mode=v2_live (notification hook not implemented yet) "
+            f"notify_candidates={len(notify_candidates)}"
+        )
 
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
 
