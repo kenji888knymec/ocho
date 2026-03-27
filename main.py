@@ -25,11 +25,14 @@ from flask import Flask, jsonify, request
 # ==============================
 try:
     from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import roc_auc_score, accuracy_score
     SKLEARN_OK = True
 except Exception as _e:
     LogisticRegression = None
+    RandomForestClassifier = None
+    HistGradientBoostingClassifier = None
     train_test_split = None
     roc_auc_score = None
     accuracy_score = None
@@ -2493,15 +2496,18 @@ V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
 V2_SHORT_RSI_SWEET_MAX          = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
 
 # --- V2 SHORT Training Filters ---
-V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST   = str(os.environ.get("V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST   = str(os.environ.get("V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_TRAIN_MODE                = str(os.environ.get("V2_SHORT_TRAIN_MODE", "ANY")).strip().upper()
 
 # --- V2 LONG Training / Guard ---
 V2_LONG_DEF_REQUIRE_VOLCONF        = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_TRAIN_REQUIRE_VOLCONF      = str(os.environ.get("V2_LONG_TRAIN_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_LONG_TRAIN_EXCLUDE_BLOCKLIST    = str(os.environ.get("V2_LONG_TRAIN_EXCLUDE_BLOCKLIST", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_TRAIN_REQUIRE_VOLCONF      = str(os.environ.get("V2_LONG_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_TRAIN_EXCLUDE_BLOCKLIST    = str(os.environ.get("V2_LONG_TRAIN_EXCLUDE_BLOCKLIST", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_TRAIN_MODE                 = str(os.environ.get("V2_LONG_TRAIN_MODE", "UP")).strip().upper()
+
+# --- V2 Trainer ---
+V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
 # --- V2 SHORT Brake / Recovery ---
 V2_SHORT_BRAKE_ENABLE          = str(os.environ.get("V2_SHORT_BRAKE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_BRAKE_LOOKBACK_SLOTS  = int(float(os.environ.get("V2_SHORT_BRAKE_LOOKBACK_SLOTS", "2")))
@@ -8224,7 +8230,58 @@ def _train_v2_side_process(side: str):
         y_tr = y[:n_train]
         y_te = y[n_train:]
 
-        model = LogisticRegression(class_weight="balanced", solver="liblinear")
+        trainer_name = V2_CLASSIFIER_TYPE
+        trainer_params: Dict[str, Any] = {}
+
+        if V2_CLASSIFIER_TYPE == "LR":
+            trainer_name = "LR"
+            trainer_params = {
+                "class_weight": "balanced",
+                "solver": "liblinear",
+                "max_iter": 800,
+            }
+            model = LogisticRegression(
+                class_weight="balanced",
+                solver="liblinear",
+                max_iter=800,
+            )
+
+        elif V2_CLASSIFIER_TYPE == "RF":
+            trainer_name = "RF"
+            trainer_params = {
+                "n_estimators": 300,
+                "max_depth": 6,
+                "min_samples_leaf": 20,
+                "class_weight": "balanced",
+                "random_state": 42,
+                "n_jobs": -1,
+            }
+            model = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=6,
+                min_samples_leaf=20,
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=-1,
+            )
+
+        else:
+            trainer_name = "HGB"
+            trainer_params = {
+                "max_iter": 300,
+                "max_depth": 5,
+                "min_samples_leaf": 20,
+                "learning_rate": 0.05,
+                "random_state": 42,
+            }
+            model = HistGradientBoostingClassifier(
+                max_iter=300,
+                max_depth=5,
+                min_samples_leaf=20,
+                learning_rate=0.05,
+                random_state=42,
+            )
+
         model.fit(X_tr, y_tr)
 
         y_pred = model.predict(X_te)
@@ -8232,8 +8289,14 @@ def _train_v2_side_process(side: str):
 
         auc = None
         try:
-            proba = model.predict_proba(X_te)[:, 1]
-            auc = float(roc_auc_score(y_te, proba)) if roc_auc_score is not None else None
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(X_te)[:, 1]
+                auc = float(roc_auc_score(y_te, proba)) if roc_auc_score is not None else None
+            elif hasattr(model, "decision_function"):
+                score = model.decision_function(X_te)
+                auc = float(roc_auc_score(y_te, score)) if roc_auc_score is not None else None
+            else:
+                auc = None
         except Exception:
             auc = None
 
@@ -8291,7 +8354,12 @@ def _train_v2_side_process(side: str):
             "version": VERSION,
             "side": side_u,
             "trained_samples": n,
-            "metrics": {"accuracy": acc, "auc": auc},
+            "trainer_name": trainer_name,
+            "trainer_params": trainer_params,
+            "metrics": {
+                "accuracy": acc,
+                "auc": auc,
+            },
             "info": info,
             "new_model": {
                 "model_version_suggest": ts_ver,
