@@ -2693,7 +2693,13 @@ def assess_htf_trend(htf_df: pd.DataFrame) -> Dict[str, Any]:
     strength_raw = abs(spread) / 0.005
     strength = min(strength_raw, 1.0)
 
-    if ema_f > ema_s and close > ema_s:
+    ema_gap_ratio = abs(ema_f - ema_s) / max(abs(close), 1e-9)
+    close_vs_ema_s_ratio = abs(close - ema_s) / max(abs(close), 1e-9)
+
+    # 差が小さい時は無理に方向を付けず NEUTRAL に寄せる
+    if ema_gap_ratio < 0.0015 or close_vs_ema_s_ratio < 0.0015:
+        direction = "NEUTRAL"
+    elif ema_f > ema_s and close > ema_s:
         direction = "LONG"
     elif ema_f < ema_s and close < ema_s:
         direction = "SHORT"
