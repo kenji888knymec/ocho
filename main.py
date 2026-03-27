@@ -2474,19 +2474,34 @@ V2_LONG_SYMBOL_BLOCKLIST        = [s.strip().upper() for s in str(os.environ.get
 V2_SHORT_SYMBOL_BLOCKLIST       = [s.strip().upper() for s in str(os.environ.get("V2_SHORT_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
 
 # --- V2 SHORT Selection Pipeline ---
-V2_SHORT_DEF_ENABLE        = str(os.environ.get("V2_SHORT_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_SHORT_DEF_P1_MIN        = _env_float("V2_SHORT_DEF_P1_MIN", 1.5)
-V2_SHORT_DEF_SCORE_MIN     = _env_float("V2_SHORT_DEF_SCORE_MIN", 2.5)
-V2_SHORT_DEF_BTCSTR_MIN    = _env_float("V2_SHORT_DEF_BTCSTR_MIN", 0.3)
-V2_SHORT_DEF_RSI_MIN       = _env_float("V2_SHORT_DEF_RSI_MIN", 40.0)
-V2_SHORT_DEF_RSI_MAX       = _env_float("V2_SHORT_DEF_RSI_MAX", 60.0)
+V2_SHORT_DEF_ENABLE             = str(os.environ.get("V2_SHORT_DEF_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_DEF_P1_MIN             = _env_float("V2_SHORT_DEF_P1_MIN", 1.5)
+V2_SHORT_DEF_SCORE_MIN          = _env_float("V2_SHORT_DEF_SCORE_MIN", 2.5)
+V2_SHORT_DEF_BTCSTR_MIN         = _env_float("V2_SHORT_DEF_BTCSTR_MIN", 0.3)
+V2_SHORT_DEF_BTCSTR_MAX         = _env_float("V2_SHORT_DEF_BTCSTR_MAX", float("inf"))
+V2_SHORT_DEF_RSI_MIN            = _env_float("V2_SHORT_DEF_RSI_MIN", 40.0)
+V2_SHORT_DEF_RSI_MAX            = _env_float("V2_SHORT_DEF_RSI_MAX", 60.0)
+V2_SHORT_DEF_RSI_MIN_DOWN       = _env_float("V2_SHORT_DEF_RSI_MIN_DOWN", 35.0)
+V2_SHORT_DEF_RSI_MAX_DOWN       = _env_float("V2_SHORT_DEF_RSI_MAX_DOWN", 60.0)
+V2_SHORT_DEF_REQUIRE_VOLCONF    = str(os.environ.get("V2_SHORT_DEF_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
 
-V2_SHORT_RANK_ENABLE       = str(os.environ.get("V2_SHORT_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
-V2_SHORT_RANK_TOP_N        = int(float(os.environ.get("V2_SHORT_RANK_TOP_N", "2")))
-V2_SHORT_QS_MIN            = _env_float("V2_SHORT_QS_MIN", float("-inf"))
+V2_SHORT_RANK_ENABLE            = str(os.environ.get("V2_SHORT_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_RANK_TOP_N             = int(float(os.environ.get("V2_SHORT_RANK_TOP_N", "2")))
+V2_SHORT_QS_MIN                 = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 
-V2_SHORT_RSI_SWEET_MIN     = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
-V2_SHORT_RSI_SWEET_MAX     = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
+V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
+V2_SHORT_RSI_SWEET_MAX          = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
+
+# --- V2 SHORT Training Filters ---
+V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST   = str(os.environ.get("V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_TRAIN_MODE                = str(os.environ.get("V2_SHORT_TRAIN_MODE", "ANY")).strip().upper()
+
+# --- V2 LONG Training / Guard ---
+V2_LONG_DEF_REQUIRE_VOLCONF        = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_TRAIN_REQUIRE_VOLCONF      = str(os.environ.get("V2_LONG_TRAIN_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_TRAIN_EXCLUDE_BLOCKLIST    = str(os.environ.get("V2_LONG_TRAIN_EXCLUDE_BLOCKLIST", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_TRAIN_MODE                 = str(os.environ.get("V2_LONG_TRAIN_MODE", "UP")).strip().upper()
 # --- V2 SHORT Brake / Recovery ---
 V2_SHORT_BRAKE_ENABLE          = str(os.environ.get("V2_SHORT_BRAKE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_BRAKE_LOOKBACK_SLOTS  = int(float(os.environ.get("V2_SHORT_BRAKE_LOOKBACK_SLOTS", "2")))
@@ -3212,10 +3227,14 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
     SHORT専用の最低品質ライン。
-    LONGは今は触らないので、そのまま通す。
-    欠損は 0 扱いにせず、明示的に reject する。
+    LONGはここでは触らない。
+    欠損は埋めずに reject する。
+    追加方針:
+      - BTC_Mode_Compat=DOWN のときだけ RSI 下限を少し緩める
+      - VolConfirmed を必須化できるようにする
+      - BTC強度の上限も持てるようにする
     """
-    direction = str(sig.get("direction", "")).upper()
+    direction = str(sig.get("direction", "")).strip().upper()
     if direction != "SHORT":
         return True, "not_short"
 
@@ -3226,6 +3245,10 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     total = _safe_float_or_nan(sig.get("total_score"))
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    volconf_raw = sig.get("vol_confirmed", None)
+    volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
 
     if not np.isfinite(p1):
         return False, "missing_p1_score"
@@ -3239,6 +3262,9 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not np.isfinite(rsi):
         return False, "missing_rsi"
 
+    if V2_SHORT_DEF_REQUIRE_VOLCONF and (not volconf):
+        return False, "vol_not_confirmed"
+
     if p1 < V2_SHORT_DEF_P1_MIN:
         return False, f"p1_below_min p1={p1:.4f} min={V2_SHORT_DEF_P1_MIN:.4f}"
 
@@ -3248,10 +3274,20 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if btcstr < V2_SHORT_DEF_BTCSTR_MIN:
         return False, f"btcstr_below_min btcstr={btcstr:.4f} min={V2_SHORT_DEF_BTCSTR_MIN:.4f}"
 
-    if rsi < V2_SHORT_DEF_RSI_MIN or rsi > V2_SHORT_DEF_RSI_MAX:
+    if np.isfinite(V2_SHORT_DEF_BTCSTR_MAX) and btcstr > V2_SHORT_DEF_BTCSTR_MAX:
+        return False, f"btcstr_above_max btcstr={btcstr:.4f} max={V2_SHORT_DEF_BTCSTR_MAX:.4f}"
+
+    if btc_mode_compat == "DOWN":
+        rsi_min = V2_SHORT_DEF_RSI_MIN_DOWN
+        rsi_max = V2_SHORT_DEF_RSI_MAX_DOWN
+    else:
+        rsi_min = V2_SHORT_DEF_RSI_MIN
+        rsi_max = V2_SHORT_DEF_RSI_MAX
+
+    if rsi < rsi_min or rsi > rsi_max:
         return False, (
             f"rsi_out_of_range rsi={rsi:.4f} "
-            f"min={V2_SHORT_DEF_RSI_MIN:.1f} max={V2_SHORT_DEF_RSI_MAX:.1f}"
+            f"min={rsi_min:.1f} max={rsi_max:.1f} mode={btc_mode_compat}"
         )
 
     return True, "pass"
@@ -3278,35 +3314,46 @@ def _calc_rsi_zone_bonus(rsi: float) -> float:
 def calc_quality_score(sig: Dict[str, Any]) -> float:
     """
     Stage B:
-    将来AIに差し替える唯一の場所。
-    今はルールベースの仮スコア。
-
-    注意:
-    - total_score には p1_score の影響がすでに入っているため、
-      p1 をそのまま total と二重に強く効かせすぎないようにする。
-    - other_score = total - p1 を使って、二重カウントを減らす。
+    SHORT用の仮QualityScore。
+    今回の方針:
+      - P1偏重を少し弱める
+      - P3_VolumeScore を評価に入れる
+      - VolConfirmed を加点する
+      - total と p1 の二重効きを抑える
     """
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
+    p3 = _safe_float_or_nan(sig.get("p3_score"))
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    volconf_raw = sig.get("vol_confirmed", None)
+    volconf = 1.0 if str(volconf_raw).strip().lower() in ("1", "true", "yes", "on") else 0.0
 
     if not np.isfinite(p1):
         p1 = 0.0
     if not np.isfinite(total):
         total = 0.0
+    if not np.isfinite(p3):
+        p3 = 0.0
     if not np.isfinite(btcstr):
         btcstr = 0.0
 
     rsi_zone_bonus = _calc_rsi_zone_bonus(rsi)
+
     other_score = total - p1
     other_score = max(-1.5, min(other_score, 1.5))
 
+    btc_over_penalty = -0.30 if (np.isfinite(btcstr) and btcstr > 0.90) else 0.0
+
     qs = (
-        (p1 * 1.0) +
-        (btcstr * 0.5) +
-        (other_score * 0.3) +
-        (rsi_zone_bonus * 0.2)
+        (p1 * 0.25) +
+        (other_score * 0.30) +
+        (p3 * 0.25) +
+        (btcstr * 0.05) +
+        (rsi_zone_bonus * 0.05) +
+        (volconf * 0.10) +
+        (btc_over_penalty)
     )
     return float(qs)
 
@@ -3415,9 +3462,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
     SHORTはここでは触らない。
-    チェック順: btc_mode_compat → P1 → total_score → RSI
+    追加方針:
+      - LONGは当面厳しめ継続
+      - VolConfirmed を必須化できるようにする
     """
-    direction = str(sig.get("direction", "")).upper()
+    direction = str(sig.get("direction", "")).strip().upper()
     if direction != "LONG":
         return True, "not_long"
 
@@ -3435,6 +3484,9 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
 
+    volconf_raw = sig.get("vol_confirmed", None)
+    volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
+
     if not np.isfinite(p1):
         return False, "missing_p1_score"
 
@@ -3443,6 +3495,9 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     if not np.isfinite(rsi):
         return False, "missing_rsi"
+
+    if V2_LONG_DEF_REQUIRE_VOLCONF and (not volconf):
+        return False, "vol_not_confirmed"
 
     if p1 < V2_LONG_DEF_P1_MIN:
         if _allow_long_p1_rescue(sig):
@@ -4614,8 +4669,18 @@ def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tup
 def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     v2_shadow_ai から LONG/SHORT 別の学習用 X, y を作るラッパー。
+    追加方針:
+      - SHORT: VolConfirmed=True 優先、SHORT blocklist除外、mode選別
+      - LONG : VolConfirmed=True 優先、LONG blocklist除外、UP中心
     """
-    meta: Dict[str, Any] = {"rows_scanned": 0, "rows_used": 0, "class_balance": {}, "side": str(side).upper()}
+    side_u = str(side or "").strip().upper()
+    meta: Dict[str, Any] = {
+        "rows_scanned": 0,
+        "rows_used": 0,
+        "class_balance": {},
+        "side": side_u,
+        "train_filters": {},
+    }
 
     df = get_v2_shadow_ai_data()
     if df is None or df.empty:
@@ -4626,7 +4691,73 @@ def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> 
 
     meta["rows_scanned"] = int(len(df))
 
-    X, y, info = _build_training_matrix_from_v2_shadow_ai(df, side)
+    work = df.copy()
+
+    if "Direction" in work.columns:
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+
+    if "Symbol" in work.columns:
+        work["__sym__"] = work["Symbol"].astype(str).str.split("/", n=1).str[0].str.strip().str.upper()
+    else:
+        work["__sym__"] = ""
+
+    if "BTC_Mode_Compat" in work.columns:
+        work["__mode__"] = work["BTC_Mode_Compat"].astype(str).str.strip().str.upper()
+    else:
+        work["__mode__"] = ""
+
+    if "VolConfirmed" in work.columns:
+        work["__volconf__"] = work["VolConfirmed"].apply(_normalize_bool01)
+    else:
+        work["__volconf__"] = np.nan
+
+    if side_u == "SHORT":
+        if V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST:
+            short_block = set(V2_SHORT_SYMBOL_BLOCKLIST or [])
+            if short_block:
+                work = work[~work["__sym__"].isin(short_block)].copy()
+
+        if V2_SHORT_TRAIN_REQUIRE_VOLCONF:
+            work = work[work["__volconf__"] == 1.0].copy()
+
+        if V2_SHORT_TRAIN_MODE == "DOWN":
+            work = work[work["__mode__"] == "DOWN"].copy()
+        elif V2_SHORT_TRAIN_MODE == "UP":
+            work = work[work["__mode__"] == "UP"].copy()
+        elif V2_SHORT_TRAIN_MODE == "RANGE":
+            work = work[work["__mode__"] == "RANGE"].copy()
+
+        meta["train_filters"] = {
+            "require_volconf": bool(V2_SHORT_TRAIN_REQUIRE_VOLCONF),
+            "exclude_blocklist": bool(V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST),
+            "mode": str(V2_SHORT_TRAIN_MODE),
+            "blocklist": list(V2_SHORT_SYMBOL_BLOCKLIST or []),
+        }
+
+    elif side_u == "LONG":
+        if V2_LONG_TRAIN_EXCLUDE_BLOCKLIST:
+            long_block = set(V2_LONG_SYMBOL_BLOCKLIST or [])
+            if long_block:
+                work = work[~work["__sym__"].isin(long_block)].copy()
+
+        if V2_LONG_TRAIN_REQUIRE_VOLCONF:
+            work = work[work["__volconf__"] == 1.0].copy()
+
+        if V2_LONG_TRAIN_MODE == "DOWN":
+            work = work[work["__mode__"] == "DOWN"].copy()
+        elif V2_LONG_TRAIN_MODE == "RANGE":
+            work = work[work["__mode__"] == "RANGE"].copy()
+        elif V2_LONG_TRAIN_MODE == "UP":
+            work = work[work["__mode__"] == "UP"].copy()
+
+        meta["train_filters"] = {
+            "require_volconf": bool(V2_LONG_TRAIN_REQUIRE_VOLCONF),
+            "exclude_blocklist": bool(V2_LONG_TRAIN_EXCLUDE_BLOCKLIST),
+            "mode": str(V2_LONG_TRAIN_MODE),
+            "blocklist": list(V2_LONG_SYMBOL_BLOCKLIST or []),
+        }
+
+    X, y, info = _build_training_matrix_from_v2_shadow_ai(work, side_u)
 
     meta["rows_used"] = int(len(X))
     if len(y) > 0:
