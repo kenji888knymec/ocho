@@ -3604,8 +3604,9 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "missing_rsi"
 
     if V2_LONG_DEF_REQUIRE_VOLCONF and (not volconf):
-        if not (btc_mode_compat == "UP" and (not V2_LONG_DEF_REQUIRE_VOLCONF_UP)):
-            return False, "vol_not_confirmed"
+        if not long_raw_rescue:
+            if not (btc_mode_compat == "UP" and (not V2_LONG_DEF_REQUIRE_VOLCONF_UP)):
+                return False, "vol_not_confirmed"
 
     if p1 < V2_LONG_DEF_P1_MIN:
         if _allow_long_p1_rescue(sig):
