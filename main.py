@@ -4908,9 +4908,15 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
             enabled = bool(side_policy.get("enabled", False))
             reason = str(side_policy.get("reason", "") or "")
 
+            long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+
             if mode != target_mode:
-                notify_pass = "0"
-                notify_reason = f"mode_mismatch:{mode}!={target_mode}"
+                if side == "LONG" and long_raw_rescue and str(mode).upper() == "DOWN":
+                    notify_pass = "1"
+                    notify_reason = f"notify_enabled_by_long_rescue:{mode}!={target_mode}"
+                else:
+                    notify_pass = "0"
+                    notify_reason = f"mode_mismatch:{mode}!={target_mode}"
             elif not enabled:
                 notify_pass = "0"
                 notify_reason = f"regime_off:{reason}"
