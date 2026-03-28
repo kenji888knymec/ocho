@@ -3624,13 +3624,21 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
             f"hard_max={V2_LONG_DEF_P1_HARD_MAX:.4f}"
         )
 
-    if total < V2_LONG_DEF_SCORE_MIN:
-        return False, f"score_below_min total={total:.4f} min={V2_LONG_DEF_SCORE_MIN:.4f}"
+    score_min_eff = float(V2_LONG_DEF_SCORE_MIN)
+    rsi_min_eff = float(V2_LONG_DEF_RSI_MIN)
+    rsi_max_eff = float(V2_LONG_DEF_RSI_MAX)
 
-    if rsi < V2_LONG_DEF_RSI_MIN or rsi > V2_LONG_DEF_RSI_MAX:
+    if long_raw_rescue:
+        score_min_eff = min(score_min_eff, 1.3)
+        rsi_min_eff = min(rsi_min_eff, 35.0)
+
+    if total < score_min_eff:
+        return False, f"score_below_min total={total:.4f} min={score_min_eff:.4f}"
+
+    if rsi < rsi_min_eff or rsi > rsi_max_eff:
         return False, (
             f"rsi_out_of_range rsi={rsi:.4f} "
-            f"min={V2_LONG_DEF_RSI_MIN:.1f} max={V2_LONG_DEF_RSI_MAX:.1f}"
+            f"min={rsi_min_eff:.1f} max={rsi_max_eff:.1f}"
         )
 
     if rsi > V2_LONG_DEF_RSI_HARD_MAX:
