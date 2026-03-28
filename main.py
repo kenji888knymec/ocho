@@ -3585,10 +3585,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return True, "long_def_disabled"
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
-    if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
-        return False, "range_mode_block"
-
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+
+    if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
+        if not long_raw_rescue:
+            return False, "range_mode_block"
 
     if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
         if not long_raw_rescue:
