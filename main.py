@@ -2590,6 +2590,13 @@ V2_LONG_AI_BADREGIME_STOP_HITS        = int(float(os.environ.get("V2_LONG_AI_BAD
 V2_LONG_AI_BADREGIME_CAUTION_HITS     = int(float(os.environ.get("V2_LONG_AI_BADREGIME_CAUTION_HITS", "3")))
 V2_LONG_AI_BADREGIME_CAUTION_PENALTY  = _env_float("V2_LONG_AI_BADREGIME_CAUTION_PENALTY", 0.08)
 
+# --- LONG rescue notify / rank tuning ---
+V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS     = os.environ.get("V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS", "0,1,2,3,4,5")
+V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N      = int(float(os.environ.get("V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N", "3")))
+V2_LONG_RANK_P2_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P2_WEAK_PENALTY", 0.08)
+V2_LONG_RANK_P3_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P3_WEAK_PENALTY", 0.08)
+V2_LONG_RANK_BAD_HOUR_PENALTY         = _env_float("V2_LONG_RANK_BAD_HOUR_PENALTY", 0.06)
+
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
 
@@ -4092,9 +4099,26 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
     if not long_signals:
         return []
 
+    def _long_rank_score(sig: Dict[str, Any]) -> float:
+        base_ai = float(sig.get("ai_prob_win", 0.0) or 0.0)
+
+        bad = _assess_long_ai_bad_regime(sig)
+        tags = list(bad.get("tags", []) or [])
+
+        penalty = 0.0
+        for t in tags:
+            if str(t).startswith("p2_weak:"):
+                penalty += float(V2_LONG_RANK_P2_WEAK_PENALTY)
+            elif str(t).startswith("p3_weak:"):
+                penalty += float(V2_LONG_RANK_P3_WEAK_PENALTY)
+            elif str(t).startswith("bad_hour:"):
+                penalty += float(V2_LONG_RANK_BAD_HOUR_PENALTY)
+
+        return float(base_ai - penalty)
+
     ranked = sorted(
         long_signals,
-        key=lambda x: float(x.get("ai_prob_win", 0.0) or 0.0),
+        key=lambda x: _long_rank_score(x),
         reverse=True,
     )
 
@@ -4129,6 +4153,7 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
 
     if (not V2_LONG_RANK_ENABLE) and brake_mode == "NORMAL":
         for rank_idx, sig in enumerate(ranked, start=1):
+            sig["_long_rank_pos"] = int(rank_idx)
             slot_total = len(ranked)
             current_note = str(sig.get("ai_note", "") or "")
             sig["ai_band"] = "RULE_QS_NO_RANK"
@@ -4144,6 +4169,7 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
     slot_total = len(ranked)
 
     for rank_idx, sig in enumerate(ranked, start=1):
+        sig["_long_rank_pos"] = int(rank_idx)
         current_note = str(sig.get("ai_note", "") or "")
 
         if brake_mode == "STOP":
@@ -4909,11 +4935,28 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
             reason = str(side_policy.get("reason", "") or "")
 
             long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+            long_rank_pos = int(float(sig.get("_long_rank_pos", 9999) or 9999))
 
             if mode != target_mode:
                 if side == "LONG" and long_raw_rescue and str(mode).upper() == "DOWN":
-                    notify_pass = "1"
-                    notify_reason = f"notify_enabled_by_long_rescue:{mode}!={target_mode}"
+                    hour = _get_long_sig_hour(sig)
+                    blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
+
+                    if hour is not None and hour in blocked_hours:
+                        notify_pass = "0"
+                        notify_reason = f"long_rescue_blocked_bad_hour:{hour}"
+                    elif long_rank_pos > int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N):
+                        notify_pass = "0"
+                        notify_reason = (
+                            f"long_rescue_rank_cut:rank={long_rank_pos}>"
+                            f"{int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N)}"
+                        )
+                    else:
+                        notify_pass = "1"
+                        notify_reason = (
+                            f"notify_enabled_by_long_rescue:{mode}!={target_mode};"
+                            f"rank={long_rank_pos}"
+                        )
                 else:
                     notify_pass = "0"
                     notify_reason = f"mode_mismatch:{mode}!={target_mode}"
