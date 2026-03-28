@@ -4939,7 +4939,7 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
             long_rank_pos = int(float(sig.get("_long_rank_pos", 9999) or 9999))
 
             if mode != target_mode:
-                if side == "LONG" and long_raw_rescue and str(mode).upper() == "DOWN":
+                if side == "LONG" and long_raw_rescue and str(mode).upper() in {"DOWN", "RANGE"}:
                     hour = _get_long_sig_hour(sig)
                     blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
 
