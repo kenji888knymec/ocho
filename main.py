@@ -3608,11 +3608,15 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
             if not (btc_mode_compat == "UP" and (not V2_LONG_DEF_REQUIRE_VOLCONF_UP)):
                 return False, "vol_not_confirmed"
 
-    if p1 < V2_LONG_DEF_P1_MIN:
+    p1_min_eff = float(V2_LONG_DEF_P1_MIN)
+    if long_raw_rescue:
+        p1_min_eff = min(p1_min_eff, 1.5)
+
+    if p1 < p1_min_eff:
         if _allow_long_p1_rescue(sig):
             pass
         else:
-            return False, f"p1_below_min p1={p1:.4f} min={V2_LONG_DEF_P1_MIN:.4f}"
+            return False, f"p1_below_min p1={p1:.4f} min={p1_min_eff:.4f}"
 
     if p1 >= V2_LONG_DEF_P1_HARD_MAX:
         return False, (
