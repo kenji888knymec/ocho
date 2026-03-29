@@ -2803,6 +2803,15 @@ V2_LONG_RAW_RESCUE_SHORT_HTF_MAX   = _env_float("V2_LONG_RAW_RESCUE_SHORT_HTF_MA
 V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL   = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RAW_RESCUE_ALLOW_SHORT     = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_SHORT", "1")).strip().lower() in ("1", "true", "yes", "on")
 
+# --- SHORT raw rescue ---
+V2_SHORT_RAW_RESCUE_ENABLE         = str(os.environ.get("V2_SHORT_RAW_RESCUE_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT = str(os.environ.get("V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_RAW_RESCUE_LTF_MIN        = _env_float("V2_SHORT_RAW_RESCUE_LTF_MIN", 0.0)
+V2_SHORT_RAW_RESCUE_RSI_MIN        = _env_float("V2_SHORT_RAW_RESCUE_RSI_MIN", 35.0)
+V2_SHORT_RAW_RESCUE_LONG_HTF_MAX   = _env_float("V2_SHORT_RAW_RESCUE_LONG_HTF_MAX", 2.0)
+V2_SHORT_RAW_RESCUE_ALLOW_NEUTRAL  = str(os.environ.get("V2_SHORT_RAW_RESCUE_ALLOW_NEUTRAL", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_RAW_RESCUE_ALLOW_LONG     = str(os.environ.get("V2_SHORT_RAW_RESCUE_ALLOW_LONG", "1")).strip().lower() in ("1", "true", "yes", "on")
+
 # --- LONG guard soften in UP ---
 V2_LONG_DEF_REQUIRE_VOLCONF_UP     = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOLCONF_UP", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_BAD_SYMBOLS        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_BAD_SYMBOLS", "SUI,UNI,AAVE,STX,XLM")).split(",") if s.strip()]
@@ -3371,6 +3380,21 @@ def v2_generate_signal(
 
     long_rescue = False
     long_rescue_reason = ""
+    short_rescue = False
+    short_rescue_reason = ""
+
+    ema_fast = _safe_float_or_nan(sym_htf.get("ema_fast"))
+    ema_slow = _safe_float_or_nan(sym_htf.get("ema_slow"))
+    htf_close = _safe_float_or_nan(sym_htf.get("close"))
+
+    ema_close_long_ok = (np.isfinite(htf_close) and np.isfinite(ema_slow) and htf_close >= ema_slow)
+    ema_close_short_ok = (np.isfinite(htf_close) and np.isfinite(ema_slow) and htf_close <= ema_slow)
+    ema_gap_small_ok = (
+        np.isfinite(ema_fast)
+        and np.isfinite(ema_slow)
+        and np.isfinite(htf_close)
+        and abs(ema_fast - ema_slow) / max(abs(htf_close), 1e-9) < 0.002
+    )
 
     # LONG raw rescue:
     # HTFがNEUTRALまたは弱いSHORTでも、BTCがLONG寄りでLTF_LONGが十分強ければLONG候補を救う
@@ -3381,32 +3405,14 @@ def v2_generate_signal(
         ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
         ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
 
-        # いまのHTF判定が弱いSHORT/NEUTRALに倒れていても、
-        # 価格がEMA_Sを上回る・EMA差が小さい場合はLONG救済候補に含める
-        ema_fast = _safe_float_or_nan(sym_htf.get("ema_fast"))
-        ema_slow = _safe_float_or_nan(sym_htf.get("ema_slow"))
-        htf_close = _safe_float_or_nan(sym_htf.get("close"))
-
-        ema_close_ok = (
-            np.isfinite(htf_close)
-            and np.isfinite(ema_slow)
-            and htf_close >= ema_slow
-        )
-
-        ema_gap_small_ok = (
-            np.isfinite(ema_fast)
-            and np.isfinite(ema_slow)
-            and np.isfinite(htf_close)
-            and abs(ema_fast - ema_slow) / max(abs(htf_close), 1e-9) < 0.002
-        )
-
         weak_short_ok = (
-            direction == "SHORT"
+            V2_LONG_RAW_RESCUE_ALLOW_SHORT
+            and direction == "SHORT"
             and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
         )
-        neutral_ok = (direction == "NEUTRAL")
+        neutral_ok = V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL and (direction == "NEUTRAL")
 
-        rescue_target_ok = neutral_ok or weak_short_ok or ema_close_ok or ema_gap_small_ok
+        rescue_target_ok = neutral_ok or weak_short_ok or ema_close_long_ok or ema_gap_small_ok
 
         if (
             allow_by_btc
@@ -3423,7 +3429,44 @@ def v2_generate_signal(
                 f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
                 f"ltf_long_score={ltf_long_score:.4f} "
                 f"ltf_long_rsi={ltf_long_rsi} "
-                f"ema_close_ok={ema_close_ok} "
+                f"ema_close_long_ok={ema_close_long_ok} "
+                f"ema_gap_small_ok={ema_gap_small_ok}"
+            )
+
+    # SHORT raw rescue:
+    # HTFがNEUTRALまたは弱いLONGでも、BTCがSHORT寄りでLTF_SHORTが十分強ければSHORT候補を救う
+    if (not long_rescue) and V2_SHORT_RAW_RESCUE_ENABLE:
+        btc_short_ok = (btc_dir == "SHORT")
+        allow_by_btc = (not V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT) or btc_short_ok
+
+        ltf_short_score = float(ltf_eval_short.get("score", 0.0) or 0.0)
+        ltf_short_rsi = _safe_float_or_nan(ltf_eval_short.get("rsi"))
+
+        weak_long_ok = (
+            V2_SHORT_RAW_RESCUE_ALLOW_LONG
+            and direction == "LONG"
+            and sym_htf_strength <= V2_SHORT_RAW_RESCUE_LONG_HTF_MAX
+        )
+        neutral_ok = V2_SHORT_RAW_RESCUE_ALLOW_NEUTRAL and (direction == "NEUTRAL")
+
+        rescue_target_ok = neutral_ok or weak_long_ok or ema_close_short_ok or ema_gap_small_ok
+
+        if (
+            allow_by_btc
+            and rescue_target_ok
+            and (not short_regime_conflict)
+            and ltf_short_score >= V2_SHORT_RAW_RESCUE_LTF_MIN
+            and ((not np.isfinite(ltf_short_rsi)) or ltf_short_rsi >= V2_SHORT_RAW_RESCUE_RSI_MIN)
+        ):
+            direction = "SHORT"
+            short_rescue = True
+            short_rescue_reason = (
+                f"short_raw_rescue from={sym_htf.get('direction')} "
+                f"sym_htf_strength={sym_htf_strength:.4f} "
+                f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
+                f"ltf_short_score={ltf_short_score:.4f} "
+                f"ltf_short_rsi={ltf_short_rsi} "
+                f"ema_close_short_ok={ema_close_short_ok} "
                 f"ema_gap_small_ok={ema_gap_small_ok}"
             )
 
@@ -3554,6 +3597,7 @@ def v2_generate_signal(
         "time_ms": closed_bar_time_ms,
         "dt": closed_bar_dt,
         "long_raw_rescue": bool(long_rescue),
+        "short_raw_rescue": bool(short_rescue),
     }
 
 
@@ -5392,6 +5436,7 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
             reason = str(side_policy.get("reason", "") or "")
 
             long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+            short_raw_rescue = str(sig.get("short_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
             long_rank_pos = int(float(sig.get("_long_rank_pos", 9999) or 9999))
 
             if mode != target_mode:
@@ -5423,6 +5468,9 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
                                 f"rank={long_rank_pos};"
                                 f"guard={guard_state.get('mode', 'NORMAL')}"
                             )
+                elif side == "SHORT" and short_raw_rescue and str(mode).upper() in {"UP", "RANGE"}:
+                    notify_pass = "1"
+                    notify_reason = f"notify_enabled_by_short_rescue:{mode}!={target_mode}"
                 else:
                     notify_pass = "0"
                     notify_reason = f"mode_mismatch:{mode}!={target_mode}"
