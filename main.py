@@ -2809,6 +2809,20 @@ V2_LONG_RANGE_RESCUE_P2_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P2_MIN", 0
 V2_LONG_RANGE_RESCUE_P3_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P3_MIN", 0.00)
 V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS = [s.strip().upper() for s in str(os.environ.get("V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS", "APT,SUI,STX,BONK")).split(",") if s.strip()]
 
+# --- LONG notify qualification gate ---
+V2_LONG_NOTIFY_GATE_ENABLE         = str(os.environ.get("V2_LONG_NOTIFY_GATE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_NOTIFY_GATE_BLOCK_SYMBOLS  = [s.strip().upper() for s in str(os.environ.get("V2_LONG_NOTIFY_GATE_BLOCK_SYMBOLS", "APT,SUI,STX,BONK")).split(",") if s.strip()]
+
+V2_LONG_NOTIFY_GATE_RANGE_ENABLE   = str(os.environ.get("V2_LONG_NOTIFY_GATE_RANGE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX  = _env_float("V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX", 43.0)
+V2_LONG_NOTIFY_GATE_RANGE_P2_MIN   = _env_float("V2_LONG_NOTIFY_GATE_RANGE_P2_MIN", 0.05)
+V2_LONG_NOTIFY_GATE_RANGE_P3_MIN   = _env_float("V2_LONG_NOTIFY_GATE_RANGE_P3_MIN", 0.00)
+
+V2_LONG_NOTIFY_GATE_UP_ENABLE      = str(os.environ.get("V2_LONG_NOTIFY_GATE_UP_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_NOTIFY_GATE_UP_RSI_MAX     = _env_float("V2_LONG_NOTIFY_GATE_UP_RSI_MAX", 48.0)
+V2_LONG_NOTIFY_GATE_UP_P2_MIN      = _env_float("V2_LONG_NOTIFY_GATE_UP_P2_MIN", 0.15)
+V2_LONG_NOTIFY_GATE_UP_P3_MIN      = _env_float("V2_LONG_NOTIFY_GATE_UP_P3_MIN", 0.00)
+
 # --- SHORT raw rescue ---
 V2_SHORT_RAW_RESCUE_ENABLE         = str(os.environ.get("V2_SHORT_RAW_RESCUE_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT = str(os.environ.get("V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -4112,6 +4126,61 @@ def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
     return tags
 
 
+def _long_notify_gate(sig: Dict[str, Any]) -> Tuple[bool, str]:
+    if not V2_LONG_NOTIFY_GATE_ENABLE:
+        return True, "notify_gate_disabled"
+
+    mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    p3 = _safe_float_or_nan(sig.get("p3_score"))
+
+    block_syms = {s.strip().upper() for s in V2_LONG_NOTIFY_GATE_BLOCK_SYMBOLS if str(s).strip()}
+    if sym in block_syms:
+        return False, f"notify_gate_symbol_block sym={sym}"
+
+    if mode == "RANGE" and V2_LONG_NOTIFY_GATE_RANGE_ENABLE:
+        if (not np.isfinite(rsi)) or rsi > float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):
+            return False, (
+                f"notify_gate_range_rsi_high rsi={rsi:.4f} "
+                f"max={float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):.1f}"
+            )
+
+        if (not np.isfinite(p2)) or p2 < float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):
+            return False, (
+                f"notify_gate_range_p2_low p2={p2:.4f} "
+                f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):.4f}"
+            )
+
+        if (not np.isfinite(p3)) or p3 < float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):
+            return False, (
+                f"notify_gate_range_p3_low p3={p3:.4f} "
+                f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):.4f}"
+            )
+
+    if mode == "UP" and V2_LONG_NOTIFY_GATE_UP_ENABLE:
+        if (not np.isfinite(rsi)) or rsi > float(V2_LONG_NOTIFY_GATE_UP_RSI_MAX):
+            return False, (
+                f"notify_gate_up_rsi_high rsi={rsi:.4f} "
+                f"max={float(V2_LONG_NOTIFY_GATE_UP_RSI_MAX):.1f}"
+            )
+
+        if (not np.isfinite(p2)) or p2 < float(V2_LONG_NOTIFY_GATE_UP_P2_MIN):
+            return False, (
+                f"notify_gate_up_p2_low p2={p2:.4f} "
+                f"min={float(V2_LONG_NOTIFY_GATE_UP_P2_MIN):.4f}"
+            )
+
+        if (not np.isfinite(p3)) or p3 < float(V2_LONG_NOTIFY_GATE_UP_P3_MIN):
+            return False, (
+                f"notify_gate_up_p3_low p3={p3:.4f} "
+                f"min={float(V2_LONG_NOTIFY_GATE_UP_P3_MIN):.4f}"
+            )
+
+    return True, "pass"
+
+
 def _v2_bool01(x: Any) -> float:
     s = ("" if x is None else str(x)).strip().lower()
     if s in {"1", "true", "t", "yes", "y", "on"}:
@@ -4807,6 +4876,31 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"rescued_p1={rescued_p1};"
                 f"research_tags={research_note}"
             )
+
+            gate_ok, gate_reason = _long_notify_gate(sig)
+            if not gate_ok:
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_note"] = (
+                    f"REJECTED:{gate_reason};"
+                    f"{ai_res.get('note', '')};"
+                    f"qs={qs:.4f};"
+                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
+                    f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')};"
+                    f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')};"
+                    f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
+                    f"btc_mode={sig.get('btc_mode_compat', '')};"
+                    f"hour={sig.get('hour', '')};"
+                    f"rsi={sig.get('rsi', '')};"
+                    f"rescued_p1={rescued_p1};"
+                    f"research_tags={research_note}"
+                )
+                output.append(sig)
+                print(
+                    f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
+                    f"reason={gate_reason}"
+                )
+                continue
 
             print(
                 f"[V2-LONG-AI] sym={sig.get('symbol')} "
