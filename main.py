@@ -2596,6 +2596,15 @@ V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N      = int(float(os.environ.get("V2_LONG_RESCUE
 V2_LONG_RANK_P2_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P2_WEAK_PENALTY", 0.08)
 V2_LONG_RANK_P3_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P3_WEAK_PENALTY", 0.08)
 V2_LONG_RANK_BAD_HOUR_PENALTY         = _env_float("V2_LONG_RANK_BAD_HOUR_PENALTY", 0.06)
+# --- 6h guardrail monitor ---
+V2_GUARDRAIL_ENABLE                   = str(os.environ.get("V2_GUARDRAIL_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_GUARDRAIL_LOOKBACK_HOURS           = int(float(os.environ.get("V2_GUARDRAIL_LOOKBACK_HOURS", "6")))
+V2_GUARDRAIL_MIN_DONE                 = int(float(os.environ.get("V2_GUARDRAIL_MIN_DONE", "12")))
+V2_GUARDRAIL_CAUTION_WR_GAP           = _env_float("V2_GUARDRAIL_CAUTION_WR_GAP", -0.03)
+V2_GUARDRAIL_STOP_WR_GAP              = _env_float("V2_GUARDRAIL_STOP_WR_GAP", -0.05)
+V2_GUARDRAIL_CAUTION_PNL_GAP          = _env_float("V2_GUARDRAIL_CAUTION_PNL_GAP", -0.05)
+V2_GUARDRAIL_STOP_PNL_GAP             = _env_float("V2_GUARDRAIL_STOP_PNL_GAP", -0.10)
+V2_GUARDRAIL_CAUTION_TOP_N            = int(float(os.environ.get("V2_GUARDRAIL_CAUTION_TOP_N", "1")))
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
@@ -4688,6 +4697,170 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     return pd.DataFrame(fixed, columns=headers)
 
 
+def _v2_guard_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+
+    if "Datetime_JST" not in work.columns:
+        return pd.DataFrame()
+
+    work["Datetime_JST"] = pd.to_datetime(work["Datetime_JST"].astype(str).str.strip(), errors="coerce")
+    work = work[work["Datetime_JST"].notna()].copy()
+
+    if "EvalStatus" in work.columns:
+        work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+        work = work[work["EvalStatus"] == "DONE"].copy()
+
+    if "WinLose" in work.columns:
+        wl = work["WinLose"].astype(str).str.strip().str.lower()
+        work["_win"] = wl.isin(["win", "w", "1", "true"])
+        work["_lose"] = wl.isin(["lose", "l", "0", "false"])
+    else:
+        work["_win"] = False
+        work["_lose"] = False
+
+    if "PnL_Pct" in work.columns:
+        work["_pnl"] = pd.to_numeric(
+            work["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+    else:
+        work["_pnl"] = np.nan
+
+    if "AI_Band" in work.columns:
+        work["AI_Band"] = work["AI_Band"].astype(str).str.strip().str.upper()
+    else:
+        work["AI_Band"] = ""
+
+    if "AI_Note" in work.columns:
+        note = work["AI_Note"].astype(str)
+        work["_notify_1"] = note.str.contains("notify_pass=1", na=False)
+    else:
+        work["_notify_1"] = False
+
+    if "Direction" in work.columns:
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+    else:
+        work["Direction"] = ""
+
+    return work
+
+
+def _v2_guard_stats(sub: pd.DataFrame) -> Dict[str, Any]:
+    n = int(len(sub))
+    if n == 0:
+        return {"n": 0, "wr": np.nan, "avg_pnl": np.nan}
+
+    wins = int(sub["_win"].sum()) if "_win" in sub.columns else 0
+    wr = float(wins / n) if n > 0 else np.nan
+    pnl = pd.to_numeric(sub["_pnl"], errors="coerce")
+    avg_pnl = float(pnl.dropna().mean()) if len(pnl.dropna()) > 0 else np.nan
+
+    return {"n": n, "wr": wr, "avg_pnl": avg_pnl}
+
+
+def get_v2_guardrail_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    直近6時間の v2_shadow_ai 実績から、
+    notify群が RANK_REJECT に負けていないかを見て
+    LONG rescue notify の guardrail 状態を返す。
+    """
+    default_state = {
+        "enabled": bool(V2_GUARDRAIL_ENABLE),
+        "mode": "NORMAL",
+        "reason": "guardrail_disabled" if not V2_GUARDRAIL_ENABLE else "insufficient_data",
+        "lookback_hours": int(V2_GUARDRAIL_LOOKBACK_HOURS),
+        "notify": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rank_reject": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rejected": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "wr_gap_vs_rank_reject": np.nan,
+        "pnl_gap_vs_rank_reject": np.nan,
+        "effective_down_top_n": int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N),
+    }
+
+    if not V2_GUARDRAIL_ENABLE:
+        return default_state
+
+    if now_jst is None:
+        now_jst = datetime.now(JST)
+
+    try:
+        df = get_v2_shadow_ai_data()
+        done = _v2_guard_prepare_done(df)
+        if done.empty:
+            return default_state
+
+        since = pd.Timestamp(now_jst.replace(tzinfo=None)) - pd.Timedelta(hours=int(V2_GUARDRAIL_LOOKBACK_HOURS))
+        done = done[done["Datetime_JST"] >= since].copy()
+        done = done[done["Direction"] == "LONG"].copy()
+
+        if done.empty:
+            return default_state
+
+        notify_sub = done[done["_notify_1"]].copy()
+        rank_reject_sub = done[done["AI_Band"].eq("RANK_REJECT")].copy()
+        rejected_sub = done[done["AI_Band"].eq("REJECTED")].copy()
+
+        notify_stats = _v2_guard_stats(notify_sub)
+        rank_reject_stats = _v2_guard_stats(rank_reject_sub)
+        rejected_stats = _v2_guard_stats(rejected_sub)
+
+        state = dict(default_state)
+        state["notify"] = notify_stats
+        state["rank_reject"] = rank_reject_stats
+        state["rejected"] = rejected_stats
+
+        if notify_stats["n"] < int(V2_GUARDRAIL_MIN_DONE) or rank_reject_stats["n"] < int(V2_GUARDRAIL_MIN_DONE):
+            state["reason"] = "insufficient_data"
+            return state
+
+        wr_gap = np.nan
+        pnl_gap = np.nan
+        if np.isfinite(notify_stats["wr"]) and np.isfinite(rank_reject_stats["wr"]):
+            wr_gap = float(notify_stats["wr"] - rank_reject_stats["wr"])
+        if np.isfinite(notify_stats["avg_pnl"]) and np.isfinite(rank_reject_stats["avg_pnl"]):
+            pnl_gap = float(notify_stats["avg_pnl"] - rank_reject_stats["avg_pnl"])
+
+        state["wr_gap_vs_rank_reject"] = wr_gap
+        state["pnl_gap_vs_rank_reject"] = pnl_gap
+
+        # STOP 判定
+        if (
+            (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_STOP_WR_GAP)) or
+            (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_STOP_PNL_GAP))
+        ):
+            state["mode"] = "STOP"
+            state["reason"] = f"stop wr_gap={wr_gap} pnl_gap={pnl_gap}"
+            state["effective_down_top_n"] = 0
+            return state
+
+        # CAUTION 判定
+        if (
+            (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_CAUTION_WR_GAP)) or
+            (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
+        ):
+            state["mode"] = "CAUTION"
+            state["reason"] = f"caution wr_gap={wr_gap} pnl_gap={pnl_gap}"
+            state["effective_down_top_n"] = min(
+                int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N),
+                int(V2_GUARDRAIL_CAUTION_TOP_N),
+            )
+            return state
+
+        state["mode"] = "NORMAL"
+        state["reason"] = f"normal wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        state["effective_down_top_n"] = int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N)
+        return state
+
+    except Exception as e:
+        st = dict(default_state)
+        st["mode"] = "NORMAL"
+        st["reason"] = f"guardrail_error:{type(e).__name__}:{e}"
+        return st
+
+
 def _v2_shadow_last_per_key(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -4911,6 +5084,7 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
     これで「通知停止」と「shadow記録停止」を分離する。
     """
     out: List[Dict[str, Any]] = []
+    guard_state = get_v2_guardrail_state(datetime.now(JST))
 
     for sig in signals:
         side = str(sig.get("direction", "")).strip().upper()
@@ -4943,21 +5117,30 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
                     hour = _get_long_sig_hour(sig)
                     blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
 
-                    if hour is not None and hour in blocked_hours:
+                    if guard_state.get("mode") == "STOP":
+                        notify_pass = "0"
+                        notify_reason = f"guardrail_stop:{guard_state.get('reason', '')}"
+                    elif hour is not None and hour in blocked_hours:
                         notify_pass = "0"
                         notify_reason = f"long_rescue_blocked_bad_hour:{hour}"
-                    elif long_rank_pos > int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N):
-                        notify_pass = "0"
-                        notify_reason = (
-                            f"long_rescue_rank_cut:rank={long_rank_pos}>"
-                            f"{int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N)}"
-                        )
                     else:
-                        notify_pass = "1"
-                        notify_reason = (
-                            f"notify_enabled_by_long_rescue:{mode}!={target_mode};"
-                            f"rank={long_rank_pos}"
-                        )
+                        eff_top_n = int(guard_state.get("effective_down_top_n", V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N))
+                        if eff_top_n <= 0:
+                            notify_pass = "0"
+                            notify_reason = f"guardrail_top_n_zero:{guard_state.get('reason', '')}"
+                        elif long_rank_pos > eff_top_n:
+                            notify_pass = "0"
+                            notify_reason = (
+                                f"long_rescue_rank_cut:rank={long_rank_pos}>{eff_top_n};"
+                                f"guard={guard_state.get('mode', 'NORMAL')}"
+                            )
+                        else:
+                            notify_pass = "1"
+                            notify_reason = (
+                                f"notify_enabled_by_long_rescue:{mode}!={target_mode};"
+                                f"rank={long_rank_pos};"
+                                f"guard={guard_state.get('mode', 'NORMAL')}"
+                            )
                 else:
                     notify_pass = "0"
                     notify_reason = f"mode_mismatch:{mode}!={target_mode}"
@@ -9396,6 +9579,21 @@ def v2_report_process():
         err = f"{type(e).__name__}: {e}"
         print(f"[ERR] /v2_report crashed: {err}")
         return f"ERR: {err}", 200
+
+
+@app.route("/v2_guard_report", methods=["GET"])
+def v2_guard_report():
+    try:
+        state = get_v2_guardrail_state(datetime.now(JST))
+        return jsonify({
+            "ok": True,
+            "version": VERSION,
+            "guardrail": state,
+        }), 200
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /v2_guard_report crashed: {err}")
+        return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
 
 @app.route("/judge_v2", methods=["GET", "POST"])
