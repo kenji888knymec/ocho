@@ -961,12 +961,65 @@ def _safe_pct_str(v, digits: int = 2) -> str:
         return ""
 
 
+def _get_v2_symbol_recent_stats(symbol: str, direction: str, lookback_n: int = 20) -> Dict[str, Any]:
+    """
+    v2_shadow_ai から同一銘柄・同方向の直近成績を取得する。
+    通知本文に「直近20件勝率」を出すための補助。
+    """
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        work = df.copy()
+
+        if "Symbol" not in work.columns or "Direction" not in work.columns:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        if "Datetime_JST" in work.columns:
+            work["Datetime_JST"] = pd.to_datetime(
+                work["Datetime_JST"].astype(str).str.strip(),
+                errors="coerce",
+            )
+            work = work[work["Datetime_JST"].notna()].copy()
+            work = work.sort_values("Datetime_JST", ascending=False)
+
+        work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+
+        if "EvalStatus" in work.columns:
+            work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+            work = work[work["EvalStatus"] == "DONE"].copy()
+
+        sub = work[
+            (work["Symbol"] == str(symbol).strip().upper()) &
+            (work["Direction"] == str(direction).strip().upper())
+        ].copy()
+
+        if sub.empty:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        sub = sub.head(int(lookback_n))
+
+        if "WinLose" not in sub.columns:
+            return {"n": int(len(sub)), "wins": 0, "wr": np.nan}
+
+        wl = sub["WinLose"].astype(str).str.strip().str.lower()
+        wins = int(wl.isin(["win", "w", "1", "true"]).sum())
+        n = int(len(sub))
+        wr = float(wins / n) if n > 0 else np.nan
+
+        return {"n": n, "wins": wins, "wr": wr}
+
+    except Exception:
+        return {"n": 0, "wins": 0, "wr": np.nan}
+
+
 def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     """
-    V1と同じ用途の実運用通知向けメッセージ。
-    表示項目は V1 と同じ発想で、
-    Symbol / Side / Entry / TP / SL / レバ考慮TP% / レバ考慮SL% / Score / Note
-    を並べる。
+    V2 の実運用向けDiscord通知。
+    実行に必要な情報を先頭に出し、
+    判断補助として AI 判定% と直近成績だけを追加する。
     """
     symbol = str(sig.get("symbol", "") or "").strip().upper()
     direction = str(sig.get("direction", "") or "").strip().upper()
@@ -986,7 +1039,6 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     except Exception:
         lev_i = int(DEFAULT_LEV)
 
-    # Hyperliquid等の5x銘柄表示ルールを既存運用に合わせる
     display_lev = 5 if symbol in MAX_LEV_5X_SYMBOLS else lev_i
 
     tp_lev_pct = _safe_pct_str(sig.get("tp_lev_pct", sig.get("TP_Lev%", "")))
@@ -1003,26 +1055,38 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
         except Exception:
             sl_lev_pct = ""
 
-    total_score = _safe_pct_str(sig.get("total_score", sig.get("TotalScore", "")), digits=2)
-    p1_score = _safe_pct_str(sig.get("p1_score", sig.get("P1_TrendScore", "")), digits=2)
-    ai_prob = _safe_pct_str(sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")), digits=3)
+    ai_prob = _safe_pct_str(sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")), digits=1)
+    recent = _get_v2_symbol_recent_stats(symbol, direction, lookback_n=20)
 
-    note = str(sig.get("note", "") or sig.get("ai_note", "") or "").strip()
-    notify_reason = str(sig.get("_notify_reason", "") or "").strip()
+    if direction == "LONG":
+        side_emoji = "🟢"
+        tp_emoji = "🎯"
+        sl_emoji = "🛑"
+    else:
+        side_emoji = "🔴"
+        tp_emoji = "🎯"
+        sl_emoji = "🛑"
 
-    side_emoji = "🟢" if direction == "LONG" else "🔴"
+    recent_line = ""
+    if int(recent.get("n", 0)) >= 10 and np.isfinite(recent.get("wr", np.nan)):
+        recent_line = (
+            f"📊 直近{int(recent['n'])}件勝率: "
+            f"{float(recent['wr']) * 100:.0f}% "
+            f"（{int(recent['wins'])}/{int(recent['n'])}）"
+        )
+    elif int(recent.get("n", 0)) > 0:
+        recent_line = f"📊 直近{int(recent['n'])}件: 参考不足"
 
     lines = [
         f"{side_emoji}【{symbol} {direction}】",
-        f"Time: {dt_str}" if dt_str else "",
-        f"Entry: {entry}" if entry else "",
-        f"TP: {tp_price} ({tp_pct}% / {tp_lev_pct}%@x{display_lev})" if tp_price else "",
-        f"SL: {sl_price} ({sl_pct}% / {sl_lev_pct}%@x{display_lev})" if sl_price else "",
-        f"Score: {total_score}" if total_score else "",
-        f"P1: {p1_score}" if p1_score else "",
-        f"AI: {ai_prob}" if ai_prob else "",
-        f"Reason: {notify_reason}" if notify_reason else "",
-        f"Note: {note}" if note else "",
+        f"💰 Entry: {entry}" if entry else "",
+        f"{tp_emoji} TP: {tp_price}" if tp_price else "",
+        f"{sl_emoji} SL: {sl_price}" if sl_price else "",
+        f"📌 TP入力: {tp_pct}%（x{display_lev}で {tp_lev_pct}%）" if tp_pct else "",
+        f"📌 SL入力: {sl_pct}%（x{display_lev}で {sl_lev_pct}%）" if sl_pct else "",
+        f"🤖 AI判定: {ai_prob}%" if ai_prob else "",
+        recent_line,
+        f"🕒 {dt_str}" if dt_str else "",
     ]
 
     return "\n".join([x for x in lines if x])
@@ -1030,15 +1094,13 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
 
 def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> int:
     """
-    V2の notify_pass=1 候補を Discord へ送る。
-    同一候補の重複送信は last_alert_records で抑止。
+    V2 の notify_pass=1 候補を Discord に送る。
     """
     global last_alert_records
 
     sent = 0
     now_ts = int(time.time())
 
-    # 古いdedupeキーを掃除（24h保持）
     try:
         expire_before = now_ts - 86400
         last_alert_records = {
