@@ -2596,7 +2596,11 @@ V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N      = int(float(os.environ.get("V2_LONG_RESCUE
 V2_LONG_RANK_P2_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P2_WEAK_PENALTY", 0.08)
 V2_LONG_RANK_P3_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P3_WEAK_PENALTY", 0.08)
 V2_LONG_RANK_BAD_HOUR_PENALTY         = _env_float("V2_LONG_RANK_BAD_HOUR_PENALTY", 0.06)
-# --- 6h guardrail monitor ---
+
+# --- monitor / guard / retrain cadence ---
+V2_MONITOR_1H_ENABLE                  = str(os.environ.get("V2_MONITOR_1H_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_MONITOR_1H_LOOKBACK_HOURS          = int(float(os.environ.get("V2_MONITOR_1H_LOOKBACK_HOURS", "1")))
+
 V2_GUARDRAIL_ENABLE                   = str(os.environ.get("V2_GUARDRAIL_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_GUARDRAIL_LOOKBACK_HOURS           = int(float(os.environ.get("V2_GUARDRAIL_LOOKBACK_HOURS", "6")))
 V2_GUARDRAIL_MIN_DONE                 = int(float(os.environ.get("V2_GUARDRAIL_MIN_DONE", "12")))
@@ -2605,6 +2609,12 @@ V2_GUARDRAIL_STOP_WR_GAP              = _env_float("V2_GUARDRAIL_STOP_WR_GAP", -
 V2_GUARDRAIL_CAUTION_PNL_GAP          = _env_float("V2_GUARDRAIL_CAUTION_PNL_GAP", -0.05)
 V2_GUARDRAIL_STOP_PNL_GAP             = _env_float("V2_GUARDRAIL_STOP_PNL_GAP", -0.10)
 V2_GUARDRAIL_CAUTION_TOP_N            = int(float(os.environ.get("V2_GUARDRAIL_CAUTION_TOP_N", "1")))
+
+V2_RETRAIN_REVIEW_ENABLE              = str(os.environ.get("V2_RETRAIN_REVIEW_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_RETRAIN_LOOKBACK_HOURS             = int(float(os.environ.get("V2_RETRAIN_LOOKBACK_HOURS", "24")))
+V2_RETRAIN_MIN_DONE                   = int(float(os.environ.get("V2_RETRAIN_MIN_DONE", "200")))
+V2_RETRAIN_TRIGGER_WR_GAP             = _env_float("V2_RETRAIN_TRIGGER_WR_GAP", -0.05)
+V2_RETRAIN_TRIGGER_PNL_GAP            = _env_float("V2_RETRAIN_TRIGGER_PNL_GAP", -0.10)
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
@@ -4697,12 +4707,11 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     return pd.DataFrame(fixed, columns=headers)
 
 
-def _v2_guard_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
+def _v2_monitor_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
     work = df.copy()
-
     if "Datetime_JST" not in work.columns:
         return pd.DataFrame()
 
@@ -4712,6 +4721,11 @@ def _v2_guard_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
     if "EvalStatus" in work.columns:
         work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
         work = work[work["EvalStatus"] == "DONE"].copy()
+
+    if "Direction" in work.columns:
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+    else:
+        work["Direction"] = ""
 
     if "WinLose" in work.columns:
         wl = work["WinLose"].astype(str).str.strip().str.lower()
@@ -4734,21 +4748,22 @@ def _v2_guard_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
     else:
         work["AI_Band"] = ""
 
-    if "AI_Note" in work.columns:
-        note = work["AI_Note"].astype(str)
+    note_col = None
+    for c in ["AI_Note", "ai_note"]:
+        if c in work.columns:
+            note_col = c
+            break
+
+    if note_col:
+        note = work[note_col].astype(str)
         work["_notify_1"] = note.str.contains("notify_pass=1", na=False)
     else:
         work["_notify_1"] = False
 
-    if "Direction" in work.columns:
-        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
-    else:
-        work["Direction"] = ""
-
     return work
 
 
-def _v2_guard_stats(sub: pd.DataFrame) -> Dict[str, Any]:
+def _v2_monitor_stats(sub: pd.DataFrame) -> Dict[str, Any]:
     n = int(len(sub))
     if n == 0:
         return {"n": 0, "wr": np.nan, "avg_pnl": np.nan}
@@ -4757,17 +4772,57 @@ def _v2_guard_stats(sub: pd.DataFrame) -> Dict[str, Any]:
     wr = float(wins / n) if n > 0 else np.nan
     pnl = pd.to_numeric(sub["_pnl"], errors="coerce")
     avg_pnl = float(pnl.dropna().mean()) if len(pnl.dropna()) > 0 else np.nan
-
     return {"n": n, "wr": wr, "avg_pnl": avg_pnl}
 
 
+def _get_v2_window_report(hours: int, now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    now_jst = now_jst or datetime.now(JST)
+
+    out = {
+        "hours": int(hours),
+        "notify": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rank_reject": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rejected": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "wr_gap_vs_rank_reject": np.nan,
+        "pnl_gap_vs_rank_reject": np.nan,
+    }
+
+    df = get_v2_shadow_ai_data()
+    done = _v2_monitor_prepare_done(df)
+    if done.empty:
+        return out
+
+    since = pd.Timestamp(now_jst.replace(tzinfo=None)) - pd.Timedelta(hours=int(hours))
+    done = done[done["Datetime_JST"] >= since].copy()
+    done = done[done["Direction"] == "LONG"].copy()
+
+    if done.empty:
+        return out
+
+    notify_sub = done[done["_notify_1"]].copy()
+    rank_reject_sub = done[done["AI_Band"].eq("RANK_REJECT")].copy()
+    rejected_sub = done[done["AI_Band"].eq("REJECTED")].copy()
+
+    notify_stats = _v2_monitor_stats(notify_sub)
+    rank_reject_stats = _v2_monitor_stats(rank_reject_sub)
+    rejected_stats = _v2_monitor_stats(rejected_sub)
+
+    out["notify"] = notify_stats
+    out["rank_reject"] = rank_reject_stats
+    out["rejected"] = rejected_stats
+
+    if np.isfinite(notify_stats["wr"]) and np.isfinite(rank_reject_stats["wr"]):
+        out["wr_gap_vs_rank_reject"] = float(notify_stats["wr"] - rank_reject_stats["wr"])
+    if np.isfinite(notify_stats["avg_pnl"]) and np.isfinite(rank_reject_stats["avg_pnl"]):
+        out["pnl_gap_vs_rank_reject"] = float(notify_stats["avg_pnl"] - rank_reject_stats["avg_pnl"])
+
+    return out
+
+
 def get_v2_guardrail_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
-    """
-    直近6時間の v2_shadow_ai 実績から、
-    notify群が RANK_REJECT に負けていないかを見て
-    LONG rescue notify の guardrail 状態を返す。
-    """
-    default_state = {
+    now_jst = now_jst or datetime.now(JST)
+
+    state = {
         "enabled": bool(V2_GUARDRAIL_ENABLE),
         "mode": "NORMAL",
         "reason": "guardrail_disabled" if not V2_GUARDRAIL_ENABLE else "insufficient_data",
@@ -4781,84 +4836,82 @@ def get_v2_guardrail_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]
     }
 
     if not V2_GUARDRAIL_ENABLE:
-        return default_state
-
-    if now_jst is None:
-        now_jst = datetime.now(JST)
-
-    try:
-        df = get_v2_shadow_ai_data()
-        done = _v2_guard_prepare_done(df)
-        if done.empty:
-            return default_state
-
-        since = pd.Timestamp(now_jst.replace(tzinfo=None)) - pd.Timedelta(hours=int(V2_GUARDRAIL_LOOKBACK_HOURS))
-        done = done[done["Datetime_JST"] >= since].copy()
-        done = done[done["Direction"] == "LONG"].copy()
-
-        if done.empty:
-            return default_state
-
-        notify_sub = done[done["_notify_1"]].copy()
-        rank_reject_sub = done[done["AI_Band"].eq("RANK_REJECT")].copy()
-        rejected_sub = done[done["AI_Band"].eq("REJECTED")].copy()
-
-        notify_stats = _v2_guard_stats(notify_sub)
-        rank_reject_stats = _v2_guard_stats(rank_reject_sub)
-        rejected_stats = _v2_guard_stats(rejected_sub)
-
-        state = dict(default_state)
-        state["notify"] = notify_stats
-        state["rank_reject"] = rank_reject_stats
-        state["rejected"] = rejected_stats
-
-        if notify_stats["n"] < int(V2_GUARDRAIL_MIN_DONE) or rank_reject_stats["n"] < int(V2_GUARDRAIL_MIN_DONE):
-            state["reason"] = "insufficient_data"
-            return state
-
-        wr_gap = np.nan
-        pnl_gap = np.nan
-        if np.isfinite(notify_stats["wr"]) and np.isfinite(rank_reject_stats["wr"]):
-            wr_gap = float(notify_stats["wr"] - rank_reject_stats["wr"])
-        if np.isfinite(notify_stats["avg_pnl"]) and np.isfinite(rank_reject_stats["avg_pnl"]):
-            pnl_gap = float(notify_stats["avg_pnl"] - rank_reject_stats["avg_pnl"])
-
-        state["wr_gap_vs_rank_reject"] = wr_gap
-        state["pnl_gap_vs_rank_reject"] = pnl_gap
-
-        # STOP 判定
-        if (
-            (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_STOP_WR_GAP)) or
-            (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_STOP_PNL_GAP))
-        ):
-            state["mode"] = "STOP"
-            state["reason"] = f"stop wr_gap={wr_gap} pnl_gap={pnl_gap}"
-            state["effective_down_top_n"] = 0
-            return state
-
-        # CAUTION 判定
-        if (
-            (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_CAUTION_WR_GAP)) or
-            (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
-        ):
-            state["mode"] = "CAUTION"
-            state["reason"] = f"caution wr_gap={wr_gap} pnl_gap={pnl_gap}"
-            state["effective_down_top_n"] = min(
-                int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N),
-                int(V2_GUARDRAIL_CAUTION_TOP_N),
-            )
-            return state
-
-        state["mode"] = "NORMAL"
-        state["reason"] = f"normal wr_gap={wr_gap} pnl_gap={pnl_gap}"
-        state["effective_down_top_n"] = int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N)
         return state
 
-    except Exception as e:
-        st = dict(default_state)
-        st["mode"] = "NORMAL"
-        st["reason"] = f"guardrail_error:{type(e).__name__}:{e}"
-        return st
+    rep = _get_v2_window_report(int(V2_GUARDRAIL_LOOKBACK_HOURS), now_jst)
+    state.update(rep)
+
+    if rep["notify"]["n"] < int(V2_GUARDRAIL_MIN_DONE) or rep["rank_reject"]["n"] < int(V2_GUARDRAIL_MIN_DONE):
+        state["reason"] = "insufficient_data"
+        return state
+
+    wr_gap = rep["wr_gap_vs_rank_reject"]
+    pnl_gap = rep["pnl_gap_vs_rank_reject"]
+
+    if (
+        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_STOP_WR_GAP)) or
+        (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_STOP_PNL_GAP))
+    ):
+        state["mode"] = "STOP"
+        state["reason"] = f"stop wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        state["effective_down_top_n"] = 0
+        return state
+
+    if (
+        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_CAUTION_WR_GAP)) or
+        (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
+    ):
+        state["mode"] = "CAUTION"
+        state["reason"] = f"caution wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        state["effective_down_top_n"] = min(
+            int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N),
+            int(V2_GUARDRAIL_CAUTION_TOP_N),
+        )
+        return state
+
+    state["mode"] = "NORMAL"
+    state["reason"] = f"normal wr_gap={wr_gap} pnl_gap={pnl_gap}"
+    return state
+
+
+def get_v2_retrain_review_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    now_jst = now_jst or datetime.now(JST)
+
+    state = {
+        "enabled": bool(V2_RETRAIN_REVIEW_ENABLE),
+        "should_retrain": False,
+        "reason": "retrain_review_disabled" if not V2_RETRAIN_REVIEW_ENABLE else "insufficient_data",
+        "lookback_hours": int(V2_RETRAIN_LOOKBACK_HOURS),
+        "notify": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rank_reject": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "rejected": {"n": 0, "wr": np.nan, "avg_pnl": np.nan},
+        "wr_gap_vs_rank_reject": np.nan,
+        "pnl_gap_vs_rank_reject": np.nan,
+    }
+
+    if not V2_RETRAIN_REVIEW_ENABLE:
+        return state
+
+    rep = _get_v2_window_report(int(V2_RETRAIN_LOOKBACK_HOURS), now_jst)
+    state.update(rep)
+
+    if rep["notify"]["n"] < int(V2_RETRAIN_MIN_DONE):
+        state["reason"] = "insufficient_data"
+        return state
+
+    wr_gap = rep["wr_gap_vs_rank_reject"]
+    pnl_gap = rep["pnl_gap_vs_rank_reject"]
+
+    if (
+        (np.isfinite(wr_gap) and wr_gap <= float(V2_RETRAIN_TRIGGER_WR_GAP)) or
+        (np.isfinite(pnl_gap) and pnl_gap <= float(V2_RETRAIN_TRIGGER_PNL_GAP))
+    ):
+        state["should_retrain"] = True
+        state["reason"] = f"trigger wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        return state
+
+    state["reason"] = f"no_trigger wr_gap={wr_gap} pnl_gap={pnl_gap}"
+    return state
 
 
 def _v2_shadow_last_per_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -9593,6 +9646,21 @@ def v2_guard_report():
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         print(f"[ERR] /v2_guard_report crashed: {err}")
+        return jsonify({"ok": False, "error": err, "version": VERSION}), 200
+
+
+@app.route("/v2_retrain_report", methods=["GET"])
+def v2_retrain_report():
+    try:
+        state = get_v2_retrain_review_state(datetime.now(JST))
+        return jsonify({
+            "ok": True,
+            "version": VERSION,
+            "retrain_review": state,
+        }), 200
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /v2_retrain_report crashed: {err}")
         return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
 
