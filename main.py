@@ -2754,11 +2754,11 @@ V2_SHORT_BRAKE_PROBE_TOP_N     = int(float(os.environ.get("V2_SHORT_BRAKE_PROBE_
 V2_LONG_BRAKE_ENABLE          = str(os.environ.get("V2_LONG_BRAKE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_BRAKE_LOOKBACK_SLOTS  = int(float(os.environ.get("V2_LONG_BRAKE_LOOKBACK_SLOTS", "2")))
 V2_LONG_BRAKE_MIN_SLOTS       = int(float(os.environ.get("V2_LONG_BRAKE_MIN_SLOTS", "2")))
-V2_LONG_BRAKE_MIN_DONE        = int(float(os.environ.get("V2_LONG_BRAKE_MIN_DONE", "10")))
-V2_LONG_BRAKE_STOP_WINRATE    = _env_float("V2_LONG_BRAKE_STOP_WINRATE", 20.0)
-V2_LONG_BRAKE_STOP_AVGPNL     = _env_float("V2_LONG_BRAKE_STOP_AVGPNL", -0.30)
-V2_LONG_BRAKE_CAUTION_WINRATE = _env_float("V2_LONG_BRAKE_CAUTION_WINRATE", 35.0)
-V2_LONG_BRAKE_CAUTION_AVGPNL  = _env_float("V2_LONG_BRAKE_CAUTION_AVGPNL", -0.10)
+V2_LONG_BRAKE_MIN_DONE        = int(float(os.environ.get("V2_LONG_BRAKE_MIN_DONE", "6")))
+V2_LONG_BRAKE_STOP_WINRATE    = _env_float("V2_LONG_BRAKE_STOP_WINRATE", 35.0)
+V2_LONG_BRAKE_STOP_AVGPNL     = _env_float("V2_LONG_BRAKE_STOP_AVGPNL", -0.10)
+V2_LONG_BRAKE_CAUTION_WINRATE = _env_float("V2_LONG_BRAKE_CAUTION_WINRATE", 50.0)
+V2_LONG_BRAKE_CAUTION_AVGPNL  = _env_float("V2_LONG_BRAKE_CAUTION_AVGPNL", 0.00)
 V2_LONG_BRAKE_RECOVER_WINRATE = _env_float("V2_LONG_BRAKE_RECOVER_WINRATE", 50.0)
 V2_LONG_BRAKE_RECOVER_AVGPNL  = _env_float("V2_LONG_BRAKE_RECOVER_AVGPNL", 0.00)
 V2_LONG_BRAKE_PROBE_TOP_N     = int(float(os.environ.get("V2_LONG_BRAKE_PROBE_TOP_N", "1")))
@@ -2802,6 +2802,12 @@ V2_LONG_RAW_RESCUE_RSI_MAX         = _env_float("V2_LONG_RAW_RESCUE_RSI_MAX", 65
 V2_LONG_RAW_RESCUE_SHORT_HTF_MAX   = _env_float("V2_LONG_RAW_RESCUE_SHORT_HTF_MAX", 2.0)
 V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL   = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_RAW_RESCUE_ALLOW_SHORT     = str(os.environ.get("V2_LONG_RAW_RESCUE_ALLOW_SHORT", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+# --- LONG RANGE rescue strict filter ---
+V2_LONG_RANGE_RESCUE_RSI_MAX       = _env_float("V2_LONG_RANGE_RESCUE_RSI_MAX", 43.0)
+V2_LONG_RANGE_RESCUE_P2_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P2_MIN", 0.05)
+V2_LONG_RANGE_RESCUE_P3_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P3_MIN", 0.00)
+V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS = [s.strip().upper() for s in str(os.environ.get("V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS", "APT,SUI,STX,BONK")).split(",") if s.strip()]
 
 # --- SHORT raw rescue ---
 V2_SHORT_RAW_RESCUE_ENABLE         = str(os.environ.get("V2_SHORT_RAW_RESCUE_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -3931,6 +3937,33 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if long_raw_rescue:
         score_min_eff = min(score_min_eff, 1.3)
         rsi_min_eff = min(rsi_min_eff, 35.0)
+
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    p3 = _safe_float_or_nan(sig.get("p3_score"))
+    sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+    range_block_syms = {s.strip().upper() for s in V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS if str(s).strip()}
+
+    if long_raw_rescue and btc_mode_compat == "RANGE":
+        if sym in range_block_syms:
+            return False, f"range_rescue_symbol_block sym={sym}"
+
+        if (not np.isfinite(rsi)) or rsi > float(V2_LONG_RANGE_RESCUE_RSI_MAX):
+            return False, (
+                f"range_rescue_rsi_too_high rsi={rsi:.4f} "
+                f"max={float(V2_LONG_RANGE_RESCUE_RSI_MAX):.1f}"
+            )
+
+        if (not np.isfinite(p2)) or p2 < float(V2_LONG_RANGE_RESCUE_P2_MIN):
+            return False, (
+                f"range_rescue_p2_below_min p2={p2:.4f} "
+                f"min={float(V2_LONG_RANGE_RESCUE_P2_MIN):.4f}"
+            )
+
+        if (not np.isfinite(p3)) or p3 < float(V2_LONG_RANGE_RESCUE_P3_MIN):
+            return False, (
+                f"range_rescue_p3_below_min p3={p3:.4f} "
+                f"min={float(V2_LONG_RANGE_RESCUE_P3_MIN):.4f}"
+            )
 
     if total < score_min_eff:
         return False, f"score_below_min total={total:.4f} min={score_min_eff:.4f}"
@@ -5114,28 +5147,57 @@ def get_v2_guardrail_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]
     rep = _get_v2_window_report(int(V2_GUARDRAIL_LOOKBACK_HOURS), now_jst)
     state.update(rep)
 
-    if rep["notify"]["n"] < int(V2_GUARDRAIL_MIN_DONE) or rep["rank_reject"]["n"] < int(V2_GUARDRAIL_MIN_DONE):
+    if (
+        rep["notify"]["n"] < int(V2_GUARDRAIL_MIN_DONE)
+        or rep["rank_reject"]["n"] < int(V2_GUARDRAIL_MIN_DONE)
+        or rep["rejected"]["n"] < int(V2_GUARDRAIL_MIN_DONE)
+    ):
         state["reason"] = "insufficient_data"
         return state
 
     wr_gap = rep["wr_gap_vs_rank_reject"]
     pnl_gap = rep["pnl_gap_vs_rank_reject"]
 
-    if (
-        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_STOP_WR_GAP)) or
-        (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_STOP_PNL_GAP))
-    ):
+    wr_gap_vs_rejected = np.nan
+    pnl_gap_vs_rejected = np.nan
+
+    if np.isfinite(rep["notify"]["wr"]) and np.isfinite(rep["rejected"]["wr"]):
+        wr_gap_vs_rejected = float(rep["notify"]["wr"] - rep["rejected"]["wr"])
+
+    if np.isfinite(rep["notify"]["avg_pnl"]) and np.isfinite(rep["rejected"]["avg_pnl"]):
+        pnl_gap_vs_rejected = float(rep["notify"]["avg_pnl"] - rep["rejected"]["avg_pnl"])
+
+    stop_hit = (
+        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_STOP_WR_GAP))
+        or (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_STOP_PNL_GAP))
+        or (np.isfinite(wr_gap_vs_rejected) and wr_gap_vs_rejected <= float(V2_GUARDRAIL_STOP_WR_GAP))
+        or (np.isfinite(pnl_gap_vs_rejected) and pnl_gap_vs_rejected <= float(V2_GUARDRAIL_STOP_PNL_GAP))
+    )
+
+    if stop_hit:
         state["mode"] = "STOP"
-        state["reason"] = f"stop wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        state["reason"] = (
+            f"stop wr_gap={wr_gap} pnl_gap={pnl_gap} "
+            f"wr_gap_vs_rejected={wr_gap_vs_rejected} "
+            f"pnl_gap_vs_rejected={pnl_gap_vs_rejected}"
+        )
         state["effective_down_top_n"] = 0
         return state
 
-    if (
-        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_CAUTION_WR_GAP)) or
-        (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
-    ):
+    caution_hit = (
+        (np.isfinite(wr_gap) and wr_gap <= float(V2_GUARDRAIL_CAUTION_WR_GAP))
+        or (np.isfinite(pnl_gap) and pnl_gap <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
+        or (np.isfinite(wr_gap_vs_rejected) and wr_gap_vs_rejected <= float(V2_GUARDRAIL_CAUTION_WR_GAP))
+        or (np.isfinite(pnl_gap_vs_rejected) and pnl_gap_vs_rejected <= float(V2_GUARDRAIL_CAUTION_PNL_GAP))
+    )
+
+    if caution_hit:
         state["mode"] = "CAUTION"
-        state["reason"] = f"caution wr_gap={wr_gap} pnl_gap={pnl_gap}"
+        state["reason"] = (
+            f"caution wr_gap={wr_gap} pnl_gap={pnl_gap} "
+            f"wr_gap_vs_rejected={wr_gap_vs_rejected} "
+            f"pnl_gap_vs_rejected={pnl_gap_vs_rejected}"
+        )
         state["effective_down_top_n"] = min(
             int(V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N),
             int(V2_GUARDRAIL_CAUTION_TOP_N),
@@ -5143,7 +5205,11 @@ def get_v2_guardrail_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]
         return state
 
     state["mode"] = "NORMAL"
-    state["reason"] = f"normal wr_gap={wr_gap} pnl_gap={pnl_gap}"
+    state["reason"] = (
+        f"normal wr_gap={wr_gap} pnl_gap={pnl_gap} "
+        f"wr_gap_vs_rejected={wr_gap_vs_rejected} "
+        f"pnl_gap_vs_rejected={pnl_gap_vs_rejected}"
+    )
     return state
 
 
