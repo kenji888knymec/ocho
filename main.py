@@ -6197,18 +6197,84 @@ def _build_short_selection_report(df_done: pd.DataFrame, now_jst: str) -> str:
     return "\n".join(lines)
 
 
+def _summarize_simple(sub: pd.DataFrame, label: str, emoji: str = "📌") -> str:
+    n = len(sub)
+    if n == 0:
+        return f"{emoji} {label}: 0件"
+
+    w = int(sub["_win"].sum()) if "_win" in sub.columns else 0
+    lo = int(sub["_lose"].sum()) if "_lose" in sub.columns else 0
+    wr = (w / (w + lo) * 100) if (w + lo) > 0 else float("nan")
+    avg_pnl = sub["_pnl"].mean() if "_pnl" in sub.columns else float("nan")
+
+    wr_str = f"{wr:.1f}%" if not pd.isna(wr) else "N/A"
+    pnl_str = f"{avg_pnl:+.2f}%" if not pd.isna(avg_pnl) else "N/A"
+
+    return f"{emoji} {label}: {n}件 / 勝率 {wr_str} / 平均 {pnl_str}"
+
+
+def _build_symbol_ranking_lines(df: pd.DataFrame, title: str, top_n: int = 5) -> list:
+    """
+    銘柄別ランキングを、わかりやすい表現で出す。
+    3件以上ある銘柄だけを対象に、平均PnL順で上位を出す。
+    """
+    lines = [f"【{title}】"]
+
+    if "Symbol" not in df.columns or df.empty:
+        lines.append("・データなし")
+        return lines
+
+    work = df.copy()
+    work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
+
+    rows = []
+    for sym, sub in work.groupby("Symbol"):
+        n = len(sub)
+        if n < 3:
+            continue
+
+        w = int(sub["_win"].sum()) if "_win" in sub.columns else 0
+        lo = int(sub["_lose"].sum()) if "_lose" in sub.columns else 0
+        wr = (w / (w + lo) * 100) if (w + lo) > 0 else float("nan")
+        avg_pnl = sub["_pnl"].mean() if "_pnl" in sub.columns else float("nan")
+
+        rows.append({
+            "symbol": sym,
+            "n": n,
+            "wins": w,
+            "wr": wr,
+            "avg_pnl": avg_pnl,
+        })
+
+    if not rows:
+        lines.append("・対象なし（3件以上の銘柄なし）")
+        return lines
+
+    rank_df = pd.DataFrame(rows)
+    rank_df = rank_df.sort_values(["avg_pnl", "wr", "n"], ascending=[False, False, False]).head(top_n)
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    for i, row in enumerate(rank_df.itertuples(index=False), start=1):
+        medal = medals[i - 1] if i - 1 < len(medals) else f"{i}."
+        lines.append(
+            f"{medal} {row.symbol}: "
+            f"{row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+        )
+
+    return lines
+
+
 def analyze_v2_performance() -> str:
-    """v2_shadow_ai の完了データを SHORT/LONG 別のカットオフで分割して集計し、Discord に送信する。"""
-    # SHORT カットオフ（コード修正: レジーム転換検出・NaN安全化・TP固定化・FR改善）
-    CUTOFF_SHORT_STR = "2026-03-21 16:20"
-    CUTOFF_SHORT = pd.Timestamp("2026-03-21 16:20:00")
-    CHANGE_SUMMARY_SHORT = "レジーム転換検出・NaN安全化・TP倍率固定化・FR取得改善"
-
-    # LONG カットオフ（コード修正: LONGフィルター・QualityScore・選抜パイプライン追加）
-    CUTOFF_LONG_STR = "2026-03-21 23:30"
-    CUTOFF_LONG = pd.Timestamp("2026-03-21 23:30:00")
-    CHANGE_SUMMARY_LONG = "LONG選抜パイプライン追加（defensive_filter_long・calc_long_quality_score・rank_and_select_long）"
-
+    """
+    朝5:57の daily report 用。
+    難しい集計は消して、必要な結果だけを1通で送る。
+    - 全体
+    - 採用（notify_pass=1）
+    - 惜しくも落選（RANK_REJECT）
+    - 除外（REJECTED）
+    - 銘柄別ランキング
+    """
     try:
         df_all = get_v2_shadow_ai_data()
     except Exception as e:
@@ -6217,7 +6283,7 @@ def analyze_v2_performance() -> str:
         return msg
 
     total_rows = len(df_all)
-    df_done = get_v2_done_records(df_all)
+    df_done = get_v2_done_records(df_all).copy()
     n_done = len(df_done)
 
     if "EvalStatus" in df_all.columns:
@@ -6226,19 +6292,18 @@ def analyze_v2_performance() -> str:
     else:
         n_open = 0
 
-    now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+    now_jst = datetime.now(JST)
+    now_str = now_jst.strftime("%Y-%m-%d %H:%M JST")
 
     if n_done == 0:
         msg = "\n".join([
-            "=== V2 Shadow AI 分析レポート ===",
-            f"集計日時: {now_jst}",
-            f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
-            "（完了データなし）",
+            "📘【V2 デイリーレポート】",
+            f"🕒 {now_str}",
+            f"📦 総件数 {total_rows} / OPEN {n_open} / DONE {n_done}",
+            "・完了データなし",
         ])
         send_discord_message(msg)
         return msg
-
-    df_done = df_done.copy()
 
     # ---- 共通前処理 ----
     if "PnL_Pct" in df_done.columns:
@@ -6251,175 +6316,81 @@ def analyze_v2_performance() -> str:
 
     if "WinLose" in df_done.columns:
         wl = df_done["WinLose"].astype(str).str.strip().str.lower()
-        df_done["_win"] = wl.isin(["win", "w", "1", "true"])
-        df_done["_lose"] = wl.isin(["lose", "l", "0", "false"])
+        df_done["_win"] = wl.eq("win")
+        df_done["_lose"] = wl.eq("lose")
     else:
         df_done["_win"] = False
         df_done["_lose"] = False
 
-    # ---- Datetime_JST パース ----
     if "Datetime_JST" in df_done.columns:
-        dt_parsed = pd.to_datetime(
-            df_done["Datetime_JST"].astype(str).str.strip(),
-            errors="coerce",
-        )
-        n_dt_invalid = int(dt_parsed.isna().sum())
+        df_done["_dt"] = pd.to_datetime(df_done["Datetime_JST"], errors="coerce")
     else:
-        dt_parsed = pd.Series([pd.NaT] * len(df_done), index=df_done.index)
-        n_dt_invalid = len(df_done)
+        df_done["_dt"] = pd.NaT
 
-    # ---- Direction で SHORT / LONG に分離 ----
-    if "Direction" in df_done.columns:
-        direction_col = df_done["Direction"].astype(str).str.strip().str.upper()
+    since = pd.Timestamp(now_jst.replace(tzinfo=None)) - pd.Timedelta(hours=24)
+    df_24h = df_done[df_done["_dt"] >= since].copy()
+
+    if df_24h.empty:
+        msg = "\n".join([
+            "📘【V2 デイリーレポート】",
+            f"🕒 {now_str}",
+            f"📦 総件数 {total_rows} / OPEN {n_open} / DONE {n_done}",
+            "・直近24時間の完了データなし",
+        ])
+        send_discord_message(msg)
+        return msg
+
+    # notify_pass=1 判定
+    note_col = None
+    for c in ["AI_Note", "ai_note"]:
+        if c in df_24h.columns:
+            note_col = c
+            break
+
+    if note_col:
+        note = df_24h[note_col].astype(str)
+        df_24h["_notify_1"] = note.str.contains("notify_pass=1", na=False)
     else:
-        direction_col = pd.Series([""] * len(df_done), index=df_done.index)
+        df_24h["_notify_1"] = False
 
-    df_short = df_done[direction_col == "SHORT"].copy()
-    df_long = df_done[direction_col == "LONG"].copy()
-    dt_short = dt_parsed[direction_col == "SHORT"]
-    dt_long = dt_parsed[direction_col == "LONG"]
+    if "AI_Band" in df_24h.columns:
+        df_24h["AI_Band"] = df_24h["AI_Band"].astype(str).str.strip().str.upper()
+    else:
+        df_24h["AI_Band"] = ""
 
-    # SHORT 前後分割
-    df_short_before = df_short[dt_short < CUTOFF_SHORT].copy()
-    df_short_after = df_short[dt_short >= CUTOFF_SHORT].copy()
+    notify_df = df_24h[df_24h["_notify_1"]].copy()
+    rank_reject_df = df_24h[df_24h["AI_Band"] == "RANK_REJECT"].copy()
+    rejected_df = df_24h[df_24h["AI_Band"] == "REJECTED"].copy()
 
-    # LONG 前後分割
-    df_long_before = df_long[dt_long < CUTOFF_LONG].copy()
-    df_long_after = df_long[dt_long >= CUTOFF_LONG].copy()
+    # 方向別件数
+    long_n = 0
+    short_n = 0
+    if "Direction" in df_24h.columns:
+        dir_col = df_24h["Direction"].astype(str).str.strip().str.upper()
+        long_n = int((dir_col == "LONG").sum())
+        short_n = int((dir_col == "SHORT").sum())
 
-    def _summarize(sub: pd.DataFrame, label: str) -> str:
-        n = len(sub)
-        if n == 0:
-            return f"  {label}: 0件"
-        w = int(sub["_win"].sum())
-        lo = int(sub["_lose"].sum())
-        wr = w / (w + lo) * 100 if (w + lo) > 0 else float("nan")
-        avg_pnl = sub["_pnl"].mean()
-        wr_str = f"{wr:.1f}%" if not pd.isna(wr) else "N/A"
-        pnl_str = f"{avg_pnl:+.2f}%" if not pd.isna(avg_pnl) else "N/A"
-        return f"  {label}: {n}件 | Win:{w} Lose:{lo} | 勝率:{wr_str} | 平均PnL:{pnl_str}"
-
-    def _build_section_lines(df: pd.DataFrame) -> list:
-        """1つのデータフレームに対して全集計軸のlineリストを返す。"""
-        sec = []
-
-        sec.append("【全体】")
-        sec.append(_summarize(df, "DONE合計"))
-
-        sec.append("")
-        sec.append("【Symbol別（件数降順・上位10件）】")
-        if "Symbol" in df.columns:
-            symbol_col = df["Symbol"].astype(str).str.strip()
-            top_symbols = symbol_col.value_counts().head(10).index.tolist()
-            for sym in top_symbols:
-                sub = df[symbol_col == sym]
-                sec.append(_summarize(sub, str(sym)))
-        else:
-            sec.append("  Symbol列なし")
-
-        sec.append("")
-        sec.append("【P3_VolumeScore別】")
-        if "P3_VolumeScore" in df.columns:
-            p3 = pd.to_numeric(df["P3_VolumeScore"], errors="coerce")
-            df = df.copy()
-            df["_p3_cat"] = "ゼロ"
-            df.loc[p3 > 0, "_p3_cat"] = "プラス"
-            df.loc[p3 < 0, "_p3_cat"] = "マイナス"
-            for cat in ["プラス", "ゼロ", "マイナス"]:
-                sub = df[df["_p3_cat"] == cat]
-                sec.append(_summarize(sub, f"P3={cat}"))
-        else:
-            sec.append("  P3_VolumeScore列なし")
-
-        sec.append("")
-        sec.append("【Hour_JST別（3件以上）】")
-        if "Hour_JST" in df.columns:
-            hour_num = pd.to_numeric(df["Hour_JST"], errors="coerce")
-            hour_counts = hour_num.dropna().astype(int).value_counts()
-            target_hours = sorted(hour_counts[hour_counts >= 3].index.tolist())
-            if target_hours:
-                for h in target_hours:
-                    sub = df[hour_num.fillna(-1).astype(int) == h]
-                    sec.append(_summarize(sub, f"{h:02d}時"))
-            else:
-                sec.append("  3件以上の時間帯なし（データ不足）")
-        else:
-            sec.append("  Hour_JST列なし")
-
-        return sec
-
-    header_common = [
-        f"集計日時: {now_jst}",
-        f"総行数: {total_rows} | OPEN中: {n_open} | DONE: {n_done}",
-        f"  うちDatetime_JST解析失敗: {n_dt_invalid}件（除外）",
-        f"  SHORT: 変更前({CUTOFF_SHORT_STR}より前)={len(df_short_before)}件 / 変更後({CUTOFF_SHORT_STR}以降)={len(df_short_after)}件",
-        f"  LONG:  変更前({CUTOFF_LONG_STR}より前)={len(df_long_before)}件 / 変更後({CUTOFF_LONG_STR}以降)={len(df_long_after)}件",
+    lines = [
+        "📘【V2 デイリーレポート】",
+        f"🕒 {now_str}",
+        f"📦 直近24h DONE {len(df_24h)}件 / 全体OPEN {n_open}件",
+        f"🟢 LONG {long_n}件 / 🔴 SHORT {short_n}件",
+        "",
+        _summarize_simple(notify_df, "採用（通知ON）", "✅"),
+        _summarize_simple(rank_reject_df, "惜しくも落選", "🟡"),
+        _summarize_simple(rejected_df, "除外", "🔴"),
+        "",
     ]
 
-    # ---- ① SHORT 変更前レポート ----
-    lines_s_before = [
-        f"=== V2 Shadow AI 分析レポート ①SHORT変更前 ({CUTOFF_SHORT_STR}より前) ===",
-    ] + header_common + [""]
-    if len(df_short_before) == 0:
-        lines_s_before.append("（SHORT変更前の完了データなし）")
-    else:
-        lines_s_before += _build_section_lines(df_short_before)
-    msg_short_before = "\n".join(lines_s_before)
-    send_discord_message(msg_short_before)
-    print(f"[V2-REPORT] ①SHORT変更前送信完了. short_before={len(df_short_before)}")
+    lines += _build_symbol_ranking_lines(notify_df, "採用銘柄ランキング", top_n=5)
+    lines += [""]
+    lines += _build_symbol_ranking_lines(rank_reject_df, "惜しくも落選ランキング", top_n=5)
 
-    # ---- ② SHORT 変更後レポート ----
-    lines_s_after = [
-        f"=== V2 Shadow AI 分析レポート ②SHORT変更後 ({CUTOFF_SHORT_STR}以降) ===",
-        f"※コード修正内容: {CHANGE_SUMMARY_SHORT}",
-    ] + header_common + [""]
-    if len(df_short_after) == 0:
-        lines_s_after.append("（SHORT変更後の完了データなし）")
-    else:
-        lines_s_after += _build_section_lines(df_short_after)
-    msg_short_after = "\n".join(lines_s_after)
-    send_discord_message(msg_short_after)
-    print(f"[V2-REPORT] ②SHORT変更後送信完了. short_after={len(df_short_after)}")
+    msg = "\n".join([x for x in lines if x is not None])
 
-    # ---- ③ LONG 変更前レポート ----
-    lines_l_before = [
-        f"=== V2 Shadow AI 分析レポート ③LONG変更前 ({CUTOFF_LONG_STR}より前) ===",
-    ] + header_common + [""]
-    if len(df_long_before) == 0:
-        lines_l_before.append("（LONG変更前の完了データなし）")
-    else:
-        lines_l_before += _build_section_lines(df_long_before)
-    msg_long_before = "\n".join(lines_l_before)
-    send_discord_message(msg_long_before)
-    print(f"[V2-REPORT] ③LONG変更前送信完了. long_before={len(df_long_before)}")
-
-    # ---- ④ LONG 変更後レポート ----
-    lines_l_after = [
-        f"=== V2 Shadow AI 分析レポート ④LONG変更後 ({CUTOFF_LONG_STR}以降) ===",
-        f"※コード修正内容: {CHANGE_SUMMARY_LONG}",
-    ] + header_common + [""]
-    if len(df_long_after) == 0:
-        lines_l_after.append("（LONG変更後の完了データなし）")
-    else:
-        lines_l_after += _build_section_lines(df_long_after)
-    msg_long_after = "\n".join(lines_l_after)
-    send_discord_message(msg_long_after)
-    print(f"[V2-REPORT] ④LONG変更後送信完了. long_after={len(df_long_after)}")
-
-    # ---- ⑤ SHORT 選抜効果分析 ----
-    msg_selection = _build_short_selection_report(df_done, now_jst)
-    send_discord_message(msg_selection)
-    print(f"[V2-REPORT] ⑤SHORT選抜効果送信完了.")
-
-    # ---- ⑥ Claude AI 分析 ----
-    call_claude_for_analysis(
-        msg_short_before, msg_short_after,
-        msg_long_before, msg_long_after,
-        CHANGE_SUMMARY_SHORT, CHANGE_SUMMARY_LONG,
-        CUTOFF_SHORT_STR, CUTOFF_LONG_STR,
-    )
-
-    return "\n\n".join([msg_short_before, msg_short_after, msg_long_before, msg_long_after, msg_selection])
+    send_discord_message(msg)
+    print(f"[V2-REPORT] daily concise report sent. done24h={len(df_24h)} notify={len(notify_df)} rank_reject={len(rank_reject_df)} rejected={len(rejected_df)}")
+    return msg
 
 
 # ==========================================
