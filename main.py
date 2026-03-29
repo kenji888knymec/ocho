@@ -2855,6 +2855,17 @@ V2_LONG_RANK_P2_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P2_WEAK_PENALTY
 V2_LONG_RANK_P3_WEAK_PENALTY          = _env_float("V2_LONG_RANK_P3_WEAK_PENALTY", 0.08)
 V2_LONG_RANK_BAD_HOUR_PENALTY         = _env_float("V2_LONG_RANK_BAD_HOUR_PENALTY", 0.06)
 
+# --- LONG rank blend (AI + rule composite) ---
+V2_LONG_RANK_BLEND_ENABLE          = str(os.environ.get("V2_LONG_RANK_BLEND_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RANK_W_AI                  = _env_float("V2_LONG_RANK_W_AI", 1.00)
+V2_LONG_RANK_W_QS                  = _env_float("V2_LONG_RANK_W_QS", 0.35)
+V2_LONG_RANK_W_P2                  = _env_float("V2_LONG_RANK_W_P2", 0.30)
+V2_LONG_RANK_W_P3                  = _env_float("V2_LONG_RANK_W_P3", 0.20)
+V2_LONG_RANK_W_RSI                 = _env_float("V2_LONG_RANK_W_RSI", 0.10)
+V2_LONG_RANK_RAW_RESCUE_PENALTY    = _env_float("V2_LONG_RANK_RAW_RESCUE_PENALTY", 0.12)
+V2_LONG_RANK_MODE_UP_PENALTY       = _env_float("V2_LONG_RANK_MODE_UP_PENALTY", 0.10)
+V2_LONG_RANK_MODE_RANGE_PENALTY    = _env_float("V2_LONG_RANK_MODE_RANGE_PENALTY", 0.05)
+
 # --- monitor / guard / retrain cadence ---
 V2_MONITOR_1H_ENABLE                  = str(os.environ.get("V2_MONITOR_1H_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_MONITOR_1H_LOOKBACK_HOURS          = int(float(os.environ.get("V2_MONITOR_1H_LOOKBACK_HOURS", "1")))
@@ -4482,6 +4493,61 @@ def _assess_long_ai_bad_regime(sig: Dict[str, Any]) -> Dict[str, Any]:
     return {"mode": mode, "hit_count": hits, "tags": tags, "note": note}
 
 
+def _long_rank_rsi_bonus(sig: Dict[str, Any]) -> float:
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    if not np.isfinite(rsi):
+        return 0.0
+
+    if rsi <= 38.0:
+        return 0.20
+    if rsi <= 43.0:
+        return 0.10
+    if rsi <= 48.0:
+        return 0.00
+    return -0.10
+
+
+def _long_rank_mode_penalty(sig: Dict[str, Any]) -> float:
+    mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    if mode == "UP":
+        return float(V2_LONG_RANK_MODE_UP_PENALTY)
+    if mode == "RANGE":
+        return float(V2_LONG_RANK_MODE_RANGE_PENALTY)
+    return 0.0
+
+
+def _long_rank_raw_rescue_penalty(sig: Dict[str, Any]) -> float:
+    raw = sig.get("long_raw_rescue", None)
+    s = ("" if raw is None else str(raw)).strip().lower()
+    return float(V2_LONG_RANK_RAW_RESCUE_PENALTY) if s in {"1", "true", "yes", "on"} else 0.0
+
+
+def _long_rank_blend_score(sig: Dict[str, Any]) -> float:
+    score = 0.0
+
+    base_ai = _safe_float_or_nan(sig.get("ai_prob_win"))
+    qs = _safe_float_or_nan(sig.get("qs"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    p3 = _safe_float_or_nan(sig.get("p3_score"))
+
+    if np.isfinite(base_ai):
+        score += float(V2_LONG_RANK_W_AI) * float(base_ai)
+    if np.isfinite(qs):
+        score += float(V2_LONG_RANK_W_QS) * float(qs)
+    if np.isfinite(p2):
+        score += float(V2_LONG_RANK_W_P2) * float(p2)
+    if np.isfinite(p3):
+        score += float(V2_LONG_RANK_W_P3) * float(p3)
+
+    rsi_bonus = _long_rank_rsi_bonus(sig)
+    score += float(V2_LONG_RANK_W_RSI) * float(rsi_bonus)
+
+    score -= _long_rank_mode_penalty(sig)
+    score -= _long_rank_raw_rescue_penalty(sig)
+
+    return float(score)
+
+
 def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     LONG候補を ai_prob_win 降順に並べる。
@@ -4509,7 +4575,11 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
             elif str(t).startswith("bad_hour:"):
                 penalty += float(V2_LONG_RANK_BAD_HOUR_PENALTY)
 
-        return float(base_ai - penalty)
+        if not V2_LONG_RANK_BLEND_ENABLE:
+            return float(base_ai - penalty)
+
+        blend_score = _long_rank_blend_score(sig)
+        return float(blend_score - penalty)
 
     ranked = sorted(
         long_signals,
@@ -4566,6 +4636,7 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
     for rank_idx, sig in enumerate(ranked, start=1):
         sig["_long_rank_pos"] = int(rank_idx)
         current_note = str(sig.get("ai_note", "") or "")
+        rank_score = _long_rank_score(sig)
 
         if brake_mode == "STOP":
             sig["ai_pass"] = "0"
@@ -4591,7 +4662,7 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
                 sig["ai_band"] = current_band if current_band else "RULE_QS"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=true;"
+                f"top_n={effective_top_n};selected=true;rank_score={rank_score:.6f};"
                 f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
                 f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
                 f"brake_reason={brake.get('reason', '')}"
@@ -4606,7 +4677,7 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
                 reject_reason = "rank_exceeded"
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=false;reason={reject_reason};"
+                f"top_n={effective_top_n};selected=false;rank_score={rank_score:.6f};reason={reject_reason};"
                 f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
                 f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
                 f"brake_reason={brake.get('reason', '')}"
@@ -4722,6 +4793,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
 
             qs = calc_long_quality_score(sig)
+            sig["qs"] = round(float(qs), 6) if np.isfinite(qs) else ""
 
             if not np.isfinite(qs):
                 sig["ai_prob_win"] = ""
