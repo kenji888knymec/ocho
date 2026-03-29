@@ -89,6 +89,7 @@ if not _route_exists("/train_ping", "GET"):
 # ==========================================
 discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
 print(f"[CFG] DISCORD_WEBHOOK_URL_LEN={len(discord_webhook_url)}")
+daily_discord_webhook_url = os.environ.get("DAILY_DISCORD_WEBHOOK_URL", "").strip()
 
 # Hyperliquid: 最大5倍銘柄（この銘柄だけ HL 表示を x5 にする）
 # ※環境変数 MAX_LEV_5X_SYMBOLS が未設定（空）の場合は、このデフォルトセットを使う
@@ -538,6 +539,27 @@ def send_discord_message(text: str):
                 print(f"[DBG] discord body={r.text[:200]}")
         except Exception as e:
             print(f"[ERR] discord webhook post: {e}")
+
+
+def send_daily_discord_message(text: str):
+    """
+    日次レポート専用Webhookに送る。
+    DAILY_DISCORD_WEBHOOK_URL が未設定なら通常Webhookへフォールバックする。
+    """
+    webhook = daily_discord_webhook_url or discord_webhook_url
+    if (not webhook) or ("ここに" in webhook):
+        print("[DBG] daily discord webhook url empty or placeholder")
+        return
+
+    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
+    for chunk in chunks:
+        try:
+            r = http.post(webhook, json={"content": chunk}, timeout=10)
+            print(f"[DBG] daily discord status={r.status_code}")
+            if r.status_code >= 300:
+                print(f"[DBG] daily discord body={r.text[:200]}")
+        except Exception as e:
+            print(f"[ERR] daily discord webhook post: {e}")
 
 def get_sheet_service():
     now = time.time()
@@ -6302,7 +6324,7 @@ def analyze_v2_performance() -> str:
             f"📦 総件数 {total_rows} / OPEN {n_open} / DONE {n_done}",
             "・完了データなし",
         ])
-        send_discord_message(msg)
+        send_daily_discord_message(msg)
         return msg
 
     # ---- 共通前処理 ----
@@ -6337,7 +6359,7 @@ def analyze_v2_performance() -> str:
             f"📦 総件数 {total_rows} / OPEN {n_open} / DONE {n_done}",
             "・直近24時間の完了データなし",
         ])
-        send_discord_message(msg)
+        send_daily_discord_message(msg)
         return msg
 
     # notify_pass=1 判定
@@ -6388,7 +6410,7 @@ def analyze_v2_performance() -> str:
 
     msg = "\n".join([x for x in lines if x is not None])
 
-    send_discord_message(msg)
+    send_daily_discord_message(msg)
     print(f"[V2-REPORT] daily concise report sent. done24h={len(df_24h)} notify={len(notify_df)} rank_reject={len(rank_reject_df)} rejected={len(rejected_df)}")
     return msg
 
