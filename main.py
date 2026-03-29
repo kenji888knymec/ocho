@@ -922,6 +922,151 @@ def fmt_opt(label: str, v, suffix=""):
         return ""
     return f"{label}{v}{suffix}"
 
+
+def _v2_notify_key(sig: Dict[str, Any]) -> str:
+    """
+    同じ候補を /run のたびに重複通知しないためのキー。
+    """
+    return "|".join([
+        str(sig.get("time", "") or sig.get("Datetime_JST", "") or ""),
+        str(sig.get("symbol", "") or ""),
+        str(sig.get("direction", "") or ""),
+        str(sig.get("entry_price", "") or sig.get("EntryPrice", "") or ""),
+        str(sig.get("tp_price", "") or sig.get("TP_Price", "") or ""),
+        str(sig.get("sl_price", "") or sig.get("SL_Price", "") or ""),
+    ])
+
+
+def _safe_num_str(v, digits: int = 4) -> str:
+    try:
+        if v is None or v == "":
+            return ""
+        x = float(v)
+        if not np.isfinite(x):
+            return ""
+        return f"{x:.{digits}f}"
+    except Exception:
+        return ""
+
+
+def _safe_pct_str(v, digits: int = 2) -> str:
+    try:
+        if v is None or v == "":
+            return ""
+        x = float(v)
+        if not np.isfinite(x):
+            return ""
+        return f"{x:.{digits}f}"
+    except Exception:
+        return ""
+
+
+def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
+    """
+    V1と同じ用途の実運用通知向けメッセージ。
+    表示項目は V1 と同じ発想で、
+    Symbol / Side / Entry / TP / SL / レバ考慮TP% / レバ考慮SL% / Score / Note
+    を並べる。
+    """
+    symbol = str(sig.get("symbol", "") or "").strip().upper()
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    dt_str = str(sig.get("time", "") or sig.get("Datetime_JST", "") or "").strip()
+    dt_str = normalize_dt_str(dt_str) if dt_str else ""
+
+    entry = _safe_num_str(sig.get("entry_price", sig.get("EntryPrice", "")))
+    tp_price = _safe_num_str(sig.get("tp_price", sig.get("TP_Price", "")))
+    sl_price = _safe_num_str(sig.get("sl_price", sig.get("SL_Price", "")))
+
+    tp_pct = _safe_pct_str(sig.get("tp_pct", sig.get("TP_Pct", "")))
+    sl_pct = _safe_pct_str(sig.get("sl_pct", sig.get("SL_Pct", "")))
+
+    lev = sig.get("leverage", sig.get("Lev", DEFAULT_LEV))
+    try:
+        lev_i = int(float(lev))
+    except Exception:
+        lev_i = int(DEFAULT_LEV)
+
+    # Hyperliquid等の5x銘柄表示ルールを既存運用に合わせる
+    display_lev = 5 if symbol in MAX_LEV_5X_SYMBOLS else lev_i
+
+    tp_lev_pct = _safe_pct_str(sig.get("tp_lev_pct", sig.get("TP_Lev%", "")))
+    sl_lev_pct = _safe_pct_str(sig.get("sl_lev_pct", sig.get("SL_Lev%", "")))
+
+    if tp_lev_pct == "" and tp_pct != "":
+        try:
+            tp_lev_pct = f"{float(tp_pct) * float(display_lev):.2f}"
+        except Exception:
+            tp_lev_pct = ""
+    if sl_lev_pct == "" and sl_pct != "":
+        try:
+            sl_lev_pct = f"{float(sl_pct) * float(display_lev):.2f}"
+        except Exception:
+            sl_lev_pct = ""
+
+    total_score = _safe_pct_str(sig.get("total_score", sig.get("TotalScore", "")), digits=2)
+    p1_score = _safe_pct_str(sig.get("p1_score", sig.get("P1_TrendScore", "")), digits=2)
+    ai_prob = _safe_pct_str(sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")), digits=3)
+
+    note = str(sig.get("note", "") or sig.get("ai_note", "") or "").strip()
+    notify_reason = str(sig.get("_notify_reason", "") or "").strip()
+
+    side_emoji = "🟢" if direction == "LONG" else "🔴"
+
+    lines = [
+        f"{side_emoji}【{symbol} {direction}】",
+        f"Time: {dt_str}" if dt_str else "",
+        f"Entry: {entry}" if entry else "",
+        f"TP: {tp_price} ({tp_pct}% / {tp_lev_pct}%@x{display_lev})" if tp_price else "",
+        f"SL: {sl_price} ({sl_pct}% / {sl_lev_pct}%@x{display_lev})" if sl_price else "",
+        f"Score: {total_score}" if total_score else "",
+        f"P1: {p1_score}" if p1_score else "",
+        f"AI: {ai_prob}" if ai_prob else "",
+        f"Reason: {notify_reason}" if notify_reason else "",
+        f"Note: {note}" if note else "",
+    ]
+
+    return "\n".join([x for x in lines if x])
+
+
+def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> int:
+    """
+    V2の notify_pass=1 候補を Discord へ送る。
+    同一候補の重複送信は last_alert_records で抑止。
+    """
+    global last_alert_records
+
+    sent = 0
+    now_ts = int(time.time())
+
+    # 古いdedupeキーを掃除（24h保持）
+    try:
+        expire_before = now_ts - 86400
+        last_alert_records = {
+            k: v for k, v in last_alert_records.items()
+            if int(v) >= expire_before
+        }
+    except Exception:
+        pass
+
+    for sig in notify_candidates:
+        key = _v2_notify_key(sig)
+        if key in last_alert_records:
+            continue
+
+        msg = _build_v2_discord_message(sig)
+        if not msg:
+            continue
+
+        try:
+            send_discord_message(msg)
+            last_alert_records[key] = now_ts
+            sent += 1
+        except Exception as e:
+            print(f"[WARN] send_v2_live_discord_alerts failed: {type(e).__name__}: {e}")
+
+    return sent
+
+
 # ==========================================
 # OKX
 # ==========================================
@@ -6524,9 +6669,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             x for x in final_signals
             if str(x.get("_notify_pass", "0")) == "1"
         ]
+
+        sent_n = send_v2_live_discord_alerts(notify_candidates)
+
         print(
-            f"[V2] engine_mode=v2_live (notification hook not implemented yet) "
-            f"notify_candidates={len(notify_candidates)}"
+            f"[V2] engine_mode=v2_live "
+            f"notify_candidates={len(notify_candidates)} "
+            f"discord_sent={sent_n}"
         )
 
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
