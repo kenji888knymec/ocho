@@ -6235,14 +6235,21 @@ def _summarize_simple(sub: pd.DataFrame, label: str, emoji: str = "📌") -> str
     return f"{emoji} {label}: {n}件 / 勝率 {wr_str} / 平均 {pnl_str}"
 
 
-def _build_symbol_ranking_lines(df: pd.DataFrame, title: str, top_n: int = 5) -> list:
+def _build_symbol_ranking_lines(
+    df: pd.DataFrame,
+    title: str,
+    top_n: int = 5,
+    sort_bad: bool = False,
+    min_n: int = 3,
+) -> list:
     """
-    銘柄別ランキングを、わかりやすい表現で出す。
-    3件以上ある銘柄だけを対象に、平均PnL順で上位を出す。
+    銘柄別ランキングを daily 用に出す。
+    sort_bad=False: 良い順
+    sort_bad=True : 悪い順
     """
     lines = [f"【{title}】"]
 
-    if "Symbol" not in df.columns or df.empty:
+    if df is None or df.empty or "Symbol" not in df.columns:
         lines.append("・データなし")
         return lines
 
@@ -6252,12 +6259,12 @@ def _build_symbol_ranking_lines(df: pd.DataFrame, title: str, top_n: int = 5) ->
     rows = []
     for sym, sub in work.groupby("Symbol"):
         n = len(sub)
-        if n < 3:
+        if n < int(min_n):
             continue
 
         w = int(sub["_win"].sum()) if "_win" in sub.columns else 0
         lo = int(sub["_lose"].sum()) if "_lose" in sub.columns else 0
-        wr = (w / (w + lo) * 100) if (w + lo) > 0 else float("nan")
+        wr = (w / (w + lo) * 100.0) if (w + lo) > 0 else float("nan")
         avg_pnl = sub["_pnl"].mean() if "_pnl" in sub.columns else float("nan")
 
         rows.append({
@@ -6273,15 +6280,24 @@ def _build_symbol_ranking_lines(df: pd.DataFrame, title: str, top_n: int = 5) ->
         return lines
 
     rank_df = pd.DataFrame(rows)
-    rank_df = rank_df.sort_values(["avg_pnl", "wr", "n"], ascending=[False, False, False]).head(top_n)
+
+    if sort_bad:
+        rank_df = rank_df.sort_values(
+            ["avg_pnl", "wr", "n"],
+            ascending=[True, True, False],
+        ).head(int(top_n))
+    else:
+        rank_df = rank_df.sort_values(
+            ["avg_pnl", "wr", "n"],
+            ascending=[False, False, False],
+        ).head(int(top_n))
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
     for i, row in enumerate(rank_df.itertuples(index=False), start=1):
         medal = medals[i - 1] if i - 1 < len(medals) else f"{i}."
         lines.append(
-            f"{medal} {row.symbol}: "
-            f"{row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+            f"{medal} {row.symbol}: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
         )
 
     return lines
@@ -6289,19 +6305,24 @@ def _build_symbol_ranking_lines(df: pd.DataFrame, title: str, top_n: int = 5) ->
 
 def analyze_v2_performance() -> str:
     """
-    朝5:57の daily report 用。
-    難しい集計は消して、必要な結果だけを1通で送る。
+    daily report 用。
+    daily 専用Webhookへ送り、
+    内容は薄すぎず・長すぎずにする。
     - 全体
-    - 採用（notify_pass=1）
-    - 惜しくも落選（RANK_REJECT）
-    - 除外（REJECTED）
-    - 銘柄別ランキング
+    - 採用
+    - 惜しくも落選
+    - 除外
+    - 良い銘柄ランキング
+    - 悪い銘柄ランキング
+    - 惜しくも落選ランキング
+    その後に AI サマリーも送る。
     """
     try:
         df_all = get_v2_shadow_ai_data()
     except Exception as e:
         msg = f"[V2-REPORT] シート取得失敗: {e}"
         print(msg)
+        send_daily_discord_message(msg)
         return msg
 
     total_rows = len(df_all)
@@ -6327,7 +6348,6 @@ def analyze_v2_performance() -> str:
         send_daily_discord_message(msg)
         return msg
 
-    # ---- 共通前処理 ----
     if "PnL_Pct" in df_done.columns:
         df_done["_pnl"] = pd.to_numeric(
             df_done["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
@@ -6362,7 +6382,6 @@ def analyze_v2_performance() -> str:
         send_daily_discord_message(msg)
         return msg
 
-    # notify_pass=1 判定
     note_col = None
     for c in ["AI_Note", "ai_note"]:
         if c in df_24h.columns:
@@ -6384,7 +6403,6 @@ def analyze_v2_performance() -> str:
     rank_reject_df = df_24h[df_24h["AI_Band"] == "RANK_REJECT"].copy()
     rejected_df = df_24h[df_24h["AI_Band"] == "REJECTED"].copy()
 
-    # 方向別件数
     long_n = 0
     short_n = 0
     if "Direction" in df_24h.columns:
@@ -6395,23 +6413,53 @@ def analyze_v2_performance() -> str:
     lines = [
         "📘【V2 デイリーレポート】",
         f"🕒 {now_str}",
-        f"📦 直近24h DONE {len(df_24h)}件 / 全体OPEN {n_open}件",
+        f"📦 直近24h DONE {len(df_24h)}件 / OPEN {n_open}件",
         f"🟢 LONG {long_n}件 / 🔴 SHORT {short_n}件",
         "",
-        _summarize_simple(notify_df, "採用（通知ON）", "✅"),
+        _summarize_simple(notify_df, "採用", "✅"),
         _summarize_simple(rank_reject_df, "惜しくも落選", "🟡"),
         _summarize_simple(rejected_df, "除外", "🔴"),
         "",
     ]
 
-    lines += _build_symbol_ranking_lines(notify_df, "採用銘柄ランキング", top_n=5)
+    lines += _build_symbol_ranking_lines(
+        notify_df,
+        "良い銘柄ランキング",
+        top_n=5,
+        sort_bad=False,
+        min_n=3,
+    )
     lines += [""]
-    lines += _build_symbol_ranking_lines(rank_reject_df, "惜しくも落選ランキング", top_n=5)
+    lines += _build_symbol_ranking_lines(
+        notify_df,
+        "悪い銘柄ランキング",
+        top_n=5,
+        sort_bad=True,
+        min_n=3,
+    )
+    lines += [""]
+    lines += _build_symbol_ranking_lines(
+        rank_reject_df,
+        "惜しくも落選ランキング",
+        top_n=5,
+        sort_bad=False,
+        min_n=3,
+    )
 
     msg = "\n".join([x for x in lines if x is not None])
 
     send_daily_discord_message(msg)
-    print(f"[V2-REPORT] daily concise report sent. done24h={len(df_24h)} notify={len(notify_df)} rank_reject={len(rank_reject_df)} rejected={len(rejected_df)}")
+    print(
+        f"[V2-REPORT] daily report sent. "
+        f"done24h={len(df_24h)} notify={len(notify_df)} "
+        f"rank_reject={len(rank_reject_df)} rejected={len(rejected_df)}"
+    )
+
+    try:
+        call_claude_for_analysis_daily(msg)
+    except Exception as e:
+        print(f"[V2-REPORT] Claude daily summary failed: {e}")
+
     return msg
 
 
@@ -6534,6 +6582,79 @@ LONG カットオフ（{cutoff_long_str} JST）に実施したコード修正：
         print(err_msg)
         send_discord_message(err_msg)
         return err_msg
+
+
+def call_claude_for_analysis_daily(daily_report_text: str) -> str:
+    """
+    daily report を読んで、改善だけでなく
+    今日の評価コメントを短く送る。
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("[V2-AI] ANTHROPIC_API_KEY 未設定 — daily AIサマリーをスキップ")
+        return ""
+
+    prompt = f"""あなたは暗号通貨botのV2運用レビュー担当です。
+以下の daily report を読み、Discord向けに短い日本語コメントを作ってください。
+
+【目的】
+改善点だけを並べるのではなく、
+その日の結果をまず評価し、必要なら次の見方を少しだけ足してください。
+
+【出力ルール】
+- 4〜8行くらい
+- 専門用語を減らす
+- 難しい言葉を避ける
+- 先頭に絵文字をつける
+- 「良かった点」「注意点」「次に見るポイント」を短く入れる
+- Discord向けに読みやすくする
+
+【daily report】
+{daily_report_text}
+"""
+
+    try:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": "claude-3-5-sonnet-latest",
+            "max_tokens": 900,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+        }
+
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=body,
+            timeout=90,
+        )
+        if r.status_code >= 300:
+            print(f"[V2-AI] daily Claude HTTP {r.status_code}: {r.text[:300]}")
+            return ""
+
+        data = r.json()
+        text = ""
+        for c in data.get("content", []) or []:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text += str(c.get("text", ""))
+
+        text = text.strip()
+        if not text:
+            return ""
+
+        msg = "🧠【AIサマリー】\n" + text
+        send_daily_discord_message(msg)
+        return msg
+
+    except Exception as e:
+        print(f"[V2-AI] daily Claude summary error: {e}")
+        return ""
 
 
 # ==========================================
