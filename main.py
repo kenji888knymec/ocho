@@ -4427,6 +4427,55 @@ def _allow_long_ai_below_min_rescue(sig: Dict[str, Any], ai_prob: float, ai_th: 
         return False, ""
 
 
+def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    LONG の ai_bypass を限定救済する。
+    全解除ではなく、Down相場で実績が良かった帯だけを通す。
+    """
+    try:
+        direction = str(sig.get("direction", "")).strip().upper()
+        if direction != "LONG":
+            return False, ""
+
+        btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+        rsi = _safe_float_or_nan(sig.get("rsi"))
+        p1 = _safe_float_or_nan(sig.get("p1_score"))
+        p2 = _safe_float_or_nan(sig.get("p2_score"))
+        p3 = _safe_float_or_nan(sig.get("p3_score"))
+
+        if btc_mode_compat != "DOWN":
+            return False, ""
+
+        if not np.isfinite(rsi) or not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(p3):
+            return False, ""
+
+        if not (40.0 <= rsi < 45.0):
+            return False, ""
+
+        if not (1.5 <= p1 < 2.0):
+            return False, ""
+
+        if p2 != 0.0:
+            return False, ""
+
+        if not (p3 <= 0.0):
+            return False, ""
+
+        reason = (
+            "rescued_ai_bypass "
+            f"p1={float(p1):.4f} "
+            f"p2={float(p2):.4f} "
+            f"p3={float(p3):.4f} "
+            f"rsi={float(rsi):.4f} "
+            f"btc_mode={btc_mode_compat} "
+            f"dbg={_v2_compact_dbg(dbg)}"
+        )
+        return True, reason
+
+    except Exception:
+        return False, ""
+
+
 def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) -> Dict[str, Any]:
     """
     V2 sig から事前特徴量だけを使って side別AI推論。
@@ -4484,6 +4533,16 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
         dbg = {"dbg": str(dbg)}
 
     if bypass_x or proba_x is None:
+        allow_rescue, rescue_reason = _allow_long_ai_bypass_rescue(sig, dbg)
+
+        if allow_rescue and np.isfinite(fallback_score):
+            base["score"] = float(fallback_score)
+            base["ok"] = True
+            base["used_fallback"] = False
+            base["model_type"] = f"{side_u}_AI_RESCUE"
+            base["note"] = rescue_reason
+            return base
+
         if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
             base["score"] = float(fallback_score)
             base["ok"] = True
@@ -4491,6 +4550,7 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
             base["model_type"] = f"{side_u}_AI_FALLBACK"
             base["note"] = f"ai_bypass_rule_fallback:{_v2_compact_dbg(dbg)}"
             return base
+
         base["note"] = f"ai_bypass:{_v2_compact_dbg(dbg)}"
         return base
 
