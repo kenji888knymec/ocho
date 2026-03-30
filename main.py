@@ -3892,6 +3892,49 @@ def _allow_long_p1_rescue(sig: Dict[str, Any]) -> bool:
     return True
 
 
+def _allow_long_p1_hard_max_rescue(sig: Dict[str, Any], p1: float, hard_max: float) -> Tuple[bool, str]:
+    """
+    LONG の p1_above_hard_max を限定救済する。
+    全解除ではなく、Up相場で実績が良かった帯だけを通す。
+    """
+    try:
+        side = str(sig.get("direction", "")).strip().upper()
+        if side != "LONG":
+            return False, ""
+
+        btc_mode = str(sig.get("btc_mode_compat", "")).strip().upper()
+        rsi = float(sig.get("rsi", np.nan))
+        p3 = float(sig.get("p3_score", np.nan))
+
+        if btc_mode != "UP":
+            return False, ""
+
+        if not np.isfinite(rsi) or not np.isfinite(p3):
+            return False, ""
+
+        if p1 < hard_max:
+            return False, ""
+
+        if not (55.0 <= rsi < 60.0):
+            return False, ""
+
+        if not (p3 < 0.0):
+            return False, ""
+
+        reason = (
+            "rescued_p1_above_hard_max:"
+            "up_mode;"
+            f"p1={float(p1):.4f};"
+            f"hard_max={float(hard_max):.4f};"
+            f"rsi={float(rsi):.4f};"
+            f"p3={float(p3):.4f}"
+        )
+        return True, reason
+
+    except Exception:
+        return False, ""
+
+
 def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
@@ -3950,6 +3993,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
             return False, f"p1_below_min p1={p1:.4f} min={p1_min_eff:.4f}"
 
     if p1 >= V2_LONG_DEF_P1_HARD_MAX:
+        allow_rescue, rescue_reason = _allow_long_p1_hard_max_rescue(sig, p1, V2_LONG_DEF_P1_HARD_MAX)
+
+        if allow_rescue:
+            return True, rescue_reason
+
         return False, (
             f"p1_above_hard_max p1={p1:.4f} "
             f"hard_max={V2_LONG_DEF_P1_HARD_MAX:.4f}"
