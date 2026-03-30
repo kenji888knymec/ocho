@@ -7461,20 +7461,19 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> Optional[pd.DataFrame]:
-                _is_long = float(1.0 if side == "LONG" else 0.0)
+                _is_long = 1.0 if side == "LONG" else 0.0
+                _is_short = 1.0 - _is_long
 
                 feats = pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
-                    "BW Change": float(row["BW_Change"]),
+                    "BW_Change": float(row["BW_Change"]),
                     "RSI": float(row["RSI"]),
-                    "Vol Change": float(row["Vol_Change"]),
-                    "BTC Ret": float(btc_ret),
-                    "BTC Vol": float(btc_vol),
-                    "Score": float(sig_score),
-                    "Is Long": _is_long,
-                    "Long x BTC Ret": _is_long * float(btc_ret),
-                    "Long x RSI": _is_long * float(row["RSI"]),
+                    "Vol_Change": float(row["Vol_Change"]),
+                    "Rise_Score": float(sig_score) * _is_long,
+                    "Drop_Score": float(sig_score) * _is_short,
+                    "BTC_Ret": float(btc_ret),
+                    "BTC_Vol": float(btc_vol),
                 }])
 
                 feats = feats.replace([np.inf, -np.inf], np.nan)
