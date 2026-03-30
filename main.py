@@ -4338,6 +4338,47 @@ def _v2_rank_reject_band(sig: Dict[str, Any]) -> str:
     return "RANK_REJECT"
 
 
+def _allow_long_ai_below_min_rescue(sig: Dict[str, Any], ai_prob: float, ai_th: float) -> Tuple[bool, str]:
+    """
+    LONG の ai_below_min を限定救済する。
+    AIを無効化するのではなく、実績で強かった組み合わせだけを通す。
+    """
+
+    try:
+        side = str(sig.get("direction", "")).strip().upper()
+        if side != "LONG":
+            return False, ""
+
+        btc_mode = str(sig.get("btc_mode_compat", "")).strip().upper()
+        rsi = float(sig.get("rsi", np.nan))
+        p1 = float(sig.get("p1_score", np.nan))
+
+        if btc_mode != "DOWN":
+            return False, ""
+
+        if not np.isfinite(rsi) or not np.isfinite(p1):
+            return False, ""
+
+        if not (40.0 <= rsi < 45.0):
+            return False, ""
+
+        if not (1.5 <= p1 < 2.0):
+            return False, ""
+
+        reason = (
+            "rescued_ai_below_min:"
+            f"down_mode;"
+            f"rsi={rsi:.4f};"
+            f"p1={p1:.4f};"
+            f"ai_prob={float(ai_prob):.4f};"
+            f"ai_th={float(ai_th):.4f}"
+        )
+        return True, reason
+
+    except Exception:
+        return False, ""
+
+
 def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) -> Dict[str, Any]:
     """
     V2 sig から事前特徴量だけを使って side別AI推論。
@@ -4427,6 +4468,18 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
             raise ValueError("non_finite_score_used")
 
         if float(s_used) < float(threshold):
+            allow_rescue, rescue_reason = _allow_long_ai_below_min_rescue(sig, float(s_used), float(threshold))
+
+            if allow_rescue:
+                base["score"] = float(s_used)
+                base["ok"] = True
+                base["note"] = (
+                    f"rescued:{rescue_reason};"
+                    f"ai={float(s_used):.6f};min={float(threshold):.6f};"
+                    f"raw={float(s_raw):.6f};invert={int(bool(invert_for_side))}"
+                )
+                return base
+
             base["score"] = float(s_used)
             base["ok"] = False
             base["note"] = (
