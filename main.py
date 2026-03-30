@@ -7285,6 +7285,8 @@ def logic_main(force: bool = False):
             row = df.iloc[-2]
             
             # 欠損・非finiteがある行は「補完せず」候補化しない（continue）
+            # Rise_Score / Drop_Score もここで必ずチェックして、
+            # AI入力まで NaN を流さない
             required_cols = [
                 "Dynamic_Sigma",
                 "BandWidth",
@@ -7292,32 +7294,51 @@ def logic_main(force: bool = False):
                 "RSI",
                 "Vol_Change",
                 "Pct_Change",
+                "Rise_Score",
+                "Drop_Score",
             ]
-            
+
             ok_row = True
+            bad_col = ""
+
             for c in required_cols:
                 val = row.get(c, np.nan)
                 if pd.isna(val):
                     ok_row = False
+                    bad_col = c
                     break
                 try:
                     fv = float(val)
                     if not np.isfinite(fv):
                         ok_row = False
+                        bad_col = c
                         break
                 except Exception:
                     ok_row = False
+                    bad_col = c
                     break
-            
+
             # Dynamic_Sigma は正（>0）である必要
             if ok_row:
                 try:
-                    if float(row["Dynamic_Sigma"]) <= 0.0:
+                    sigma_val = float(row["Dynamic_Sigma"])
+                    if sigma_val <= 0.0:
                         ok_row = False
+                        bad_col = "Dynamic_Sigma<=0"
                 except Exception:
                     ok_row = False
-            
+                    bad_col = "Dynamic_Sigma"
+
             if not ok_row:
+                try:
+                    print(
+                        f"[CAND-SKIP] sym={symbol} bad_col={bad_col} "
+                        f"sigma={row.get('Dynamic_Sigma', np.nan)} "
+                        f"rise={row.get('Rise_Score', np.nan)} "
+                        f"drop={row.get('Drop_Score', np.nan)}"
+                    )
+                except Exception:
+                    pass
                 continue
 
 
