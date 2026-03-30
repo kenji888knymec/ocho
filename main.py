@@ -7424,9 +7424,10 @@ def logic_main(force: bool = False):
             # 学習側と整合：Sideに応じて Rise/Drop のどちらか一方だけに寄せる
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
-            def _make_feats(side: str) -> pd.DataFrame:
+            def _make_feats(side: str) -> Optional[pd.DataFrame]:
                 _is_long = float(1.0 if side == "LONG" else 0.0)
-                return pd.DataFrame([{
+
+                feats = pd.DataFrame([{
                     "Sigma": float(row["Dynamic_Sigma"]),
                     "BandWidth": float(row["BandWidth"]),
                     "BW Change": float(row["BW_Change"]),
@@ -7439,6 +7440,26 @@ def logic_main(force: bool = False):
                     "Long x BTC Ret": _is_long * float(btc_ret),
                     "Long x RSI": _is_long * float(row["RSI"]),
                 }])
+
+                feats = feats.replace([np.inf, -np.inf], np.nan)
+
+                mask = feats.isna()
+                if mask.any().any():
+                    bad_cols = [c for c in feats.columns if mask[c].any()]
+                    try:
+                        print(
+                            f"[AI-FEAT-SKIP] sym={symbol} side={side} "
+                            f"bad_cols={bad_cols} "
+                            f"btc_ret={btc_ret} btc_vol={btc_vol} "
+                            f"volchg={row.get('Vol_Change', np.nan)} "
+                            f"sigma={row.get('Dynamic_Sigma', np.nan)} "
+                            f"score={sig_score}"
+                        )
+                    except Exception:
+                        pass
+                    return None
+
+                return feats
 
             def _score_side(side: str) -> Tuple[Optional[float], Optional[float], bool, Dict[str, Any]]:
                 """
@@ -7458,7 +7479,16 @@ def logic_main(force: bool = False):
                     "model_type": f"{str(side).strip().upper()}_AI",
                 }
 
-                proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_side, _make_feats(side))
+                feats_side = _make_feats(side)
+                if feats_side is None:
+                    d = dict(d_base)
+                    d["action"] = "precheck_feature_skip"
+                    d["error"] = "features contain NaN before safe_predict_proba"
+                    d["proba_raw"] = None
+                    d["proba_used"] = None
+                    return None, None, True, d
+
+                proba_x, bypass_x, dbg_x = safe_predict_proba(model_for_side, feats_side)
 
                 d = (dbg_x or {})
                 if not isinstance(d, dict):
