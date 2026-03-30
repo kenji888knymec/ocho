@@ -4268,10 +4268,10 @@ def _v2_compact_dbg(dbg: Any) -> str:
     return txt[:maxlen]
 
 
-def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> pd.DataFrame:
+def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> Optional[pd.DataFrame]:
     mode_up, mode_range, mode_down = _v2_mode_onehot(sig.get("btc_mode_compat"))
 
-    return pd.DataFrame([{
+    feats = pd.DataFrame([{
         "TotalScore": _safe_float_or_nan(sig.get("total_score")),
         "P1_TrendScore": _safe_float_or_nan(sig.get("p1_score")),
         "P2_FundingScore": _safe_float_or_nan(sig.get("p2_score")),
@@ -4288,7 +4288,27 @@ def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> pd.DataFrame:
         "BTC_Mode_UP": mode_up,
         "BTC_Mode_RANGE": mode_range,
         "BTC_Mode_DOWN": mode_down,
-    }])
+    }]).replace([np.inf, -np.inf], np.nan)
+
+    mask = feats.isna()
+    if mask.any().any():
+        bad_cols = [c for c in feats.columns if mask[c].any()]
+        try:
+            print(
+                f"[V2-AI-FEAT-SKIP] sym={sig.get('symbol', '')} "
+                f"side={sig.get('side', '')} bad_cols={bad_cols} "
+                f"total={sig.get('total_score', '')} "
+                f"p1={sig.get('p1_score', '')} "
+                f"p2={sig.get('p2_score', '')} "
+                f"p3={sig.get('p3_score', '')} "
+                f"rsi={sig.get('rsi', '')} "
+                f"btc_mode={sig.get('btc_mode_compat', '')}"
+            )
+        except Exception:
+            pass
+        return None
+
+    return feats
 
 
 def _v2_rank_selected_band(sig: Dict[str, Any]) -> str:
@@ -4325,7 +4345,11 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
     """
     side_u = str(side or "").strip().upper()
     sym_code = _v2_sig_symbol_code(sig)
-    feats = _build_v2_ai_feature_frame(sig)
+
+    sig_for_feats = dict(sig)
+    sig_for_feats["side"] = side_u
+    feats = _build_v2_ai_feature_frame(sig_for_feats)
+
     threshold = V2_LONG_AI_MIN if side_u == "LONG" else V2_SHORT_AI_MIN
 
     model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(side_u, sym_code)
@@ -4341,6 +4365,18 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
         "model_type": f"{side_u}_AI",
         "note": "",
     }
+
+    if feats is None:
+        if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
+            base["score"] = float(fallback_score)
+            base["ok"] = True
+            base["used_fallback"] = True
+            base["model_type"] = f"{side_u}_AI_FALLBACK"
+            base["note"] = "v2_ai_feature_nan_rule_fallback"
+            return base
+
+        base["note"] = "v2_ai_feature_nan_precheck_skip"
+        return base
 
     if model_for_side is None:
         if V2_AI_FAIL_OPEN and np.isfinite(fallback_score):
