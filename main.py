@@ -4449,16 +4449,16 @@ def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tu
         if not np.isfinite(rsi) or not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(p3):
             return False, ""
 
-        if not (35.5 <= rsi < 44.5):
+        if not (40.0 <= rsi < 44.5):
             return False, ""
 
-        if not (1.5 <= p1 < 2.0):
+        if not (1.5 <= p1 < 1.8):
             return False, ""
 
         if abs(float(p2)) > 1e-9:
             return False, ""
 
-        if not (-0.200001 <= float(p3) <= 0.000001):
+        if abs(float(p3) - (-0.2)) > 1e-9:
             return False, ""
 
         reason = (
