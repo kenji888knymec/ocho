@@ -4433,8 +4433,8 @@ def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tu
     全解除ではなく、最新 v2_shadow_ai 実績で強かった Down 反発帯だけを通す。
     """
     try:
-        direction = str(sig.get("direction", "")).strip().upper()
-        if direction != "LONG":
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
             return False, ""
 
         btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
