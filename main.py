@@ -4480,25 +4480,41 @@ def _v2_compact_dbg(dbg: Any) -> str:
 
 
 def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> Optional[pd.DataFrame]:
-    mode_up, mode_range, mode_down = _v2_mode_onehot(sig.get("btc_mode_compat"))
+    """
+    本番の V2 LONG/SHORT AI 推論用特徴量を、現行 serving model が期待する旧9列で作る。
+
+    期待列:
+      Sigma, BandWidth, BW_Change, RSI, Vol_Change,
+      Rise_Score, Drop_Score, BTC_Ret, BTC_Vol
+
+    重要:
+      - ここでは固定値埋めをしない
+      - 欠損があれば None を返し、上位で bypass させる
+      - side に応じて Rise_Score / Drop_Score の片側だけにスコアを載せる
+    """
+    side_u = str(sig.get("side", "") or "").strip().upper()
+    is_long = 1.0 if side_u == "LONG" else 0.0
+    is_short = 1.0 - is_long
+
+    score_val = _safe_float_or_nan(sig.get("score"))
+    sigma_val = _safe_float_or_nan(sig.get("sigma"))
+    bw_val = _safe_float_or_nan(sig.get("BandWidth"))
+    bw_chg_val = _safe_float_or_nan(sig.get("BW_Change"))
+    rsi_val = _safe_float_or_nan(sig.get("rsi"))
+    vol_chg_val = _safe_float_or_nan(sig.get("Vol_Change"))
+    btc_ret_val = _safe_float_or_nan(sig.get("btc_ret"))
+    btc_vol_val = _safe_float_or_nan(sig.get("btc_vol"))
 
     feats = pd.DataFrame([{
-        "TotalScore": _safe_float_or_nan(sig.get("total_score")),
-        "P1_TrendScore": _safe_float_or_nan(sig.get("p1_score")),
-        "P2_FundingScore": _safe_float_or_nan(sig.get("p2_score")),
-        "P3_VolumeScore": _safe_float_or_nan(sig.get("p3_score")),
-        "SymHTF_Strength": _safe_float_or_nan(sig.get("sym_htf_strength")),
-        "BTC_HTF_Strength": _safe_float_or_nan(sig.get("btc_htf_strength")),
-        "VolRatio": _safe_float_or_nan(sig.get("vol_ratio")),
-        "ATR": _safe_float_or_nan(sig.get("atr")),
-        "RSI": _safe_float_or_nan(sig.get("rsi")),
-        "Hour_JST": _v2_sig_hour(sig),
-        "LTF_Aligned": _v2_bool01(sig.get("ltf_aligned")),
-        "FR_Available": _v2_bool01(sig.get("fr_available")),
-        "VolConfirmed": _v2_bool01(sig.get("vol_confirmed")),
-        "BTC_Mode_UP": mode_up,
-        "BTC_Mode_RANGE": mode_range,
-        "BTC_Mode_DOWN": mode_down,
+        "Sigma": sigma_val,
+        "BandWidth": bw_val,
+        "BW_Change": bw_chg_val,
+        "RSI": rsi_val,
+        "Vol_Change": vol_chg_val,
+        "Rise_Score": score_val * is_long,
+        "Drop_Score": score_val * is_short,
+        "BTC_Ret": btc_ret_val,
+        "BTC_Vol": btc_vol_val,
     }]).replace([np.inf, -np.inf], np.nan)
 
     mask = feats.isna()
@@ -4507,13 +4523,15 @@ def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> Optional[pd.DataFrame]:
         try:
             print(
                 f"[V2-AI-FEAT-SKIP] sym={sig.get('symbol', '')} "
-                f"side={sig.get('side', '')} bad_cols={bad_cols} "
-                f"total={sig.get('total_score', '')} "
-                f"p1={sig.get('p1_score', '')} "
-                f"p2={sig.get('p2_score', '')} "
-                f"p3={sig.get('p3_score', '')} "
+                f"side={side_u} bad_cols={bad_cols} "
+                f"score={sig.get('score', '')} "
+                f"sigma={sig.get('sigma', '')} "
+                f"bw={sig.get('BandWidth', '')} "
+                f"bw_chg={sig.get('BW_Change', '')} "
                 f"rsi={sig.get('rsi', '')} "
-                f"btc_mode={sig.get('btc_mode_compat', '')}"
+                f"vol_chg={sig.get('Vol_Change', '')} "
+                f"btc_ret={sig.get('btc_ret', '')} "
+                f"btc_vol={sig.get('btc_vol', '')}"
             )
         except Exception:
             pass
