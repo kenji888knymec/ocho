@@ -2808,6 +2808,12 @@ V2_LONG_RANGE_RESCUE_RSI_MAX       = _env_float("V2_LONG_RANGE_RESCUE_RSI_MAX", 
 V2_LONG_RANGE_RESCUE_P2_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P2_MIN", 0.05)
 V2_LONG_RANGE_RESCUE_P3_MIN        = _env_float("V2_LONG_RANGE_RESCUE_P3_MIN", 0.00)
 V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS = [s.strip().upper() for s in str(os.environ.get("V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS", "APT,SUI,STX,BONK")).split(",") if s.strip()]
+# 通常の RANGE rescue では落ちるが、実績上まだ触る価値がある一部だけを細く救う
+V2_LONG_RANGE_RESCUE_THIN_ENABLE        = str(os.environ.get("V2_LONG_RANGE_RESCUE_THIN_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_RANGE_RESCUE_THIN_RSI_MAX       = _env_float("V2_LONG_RANGE_RESCUE_THIN_RSI_MAX", 55.0)
+V2_LONG_RANGE_RESCUE_THIN_P2_MIN        = _env_float("V2_LONG_RANGE_RESCUE_THIN_P2_MIN", 0.00)
+V2_LONG_RANGE_RESCUE_THIN_P3_MIN        = _env_float("V2_LONG_RANGE_RESCUE_THIN_P3_MIN", 0.0001)
+V2_LONG_RANGE_RESCUE_THIN_ALLOW_SYMBOLS = [s.strip().upper() for s in str(os.environ.get("V2_LONG_RANGE_RESCUE_THIN_ALLOW_SYMBOLS", "POL,HBAR,SOL")).split(",") if s.strip()]
 
 # --- LONG notify qualification gate ---
 V2_LONG_NOTIFY_GATE_ENABLE         = str(os.environ.get("V2_LONG_NOTIFY_GATE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
@@ -4125,26 +4131,36 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     range_block_syms = {s.strip().upper() for s in V2_LONG_RANGE_RESCUE_BLOCK_SYMBOLS if str(s).strip()}
 
     if long_raw_rescue and btc_mode_compat == "RANGE":
-        if sym in range_block_syms:
-            return False, f"range_rescue_symbol_block sym={sym}"
+        thin_allow_syms = {s.strip().upper() for s in V2_LONG_RANGE_RESCUE_THIN_ALLOW_SYMBOLS if str(s).strip()}
+        thin_rescue_hit = (
+            V2_LONG_RANGE_RESCUE_THIN_ENABLE
+            and sym in thin_allow_syms
+            and np.isfinite(rsi) and np.isfinite(p2) and np.isfinite(p3)
+            and rsi <= float(V2_LONG_RANGE_RESCUE_THIN_RSI_MAX)
+            and p2 >= float(V2_LONG_RANGE_RESCUE_THIN_P2_MIN)
+            and p3 >= float(V2_LONG_RANGE_RESCUE_THIN_P3_MIN)
+        )
+        if not thin_rescue_hit:
+            if sym in range_block_syms:
+                return False, f"range_rescue_symbol_block sym={sym}"
 
-        if (not np.isfinite(rsi)) or rsi > float(V2_LONG_RANGE_RESCUE_RSI_MAX):
-            return False, (
-                f"range_rescue_rsi_too_high rsi={rsi:.4f} "
-                f"max={float(V2_LONG_RANGE_RESCUE_RSI_MAX):.1f}"
-            )
+            if (not np.isfinite(rsi)) or rsi > float(V2_LONG_RANGE_RESCUE_RSI_MAX):
+                return False, (
+                    f"range_rescue_rsi_too_high rsi={rsi:.4f} "
+                    f"max={float(V2_LONG_RANGE_RESCUE_RSI_MAX):.1f}"
+                )
 
-        if (not np.isfinite(p2)) or p2 < float(V2_LONG_RANGE_RESCUE_P2_MIN):
-            return False, (
-                f"range_rescue_p2_below_min p2={p2:.4f} "
-                f"min={float(V2_LONG_RANGE_RESCUE_P2_MIN):.4f}"
-            )
+            if (not np.isfinite(p2)) or p2 < float(V2_LONG_RANGE_RESCUE_P2_MIN):
+                return False, (
+                    f"range_rescue_p2_below_min p2={p2:.4f} "
+                    f"min={float(V2_LONG_RANGE_RESCUE_P2_MIN):.4f}"
+                )
 
-        if (not np.isfinite(p3)) or p3 < float(V2_LONG_RANGE_RESCUE_P3_MIN):
-            return False, (
-                f"range_rescue_p3_below_min p3={p3:.4f} "
-                f"min={float(V2_LONG_RANGE_RESCUE_P3_MIN):.4f}"
-            )
+            if (not np.isfinite(p3)) or p3 < float(V2_LONG_RANGE_RESCUE_P3_MIN):
+                return False, (
+                    f"range_rescue_p3_below_min p3={p3:.4f} "
+                    f"min={float(V2_LONG_RANGE_RESCUE_P3_MIN):.4f}"
+                )
 
     if total < score_min_eff:
         return False, f"score_below_min total={total:.4f} min={score_min_eff:.4f}"
@@ -4313,23 +4329,33 @@ def _long_notify_gate(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"notify_gate_symbol_block sym={sym}"
 
     if mode == "RANGE" and V2_LONG_NOTIFY_GATE_RANGE_ENABLE:
-        if (not np.isfinite(rsi)) or rsi > float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):
-            return False, (
-                f"notify_gate_range_rsi_high rsi={rsi:.4f} "
-                f"max={float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):.1f}"
-            )
+        thin_allow_syms_gate = {s.strip().upper() for s in V2_LONG_RANGE_RESCUE_THIN_ALLOW_SYMBOLS if str(s).strip()}
+        thin_gate_hit = (
+            V2_LONG_RANGE_RESCUE_THIN_ENABLE
+            and sym in thin_allow_syms_gate
+            and np.isfinite(rsi) and np.isfinite(p2) and np.isfinite(p3)
+            and rsi <= float(V2_LONG_RANGE_RESCUE_THIN_RSI_MAX)
+            and p2 >= float(V2_LONG_RANGE_RESCUE_THIN_P2_MIN)
+            and p3 >= float(V2_LONG_RANGE_RESCUE_THIN_P3_MIN)
+        )
+        if not thin_gate_hit:
+            if (not np.isfinite(rsi)) or rsi > float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):
+                return False, (
+                    f"notify_gate_range_rsi_high rsi={rsi:.4f} "
+                    f"max={float(V2_LONG_NOTIFY_GATE_RANGE_RSI_MAX):.1f}"
+                )
 
-        if (not np.isfinite(p2)) or p2 < float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):
-            return False, (
-                f"notify_gate_range_p2_low p2={p2:.4f} "
-                f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):.4f}"
-            )
+            if (not np.isfinite(p2)) or p2 < float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):
+                return False, (
+                    f"notify_gate_range_p2_low p2={p2:.4f} "
+                    f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P2_MIN):.4f}"
+                )
 
-        if (not np.isfinite(p3)) or p3 < float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):
-            return False, (
-                f"notify_gate_range_p3_low p3={p3:.4f} "
-                f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):.4f}"
-            )
+            if (not np.isfinite(p3)) or p3 < float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):
+                return False, (
+                    f"notify_gate_range_p3_low p3={p3:.4f} "
+                    f"min={float(V2_LONG_NOTIFY_GATE_RANGE_P3_MIN):.4f}"
+                )
 
     if mode == "UP" and V2_LONG_NOTIFY_GATE_UP_ENABLE:
         if (not np.isfinite(rsi)) or rsi > float(V2_LONG_NOTIFY_GATE_UP_RSI_MAX):
