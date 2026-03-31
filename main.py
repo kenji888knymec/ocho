@@ -3618,24 +3618,60 @@ def v2_generate_signal(
     # ★修正3: btc_mode 互換変換
     btc_mode_compat = {"LONG": "Up", "SHORT": "Down", "NEUTRAL": "Range"}.get(btc_dir, "Range")
 
+    score_for_ai = float(total)
+
+    sigma_for_ai = _safe_float_or_nan(
+        locals().get(
+            "sigma",
+            row["Sigma"] if "row" in locals() and row is not None and "Sigma" in row else np.nan
+        )
+    )
+    bandwidth_for_ai = _safe_float_or_nan(
+        locals().get(
+            "BandWidth",
+            row["BandWidth"] if "row" in locals() and row is not None and "BandWidth" in row else np.nan
+        )
+    )
+    bw_change_for_ai = _safe_float_or_nan(
+        locals().get(
+            "BW_Change",
+            row["BW_Change"] if "row" in locals() and row is not None and "BW_Change" in row else np.nan
+        )
+    )
+    vol_change_for_ai = _safe_float_or_nan(
+        locals().get(
+            "Vol_Change",
+            row["Vol_Change"] if "row" in locals() and row is not None and "Vol_Change" in row else np.nan
+        )
+    )
+    btc_ret_for_ai = _safe_float_or_nan(locals().get("btc_ret", np.nan))
+    btc_vol_for_ai = _safe_float_or_nan(locals().get("btc_vol", np.nan))
+
     return {
         "symbol": sym,
         "direction": direction,
         "entry_price": entry,
+
         "total_score": float(total),
+        "score": score_for_ai,
+
         "p1_score": float(p1_score),
         "p2_score": float(p2_score),
         "p3_score": float(p3_score),
+
         "sym_htf_dir": sym_htf["direction"],
         "sym_htf_strength": sym_htf["strength"],
         "btc_htf_dir": btc_dir,
         "btc_htf_strength": btc_str,
+
         "ltf_aligned": ltf_eval["score"] >= 0.5,
         "ltf_reasons": ltf_eval.get("reasons", []),
+
         "funding_rate": fr,
         "fr_available": p2["available"],
         "vol_ratio": p3.get("vol_ratio"),
         "vol_confirmed": p3["confirmed"],
+
         "tp": tpsl["tp"],
         "sl": tpsl["sl"],
         "tp_pct": tpsl["tp_pct"],
@@ -3644,6 +3680,14 @@ def v2_generate_signal(
         "rsi": ltf_eval.get("rsi", np.nan),
         "hour": hour,
         "btc_mode_compat": btc_mode_compat,
+
+        "sigma": sigma_for_ai,
+        "BandWidth": bandwidth_for_ai,
+        "BW_Change": bw_change_for_ai,
+        "Vol_Change": vol_change_for_ai,
+        "btc_ret": btc_ret_for_ai,
+        "btc_vol": btc_vol_for_ai,
+
         "time_ms": closed_bar_time_ms,
         "dt": closed_bar_dt,
         "long_raw_rescue": bool(long_rescue),
