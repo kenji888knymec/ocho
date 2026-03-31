@@ -4430,7 +4430,7 @@ def _allow_long_ai_below_min_rescue(sig: Dict[str, Any], ai_prob: float, ai_th: 
 def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG の ai_bypass を限定救済する。
-    全解除ではなく、Down相場で実績が良かった帯だけを通す。
+    全解除ではなく、最新 v2_shadow_ai 実績で強かった Down 反発帯だけを通す。
     """
     try:
         direction = str(sig.get("direction", "")).strip().upper()
@@ -4449,16 +4449,16 @@ def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tu
         if not np.isfinite(rsi) or not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(p3):
             return False, ""
 
-        if not (40.0 <= rsi < 45.0):
+        if not (35.5 <= rsi < 44.5):
             return False, ""
 
         if not (1.5 <= p1 < 2.0):
             return False, ""
 
-        if p2 != 0.0:
+        if abs(float(p2)) > 1e-9:
             return False, ""
 
-        if not (p3 <= 0.0):
+        if not (-0.200001 <= float(p3) <= 0.000001):
             return False, ""
 
         reason = (
