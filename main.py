@@ -1697,11 +1697,24 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
                 nan_cnt = int(mask.sum().sum())
 
                 debug["nan_cols"] = nan_cols
+                debug["nan_columns"] = list(nan_cols)
                 debug["nan_n_cols"] = int(len(nan_cols))
                 debug["nan_cnt"] = nan_cnt
                 debug["nan_filled"] = 0
                 debug["action"] = "nan_input_bypass"
                 debug["error"] = "input contains NaN; skip predict_proba"
+
+                try:
+                    print(
+                        f"[AI-NAN-BYPASS] "
+                        f"nan_cols={nan_cols} "
+                        f"nan_cnt={nan_cnt} "
+                        f"input_n_features={debug.get('input_n_features', -1)} "
+                        f"expected_n_features={debug.get('expected_n_features', -1)}"
+                    )
+                except Exception:
+                    pass
+
                 return None, True, debug
 
         # 5) predict_proba 実行
@@ -4433,6 +4446,8 @@ def _v2_compact_dbg(dbg: Any) -> str:
         parts.append(f"detail={detail}")
 
     miss = d.get("missing_columns")
+    if not isinstance(miss, (list, tuple)) or not miss:
+        miss = d.get("missing_cols")
     if isinstance(miss, (list, tuple)) and miss:
         miss_txt = ",".join(str(x) for x in list(miss)[:8])
         if len(miss) > 8:
@@ -4440,11 +4455,20 @@ def _v2_compact_dbg(dbg: Any) -> str:
         parts.append(f"missing={miss_txt}")
 
     nan_cols = d.get("nan_columns")
+    if not isinstance(nan_cols, (list, tuple)) or not nan_cols:
+        nan_cols = d.get("nan_cols")
     if isinstance(nan_cols, (list, tuple)) and nan_cols:
         nan_txt = ",".join(str(x) for x in list(nan_cols)[:8])
         if len(nan_cols) > 8:
             nan_txt += ",..."
         parts.append(f"nan={nan_txt}")
+
+    nan_cnt = d.get("nan_cnt")
+    try:
+        if nan_cnt is not None:
+            parts.append(f"nan_cnt={int(nan_cnt)}")
+    except Exception:
+        pass
 
     if not parts:
         raw = str(d.get("dbg", "") or "").strip()
