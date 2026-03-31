@@ -3620,32 +3620,43 @@ def v2_generate_signal(
 
     score_for_ai = float(total)
 
-    sigma_for_ai = _safe_float_or_nan(
-        locals().get(
-            "sigma",
-            row["Sigma"] if "row" in locals() and row is not None and "Sigma" in row else np.nan
-        )
+    ltf_ai = ltf_df.copy()
+
+    close_s = pd.to_numeric(ltf_ai["Close"], errors="coerce")
+    vol_s = pd.to_numeric(ltf_ai["Volume"], errors="coerce")
+
+    ltf_ai["Pct_Change"] = close_s.pct_change(fill_method=None)
+    ltf_ai["Dynamic_Sigma"] = ltf_ai["Pct_Change"].rolling(20).std()
+
+    ma20 = close_s.rolling(20).mean()
+    std20 = close_s.rolling(20).std()
+    bb_upper = ma20 + (2.0 * std20)
+    bb_lower = ma20 - (2.0 * std20)
+
+    ltf_ai["BandWidth"] = np.where(
+        ma20.abs() > 1e-12,
+        (bb_upper - bb_lower) / ma20.abs(),
+        np.nan,
     )
-    bandwidth_for_ai = _safe_float_or_nan(
-        locals().get(
-            "BandWidth",
-            row["BandWidth"] if "row" in locals() and row is not None and "BandWidth" in row else np.nan
-        )
+
+    ltf_ai["BW_Change"] = (
+        pd.to_numeric(ltf_ai["BandWidth"], errors="coerce")
+        .pct_change(fill_method=None)
+        .replace([np.inf, -np.inf], np.nan)
     )
-    bw_change_for_ai = _safe_float_or_nan(
-        locals().get(
-            "BW_Change",
-            row["BW_Change"] if "row" in locals() and row is not None and "BW_Change" in row else np.nan
-        )
+
+    ltf_ai["Vol_Change"] = (
+        vol_s.pct_change(fill_method=None)
+        .replace([np.inf, -np.inf], np.nan)
     )
-    vol_change_for_ai = _safe_float_or_nan(
-        locals().get(
-            "Vol_Change",
-            row["Vol_Change"] if "row" in locals() and row is not None and "Vol_Change" in row else np.nan
-        )
-    )
-    btc_ret_for_ai = _safe_float_or_nan(locals().get("btc_ret", np.nan))
-    btc_vol_for_ai = _safe_float_or_nan(locals().get("btc_vol", np.nan))
+
+    sigma_for_ai = _safe_float_or_nan(ltf_ai["Dynamic_Sigma"].iloc[-2])
+    bandwidth_for_ai = _safe_float_or_nan(ltf_ai["BandWidth"].iloc[-2])
+    bw_change_for_ai = _safe_float_or_nan(ltf_ai["BW_Change"].iloc[-2])
+    vol_change_for_ai = _safe_float_or_nan(ltf_ai["Vol_Change"].iloc[-2])
+
+    btc_ret_for_ai = _safe_float_or_nan(np.nan)
+    btc_vol_for_ai = _safe_float_or_nan(np.nan)
 
     return {
         "symbol": sym,
@@ -7397,6 +7408,19 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_htf_df = pd.DataFrame(btc_htf_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     btc_htf = assess_htf_trend(btc_htf_df)
 
+    # BTC 15m Pct_Change / Vol (AI 特徴量用)
+    btc_ret = np.nan
+    btc_vol = np.nan
+    try:
+        btc_15m_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+        if btc_15m_ohlcv and len(btc_15m_ohlcv) >= 3:
+            btc_15m_df = pd.DataFrame(btc_15m_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+            btc_15m_df["Pct_Change"] = pd.to_numeric(btc_15m_df["Close"], errors="coerce").pct_change(fill_method=None)
+            btc_ret = float(btc_15m_df["Pct_Change"].iloc[-2])
+            btc_vol = abs(btc_ret)
+    except Exception as e:
+        print(f"[V2-WARN] BTC 15m fetch for AI feats failed: {e}")
+
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
     short_conflict = bool(regime.get("short_conflict", False))
@@ -7453,6 +7477,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             if sig is not None:
                 sig["v2_version"] = "V2-Shadow"
                 sig["note"] = ""
+                sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                sig["btc_vol"] = _safe_float_or_nan(btc_vol)
 
                 raw_signals.append(sig)
 
