@@ -3935,6 +3935,109 @@ def _allow_long_p1_hard_max_rescue(sig: Dict[str, Any], p1: float, hard_max: flo
         return False, ""
 
 
+def _allow_long_rsi_out_of_range_rescue(
+    sig: Dict[str, Any],
+    rsi: float,
+    rsi_min_eff: float,
+    rsi_max_eff: float,
+) -> Tuple[bool, str]:
+    """
+    LONG の rsi_out_of_range を限定救済する。
+    Down 相場の強い反発帯だけを通す。
+    """
+    try:
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
+            return False, ""
+
+        btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+        p1 = _safe_float_or_nan(sig.get("p1_score"))
+        p2 = _safe_float_or_nan(sig.get("p2_score"))
+        p3 = _safe_float_or_nan(sig.get("p3_score"))
+
+        if btc_mode_compat != "DOWN":
+            return False, ""
+
+        if not np.isfinite(rsi) or not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(p3):
+            return False, ""
+
+        if not (float(rsi) < 35.0):
+            return False, ""
+
+        if not (1.5 <= float(p1) < 1.8):
+            return False, ""
+
+        if not (float(p2) <= 0.25):
+            return False, ""
+
+        p3v = float(p3)
+        if not (abs(p3v - (-0.2)) <= 1e-9 or abs(p3v - 0.0) <= 1e-9):
+            return False, ""
+
+        reason = (
+            "rescued_rsi_out_of_range "
+            f"rsi={float(rsi):.4f} "
+            f"range={float(rsi_min_eff):.4f}-{float(rsi_max_eff):.4f} "
+            f"p1={float(p1):.4f} "
+            f"p2={float(p2):.4f} "
+            f"p3={float(p3):.4f} "
+            f"btc_mode={btc_mode_compat}"
+        )
+        return True, reason
+
+    except Exception:
+        return False, ""
+
+
+def _allow_long_p1_below_min_rescue(
+    sig: Dict[str, Any],
+    p1: float,
+    p1_min_eff: float,
+) -> Tuple[bool, str]:
+    """
+    LONG の p1_below_min を限定救済する。
+    Down 相場のかなり狭い勝ち帯だけを通す。
+    """
+    try:
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
+            return False, ""
+
+        btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+        rsi = _safe_float_or_nan(sig.get("rsi"))
+        p2 = _safe_float_or_nan(sig.get("p2_score"))
+        p3 = _safe_float_or_nan(sig.get("p3_score"))
+
+        if btc_mode_compat != "DOWN":
+            return False, ""
+
+        if not np.isfinite(rsi) or not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(p3):
+            return False, ""
+
+        if not (35.0 <= float(rsi) < 40.0):
+            return False, ""
+
+        if abs(float(p2)) > 1e-9:
+            return False, ""
+
+        if not (float(p3) > 0.0):
+            return False, ""
+
+        reason = (
+            "rescued_p1_below_min "
+            f"p1={float(p1):.4f} "
+            f"min={float(p1_min_eff):.4f} "
+            f"rsi={float(rsi):.4f} "
+            f"p2={float(p2):.4f} "
+            f"p3={float(p3):.4f} "
+            f"btc_mode={btc_mode_compat}"
+        )
+        return True, reason
+
+    except Exception:
+        return False, ""
+
+
 def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     LONG専用の最低品質ライン。
@@ -3990,6 +4093,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         if _allow_long_p1_rescue(sig):
             pass
         else:
+            allow_rescue, rescue_reason = _allow_long_p1_below_min_rescue(
+                sig, p1, p1_min_eff
+            )
+            if allow_rescue:
+                return True, rescue_reason
             return False, f"p1_below_min p1={p1:.4f} min={p1_min_eff:.4f}"
 
     if p1 >= V2_LONG_DEF_P1_HARD_MAX:
@@ -4042,6 +4150,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, f"score_below_min total={total:.4f} min={score_min_eff:.4f}"
 
     if rsi < rsi_min_eff or rsi > rsi_max_eff:
+        allow_rescue, rescue_reason = _allow_long_rsi_out_of_range_rescue(
+            sig, rsi, rsi_min_eff, rsi_max_eff
+        )
+        if allow_rescue:
+            return True, rescue_reason
         return False, (
             f"rsi_out_of_range rsi={rsi:.4f} "
             f"min={rsi_min_eff:.1f} max={rsi_max_eff:.1f}"
