@@ -2737,6 +2737,18 @@ V2_SHORT_QS_MIN                 = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
 V2_SHORT_RSI_SWEET_MAX          = _env_float("V2_SHORT_RSI_SWEET_MAX", 55.0)
 
+# --- SHORTの帯別制御 ---
+V2_SHORT_RSI_WEAK_MIN      = _env_float("V2_SHORT_RSI_WEAK_MIN", 35.0)
+V2_SHORT_RSI_WEAK_MAX      = _env_float("V2_SHORT_RSI_WEAK_MAX", 40.0)
+
+V2_SHORT_RSI_DEEP_MAX      = _env_float("V2_SHORT_RSI_DEEP_MAX", 35.0)
+V2_SHORT_RSI_REBOUND_MIN   = _env_float("V2_SHORT_RSI_REBOUND_MIN", 45.0)
+V2_SHORT_RSI_REBOUND_MAX   = _env_float("V2_SHORT_RSI_REBOUND_MAX", 50.0)
+
+V2_SHORT_QS_W_P2_NEG       = _env_float("V2_SHORT_QS_W_P2_NEG", -0.20)
+V2_SHORT_QS_W_P1_GE2       = _env_float("V2_SHORT_QS_W_P1_GE2", -0.15)
+V2_SHORT_QS_W_P3_FLAT      = _env_float("V2_SHORT_QS_W_P3_FLAT", 0.15)
+
 # --- V2 SHORT Training Filters ---
 V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST   = str(os.environ.get("V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -3798,6 +3810,12 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
             f"min={rsi_min:.1f} max={rsi_max:.1f} mode={btc_mode_compat}"
         )
 
+    if V2_SHORT_RSI_WEAK_MIN <= rsi < V2_SHORT_RSI_WEAK_MAX:
+        return False, (
+            f"rsi_weak_pocket rsi={rsi:.4f} "
+            f"weak_min={V2_SHORT_RSI_WEAK_MIN:.1f} weak_max={V2_SHORT_RSI_WEAK_MAX:.1f}"
+        )
+
     return True, "pass"
 
 
@@ -3810,11 +3828,17 @@ def _calc_rsi_zone_bonus(rsi: float) -> float:
     if not np.isfinite(r):
         return 0.0
 
-    if V2_SHORT_RSI_SWEET_MIN <= r <= V2_SHORT_RSI_SWEET_MAX:
+    if r < V2_SHORT_RSI_DEEP_MAX:
         return 1.0
 
+    if V2_SHORT_RSI_REBOUND_MIN <= r <= V2_SHORT_RSI_REBOUND_MAX:
+        return 1.0
+
+    if V2_SHORT_RSI_WEAK_MIN <= r < V2_SHORT_RSI_WEAK_MAX:
+        return -1.0
+
     if V2_SHORT_DEF_RSI_MIN <= r <= V2_SHORT_DEF_RSI_MAX:
-        return 0.5
+        return 0.25
 
     return 0.0
 
@@ -3823,14 +3847,18 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     """
     Stage B:
     SHORT用の仮QualityScore。
+
     今回の方針:
-      - P1偏重を少し弱める
-      - P3_VolumeScore を評価に入れる
-      - VolConfirmed を加点する
+      - 弱い帯の 35〜40 を嫌う
+      - 強い帯の <35 と 45〜50 を残す
+      - P2<0 を減点する
+      - P1>=2.0 を減点する
+      - P3が0〜0.5の帯を少し優遇する
       - total と p1 の二重効きを抑える
     """
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
     p3 = _safe_float_or_nan(sig.get("p3_score"))
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
@@ -3842,6 +3870,8 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
         p1 = 0.0
     if not np.isfinite(total):
         total = 0.0
+    if not np.isfinite(p2):
+        p2 = 0.0
     if not np.isfinite(p3):
         p3 = 0.0
     if not np.isfinite(btcstr):
@@ -3853,14 +3883,20 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     other_score = max(-1.5, min(other_score, 1.5))
 
     btc_over_penalty = -0.30 if (np.isfinite(btcstr) and btcstr > 0.90) else 0.0
+    p2_neg_penalty = V2_SHORT_QS_W_P2_NEG if p2 < 0.0 else 0.0
+    p1_high_penalty = V2_SHORT_QS_W_P1_GE2 if p1 >= 2.0 else 0.0
+    p3_flat_bonus = V2_SHORT_QS_W_P3_FLAT if (0.0 <= p3 <= 0.5) else 0.0
 
     qs = (
-        (p1 * 0.25) +
+        (p1 * 0.20) +
         (other_score * 0.30) +
-        (p3 * 0.25) +
+        (p3 * 0.20) +
         (btcstr * 0.05) +
-        (rsi_zone_bonus * 0.05) +
+        (rsi_zone_bonus * 0.15) +
         (volconf * 0.10) +
+        (p3_flat_bonus) +
+        (p2_neg_penalty) +
+        (p1_high_penalty) +
         (btc_over_penalty)
     )
     return float(qs)
@@ -3877,9 +3913,15 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     if not short_signals:
         return []
 
+    for sig in short_signals:
+        sig["rule_qs"] = calc_quality_score(sig)
+
     ranked = sorted(
         short_signals,
-        key=lambda x: float(x.get("ai_prob_win", 0.0) or 0.0),
+        key=lambda x: (
+            float(x.get("ai_prob_win", 0.0) or 0.0),
+            float(x.get("rule_qs", 0.0) or 0.0),
+        ),
         reverse=True,
     )
 
