@@ -3898,8 +3898,8 @@ def _allow_long_p1_hard_max_rescue(sig: Dict[str, Any], p1: float, hard_max: flo
     全解除ではなく、Up相場で実績が良かった帯だけを通す。
     """
     try:
-        direction = str(sig.get("direction", "")).strip().upper()
-        if direction != "LONG":
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
             return False, ""
 
         btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
@@ -4393,15 +4393,15 @@ def _allow_long_ai_below_min_rescue(sig: Dict[str, Any], ai_prob: float, ai_th: 
     """
 
     try:
-        side = str(sig.get("direction", "")).strip().upper()
-        if side != "LONG":
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
             return False, ""
 
-        btc_mode = str(sig.get("btc_mode_compat", "")).strip().upper()
-        rsi = float(sig.get("rsi", np.nan))
-        p1 = float(sig.get("p1_score", np.nan))
+        btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+        rsi = _safe_float_or_nan(sig.get("rsi"))
+        p1 = _safe_float_or_nan(sig.get("p1_score"))
 
-        if btc_mode != "DOWN":
+        if btc_mode_compat != "DOWN":
             return False, ""
 
         if not np.isfinite(rsi) or not np.isfinite(p1):
@@ -4433,8 +4433,8 @@ def _allow_long_ai_bypass_rescue(sig: Dict[str, Any], dbg: Dict[str, Any]) -> Tu
     全解除ではなく、最新 v2_shadow_ai 実績で強かった Down 反発帯だけを通す。
     """
     try:
-        direction = str(sig.get("direction", "")).strip().upper()
-        if direction != "LONG":
+        side_u = str(sig.get("side", sig.get("direction", ""))).strip().upper()
+        if side_u != "LONG":
             return False, ""
 
         btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
