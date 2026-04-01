@@ -3459,22 +3459,17 @@ def v2_generate_signal(
     )
 
     # LONG raw rescue:
-    # HTFがNEUTRALまたは弱いSHORTでも、BTCがLONG寄りでLTF_LONGが十分強ければLONG候補を救う
+    # いったん same-side の LONG だけに限定する。
+    # from=SHORT / from=NEUTRAL への救済はここで禁止する。
     if V2_LONG_RAW_RESCUE_ENABLE:
         btc_long_ok = (btc_dir == "LONG")
-        allow_by_btc = (not V2_LONG_RAW_RESCUE_ONLY_BTC_LONG) or btc_long_ok
+        allow_by_btc = btc_long_ok
 
         ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
         ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
 
-        weak_short_ok = (
-            V2_LONG_RAW_RESCUE_ALLOW_SHORT
-            and direction == "SHORT"
-            and sym_htf_strength <= V2_LONG_RAW_RESCUE_SHORT_HTF_MAX
-        )
-        neutral_ok = V2_LONG_RAW_RESCUE_ALLOW_NEUTRAL and (direction == "NEUTRAL")
-
-        rescue_target_ok = neutral_ok or weak_short_ok or ema_close_long_ok or ema_gap_small_ok
+        same_side_long_ok = (direction == "LONG")
+        rescue_target_ok = same_side_long_ok and ema_close_long_ok
 
         if (
             allow_by_btc
