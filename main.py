@@ -3459,40 +3459,15 @@ def v2_generate_signal(
     )
 
     # LONG raw rescue:
-    # いったん same-side の LONG だけに限定する。
-    # from=SHORT / from=NEUTRAL への救済はここで禁止する。
-    if V2_LONG_RAW_RESCUE_ENABLE:
-        btc_long_ok = (btc_dir == "LONG")
-        allow_by_btc = btc_long_ok
-
-        ltf_long_score = float(ltf_eval_long.get("score", 0.0) or 0.0)
-        ltf_long_rsi = _safe_float_or_nan(ltf_eval_long.get("rsi"))
-
-        same_side_long_ok = (direction == "LONG")
-        rescue_target_ok = same_side_long_ok and ema_close_long_ok
-
-        if (
-            allow_by_btc
-            and rescue_target_ok
-            and (not long_regime_conflict)
-            and ltf_long_score >= V2_LONG_RAW_RESCUE_LTF_MIN
-            and ((not np.isfinite(ltf_long_rsi)) or ltf_long_rsi <= V2_LONG_RAW_RESCUE_RSI_MAX)
-        ):
-            direction = "LONG"
-            long_rescue = True
-            long_rescue_reason = (
-                f"long_raw_rescue from={sym_htf.get('direction')} "
-                f"sym_htf_strength={sym_htf_strength:.4f} "
-                f"btc_dir={btc_dir} btc_str={btc_str:.4f} "
-                f"ltf_long_score={ltf_long_score:.4f} "
-                f"ltf_long_rsi={ltf_long_rsi} "
-                f"ema_close_long_ok={ema_close_long_ok} "
-                f"ema_gap_small_ok={ema_gap_small_ok}"
-            )
+    # ここは一時的に無効化する。
+    # 目的は、SHORT raw rescue が本当に発火するかを確認すること。
+    # direction は assess_htf_trend() の結果のまま維持する。
+    long_rescue = False
+    long_rescue_reason = ""
 
     # SHORT raw rescue:
     # HTFがNEUTRALまたは弱いLONGでも、BTCがSHORT寄りでLTF_SHORTが十分強ければSHORT候補を救う
-    if (not long_rescue) and V2_SHORT_RAW_RESCUE_ENABLE:
+    if V2_SHORT_RAW_RESCUE_ENABLE:
         btc_short_ok = (btc_dir == "SHORT")
         allow_by_btc = (not V2_SHORT_RAW_RESCUE_ONLY_BTC_SHORT) or btc_short_ok
 
@@ -3588,6 +3563,9 @@ def v2_generate_signal(
 
     if long_rescue:
         print(f"[V2-LONG-RAW-RESCUE] sym={sym} {long_rescue_reason}")
+
+    if short_rescue:
+        print(f"[V2-SHORT-RAW-RESCUE] sym={sym} {short_rescue_reason}")
 
     # ★修正1: Pillar1 必須ゲート
     if p1_score < V2_PILLAR1_MIN:
