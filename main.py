@@ -948,14 +948,18 @@ def fmt_opt(label: str, v, suffix=""):
 def _v2_notify_key(sig: Dict[str, Any]) -> str:
     """
     同じ候補を /run のたびに重複通知しないためのキー。
+    V2シグナル本体の key（dt / tp / sl）も読む。
     """
+    raw_dt = sig.get("time", "") or sig.get("Datetime_JST", "") or sig.get("dt", "") or ""
+    dt_str = normalize_dt_str(str(raw_dt).strip()) if str(raw_dt).strip() else ""
+
     return "|".join([
-        str(sig.get("time", "") or sig.get("Datetime_JST", "") or ""),
+        dt_str,
         str(sig.get("symbol", "") or ""),
         str(sig.get("direction", "") or ""),
         str(sig.get("entry_price", "") or sig.get("EntryPrice", "") or ""),
-        str(sig.get("tp_price", "") or sig.get("TP_Price", "") or ""),
-        str(sig.get("sl_price", "") or sig.get("SL_Price", "") or ""),
+        str(sig.get("tp_price", "") or sig.get("TP_Price", "") or sig.get("tp", "") or sig.get("TP", "") or ""),
+        str(sig.get("sl_price", "") or sig.get("SL_Price", "") or sig.get("sl", "") or sig.get("SL", "") or ""),
     ])
 
 
@@ -1042,20 +1046,32 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     V2 の実運用向けDiscord通知。
     実行に必要な情報を先頭に出し、
     判断補助として AI 判定% と直近成績だけを追加する。
+    V2シグナル本体の key（dt / tp / sl）も読む。
     """
     symbol = str(sig.get("symbol", "") or "").strip().upper()
     direction = str(sig.get("direction", "") or "").strip().upper()
-    dt_str = str(sig.get("time", "") or sig.get("Datetime_JST", "") or "").strip()
-    dt_str = normalize_dt_str(dt_str) if dt_str else ""
 
-    entry = _safe_num_str(sig.get("entry_price", sig.get("EntryPrice", "")))
-    tp_price = _safe_num_str(sig.get("tp_price", sig.get("TP_Price", "")))
-    sl_price = _safe_num_str(sig.get("sl_price", sig.get("SL_Price", "")))
+    dt_raw = sig.get("time", "") or sig.get("Datetime_JST", "") or sig.get("dt", "") or ""
+    if hasattr(dt_raw, "strftime"):
+        dt_str = dt_raw.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        dt_str = str(dt_raw).strip()
+        dt_str = normalize_dt_str(dt_str) if dt_str else ""
+
+    entry = _safe_num_str(
+        sig.get("entry_price", sig.get("EntryPrice", sig.get("entry", "")))
+    )
+    tp_price = _safe_num_str(
+        sig.get("tp_price", sig.get("TP_Price", sig.get("tp", sig.get("TP", ""))))
+    )
+    sl_price = _safe_num_str(
+        sig.get("sl_price", sig.get("SL_Price", sig.get("sl", sig.get("SL", ""))))
+    )
 
     tp_pct = _safe_pct_str(sig.get("tp_pct", sig.get("TP_Pct", "")))
     sl_pct = _safe_pct_str(sig.get("sl_pct", sig.get("SL_Pct", "")))
 
-    lev = sig.get("leverage", sig.get("Lev", DEFAULT_LEV))
+    lev = sig.get("leverage", sig.get("Lev", sig.get("Leverage", DEFAULT_LEV)))
     try:
         lev_i = int(float(lev))
     except Exception:
