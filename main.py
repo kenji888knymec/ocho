@@ -3757,7 +3757,7 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
         return False
     if not (30.0 <= float(rsi) < 50.0):
         return False
-    if float(p2) < 0.0:
+    if float(p2) < -0.30:
         return False
     return True
 
