@@ -2744,7 +2744,7 @@ V2_SHORT_DEF_RSI_MIN            = _env_float("V2_SHORT_DEF_RSI_MIN", 40.0)
 V2_SHORT_DEF_RSI_MAX            = _env_float("V2_SHORT_DEF_RSI_MAX", 60.0)
 V2_SHORT_DEF_RSI_MIN_DOWN       = _env_float("V2_SHORT_DEF_RSI_MIN_DOWN", 35.0)
 V2_SHORT_DEF_RSI_MAX_DOWN       = _env_float("V2_SHORT_DEF_RSI_MAX_DOWN", 60.0)
-V2_SHORT_DEF_REQUIRE_VOLCONF    = str(os.environ.get("V2_SHORT_DEF_REQUIRE_VOLCONF", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_DEF_REQUIRE_VOLCONF    = str(os.environ.get("V2_SHORT_DEF_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 V2_SHORT_RANK_ENABLE            = str(os.environ.get("V2_SHORT_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_RANK_TOP_N             = int(float(os.environ.get("V2_SHORT_RANK_TOP_N", "2")))
@@ -3930,7 +3930,7 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
         (p3 * 0.20) +
         (btcstr * 0.05) +
         (rsi_zone_bonus * 0.15) +
-        (volconf * 0.10) +
+        (volconf * 0.20) +
         (p3_flat_bonus) +
         (p2_neg_penalty) +
         (p1_high_penalty) +
