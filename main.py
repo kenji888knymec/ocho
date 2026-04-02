@@ -2762,6 +2762,30 @@ V2_SHORT_RSI_WEAK_MIN      = _env_float("V2_SHORT_RSI_WEAK_MIN", 35.0)
 V2_SHORT_RSI_WEAK_MAX      = _env_float("V2_SHORT_RSI_WEAK_MAX", 40.0)
 
 V2_SHORT_RSI_DEEP_MAX      = _env_float("V2_SHORT_RSI_DEEP_MAX", 35.0)
+
+V2_SHORT_BLOCK_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_BLOCK_HOURS", "3,4,8,9,13,22,23")).split(",")
+    if str(x).strip()
+}
+V2_SHORT_STRONG_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_STRONG_HOURS", "0,1,2,10,11,12,15,16,17,18,19,20,21")).split(",")
+    if str(x).strip()
+}
+
+V2_SHORT_BUCKET_P1_MIN = _env_float("V2_SHORT_BUCKET_P1_MIN", 1.0)
+V2_SHORT_BUCKET_P1_MAX = _env_float("V2_SHORT_BUCKET_P1_MAX", 3.0)
+V2_SHORT_BUCKET_RSI_MIN = _env_float("V2_SHORT_BUCKET_RSI_MIN", 30.0)
+V2_SHORT_BUCKET_RSI_MAX = _env_float("V2_SHORT_BUCKET_RSI_MAX", 50.0)
+V2_SHORT_BUCKET_P2_MIN = _env_float("V2_SHORT_BUCKET_P2_MIN", -0.30)
+
+V2_SHORT_STRONG_P2_MIN = _env_float("V2_SHORT_STRONG_P2_MIN", 0.0)
+V2_SHORT_STRONG_VOLRATIO_MIN = _env_float("V2_SHORT_STRONG_VOLRATIO_MIN", 1.0)
+V2_SHORT_STRONG_VOLRATIO_MAX = _env_float("V2_SHORT_STRONG_VOLRATIO_MAX", 1.5)
+
+V2_SHORT_GOOD_HOUR_AI_TH = _env_float("V2_SHORT_GOOD_HOUR_AI_TH", 0.15)
+V2_SHORT_STRONG_AI_TH = _env_float("V2_SHORT_STRONG_AI_TH", 0.10)
 V2_SHORT_RSI_REBOUND_MIN   = _env_float("V2_SHORT_RSI_REBOUND_MIN", 45.0)
 V2_SHORT_RSI_REBOUND_MAX   = _env_float("V2_SHORT_RSI_REBOUND_MAX", 50.0)
 
@@ -2947,6 +2971,10 @@ V2_REGIME_LOOKBACK_HOURS        = int(float(os.environ.get("V2_REGIME_LOOKBACK_H
 V2_REGIME_MIN_DONE              = int(float(os.environ.get("V2_REGIME_MIN_DONE", "20")))
 V2_REGIME_MIN_UPLIFT_WINRATE    = _env_float("V2_REGIME_MIN_UPLIFT_WINRATE", 0.03)
 V2_REGIME_MIN_UPLIFT_PNL        = _env_float("V2_REGIME_MIN_UPLIFT_PNL", 0.0)
+
+V2_SHORT_REGIME_CONFLICT_BLOCK_ENABLE = str(
+    os.environ.get("V2_SHORT_REGIME_CONFLICT_BLOCK_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # --- V2 Shadow ヘッダー（旧列を流用しない） ---
 V2_HEADERS = [
@@ -3557,7 +3585,7 @@ def v2_generate_signal(
             )
             return None
 
-    if short_regime_conflict and direction == "SHORT":
+    if V2_SHORT_REGIME_CONFLICT_BLOCK_ENABLE and short_regime_conflict and direction == "SHORT":
         _v2_reject(
             "regime_conflict_block",
             f"direction={direction} btc_dir={btc_dir} short_regime_conflict=True"
@@ -3741,24 +3769,78 @@ def _is_fr_available_flag(sig: Dict[str, Any]) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _sig_hour_jst(sig: Dict[str, Any]) -> Optional[int]:
+    try:
+        dtv = sig.get("dt", None)
+        if dtv is not None and hasattr(dtv, "hour"):
+            return int(dtv.hour)
+    except Exception:
+        pass
+
+    for key in ("hour", "hour_jst", "Hour_JST"):
+        v = _safe_float_or_nan(sig.get(key))
+        if np.isfinite(v):
+            return int(v)
+
+    return None
+
+
 def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    hour = _sig_hour_jst(sig)
 
     if not _is_fr_available_flag(sig):
         return False
+
+    if hour in V2_SHORT_BLOCK_HOURS:
+        return False
+
     if btc_mode_compat != "DOWN":
         return False
+
     if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
         return False
-    if not (2.0 <= float(p1) < 3.0):
+
+    if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
         return False
-    if not (30.0 <= float(rsi) < 50.0):
+
+    if not (float(V2_SHORT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_SHORT_BUCKET_RSI_MAX)):
         return False
-    if float(p2) < -0.30:
+
+    if float(p2) < float(V2_SHORT_BUCKET_P2_MIN):
         return False
+
+    return True
+
+
+def _is_short_good_hour_common_bucket(sig: Dict[str, Any]) -> bool:
+    hour = _sig_hour_jst(sig)
+    if hour is None:
+        return False
+    if hour not in V2_SHORT_STRONG_HOURS:
+        return False
+    return _is_short_win_bucket(sig)
+
+
+def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
+    volratio = _safe_float_or_nan(sig.get("vol_ratio"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+
+    if not _is_short_good_hour_common_bucket(sig):
+        return False
+
+    if not np.isfinite(volratio) or not np.isfinite(p2):
+        return False
+
+    if float(p2) < float(V2_SHORT_STRONG_P2_MIN):
+        return False
+
+    if not (float(V2_SHORT_STRONG_VOLRATIO_MIN) <= float(volratio) <= float(V2_SHORT_STRONG_VOLRATIO_MAX)):
+        return False
+
     return True
 
 
@@ -3850,6 +3932,7 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
             f"p1={p1:.4f} "
             f"p2={p2:.4f} "
             f"rsi={rsi:.4f} "
+            f"hour={_sig_hour_jst(sig)} "
             f"btc_mode={btc_mode_compat} "
             f"fr_ok={fr_ok}"
         )
@@ -8274,6 +8357,11 @@ def logic_main(force: bool = False):
                     else:
 
                         ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
+
+                        if _is_short_strong_hour_bucket(sig):
+                            ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_STRONG_AI_TH))
+                        elif _is_short_good_hour_common_bucket(sig):
+                            ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_GOOD_HOUR_AI_TH))
 
                         if str(btc_mode).strip() == "Up":
                             ai_th_effective = max(float(ai_th_effective), float(SHORT_AI_TH_UP))
