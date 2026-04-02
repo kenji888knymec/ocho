@@ -103,6 +103,10 @@ VERSION = "Ver7.7 ModelReloadFix (Code v3.5.5)"
 
 SIGNAL_ENGINE = os.environ.get("SIGNAL_ENGINE", "v1").strip().lower()
 
+ENABLE_LEGACY_REGIME_NOTIFY = str(
+    os.environ.get("ENABLE_LEGACY_REGIME_NOTIFY", "0")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # --- Thresholds (env configurable) ---
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
@@ -3741,12 +3745,15 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
 
     if not _is_fr_available_flag(sig):
         return False
+    if btc_mode_compat != "DOWN":
+        return False
     if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
         return False
-    if not (1.5 <= float(p1) < 2.0):
+    if not (2.0 <= float(p1) < 3.0):
         return False
     if not (30.0 <= float(rsi) < 50.0):
         return False
@@ -9234,8 +9241,23 @@ def logic_main(force: bool = False):
             print(f"[NOTIFY_FILTER] error fallback pass sym={item.get('symbol','?')}: {e}")
             return True, "NORMAL", "filter_error_fallback_pass"
 
-    # いったんスコア順に並べる（ここではまだ上位制限しない）
-    filtered = sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
+    # 旧V1通知は、明示的に許可したときだけ動かす
+    engine_mode = str(SIGNAL_ENGINE).strip().lower()
+    legacy_live_notify_enabled = bool(ENABLE_LEGACY_REGIME_NOTIFY) and (engine_mode == "v1")
+
+    if not legacy_live_notify_enabled:
+        print(
+            f"[LEGACY-NOTIFY] skipped "
+            f"SIGNAL_ENGINE={engine_mode} "
+            f"ENABLE_LEGACY_REGIME_NOTIFY={ENABLE_LEGACY_REGIME_NOTIFY}"
+        )
+
+    # 旧通知ループに入れる候補は、legacy許可時だけ残す
+    filtered = (
+        sorted(pending_alerts, key=lambda x: x["score"], reverse=True)
+        if legacy_live_notify_enabled
+        else []
+    )
 
 
     count = 0
