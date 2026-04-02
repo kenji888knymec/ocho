@@ -3732,16 +3732,59 @@ def _fmt_sig_num_or_blank(sig: Dict[str, Any], key: str, fmt: str = ".4f") -> st
     return ""
 
 
+def _is_fr_available_flag(sig: Dict[str, Any]) -> bool:
+    v = sig.get("fr_available", None)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+
+    if not _is_fr_available_flag(sig):
+        return False
+    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
+        return False
+    if not (1.5 <= float(p1) < 2.0):
+        return False
+    if not (30.0 <= float(rsi) < 50.0):
+        return False
+    if float(p2) < 0.0:
+        return False
+    return True
+
+
+def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+
+    if not _is_fr_available_flag(sig):
+        return False
+    if btc_mode_compat != "DOWN":
+        return False
+    if not np.isfinite(p1) or not np.isfinite(rsi):
+        return False
+    if not (2.0 <= float(p1) < 2.5):
+        return False
+    if not (40.0 <= float(rsi) < 50.0):
+        return False
+    return True
+
+
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
     SHORT専用の最低品質ライン。
     LONGはここでは触らない。
     欠損は埋めずに reject する。
-    追加方針:
-      - BTC_Mode_Compat=DOWN のときだけ RSI 下限を少し緩める
-      - VolConfirmed を必須化できるようにする
-      - BTC強度の上限も持てるようにする
+
+    今回の方針:
+      - SHORT は勝ちバケットだけを通す
+      - 共通条件として FR_Available=False は切る
+      - SHORT バケットは 1.5<=P1<2.0, 30<=RSI<50, P2>=0 を必須にする
+      - 既存の total / btcstr / weak pocket / VolConfirmed 条件は残す
     """
     direction = str(sig.get("direction", "")).strip().upper()
     if direction != "SHORT":
@@ -3754,10 +3797,12 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     total = _safe_float_or_nan(sig.get("total_score"))
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     volconf_raw = sig.get("vol_confirmed", None)
     volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
+    fr_ok = _is_fr_available_flag(sig)
 
     if not np.isfinite(p1):
         return False, "missing_p1_score"
@@ -3770,6 +3815,12 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     if not np.isfinite(rsi):
         return False, "missing_rsi"
+
+    if not np.isfinite(p2):
+        return False, "missing_p2_score"
+
+    if not fr_ok:
+        return False, "fr_unavailable"
 
     if V2_SHORT_DEF_REQUIRE_VOLCONF and (not volconf):
         return False, "vol_not_confirmed"
@@ -3786,17 +3837,14 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if np.isfinite(V2_SHORT_DEF_BTCSTR_MAX) and btcstr > V2_SHORT_DEF_BTCSTR_MAX:
         return False, f"btcstr_above_max btcstr={btcstr:.4f} max={V2_SHORT_DEF_BTCSTR_MAX:.4f}"
 
-    if btc_mode_compat == "DOWN":
-        rsi_min = V2_SHORT_DEF_RSI_MIN_DOWN
-        rsi_max = V2_SHORT_DEF_RSI_MAX_DOWN
-    else:
-        rsi_min = V2_SHORT_DEF_RSI_MIN
-        rsi_max = V2_SHORT_DEF_RSI_MAX
-
-    if rsi < rsi_min or rsi > rsi_max:
+    if not _is_short_win_bucket(sig):
         return False, (
-            f"rsi_out_of_range rsi={rsi:.4f} "
-            f"min={rsi_min:.1f} max={rsi_max:.1f} mode={btc_mode_compat}"
+            f"short_bucket_miss "
+            f"p1={p1:.4f} "
+            f"p2={p2:.4f} "
+            f"rsi={rsi:.4f} "
+            f"btc_mode={btc_mode_compat} "
+            f"fr_ok={fr_ok}"
         )
 
     if V2_SHORT_RSI_WEAK_MIN <= rsi < V2_SHORT_RSI_WEAK_MAX:
@@ -4166,7 +4214,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
             return False, "range_mode_block"
 
     if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
-        if not long_raw_rescue:
+        if not long_raw_rescue and (not _is_long_down_win_bucket(sig)):
             return False, "down_mode_block"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
@@ -4175,6 +4223,22 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     volconf_raw = sig.get("vol_confirmed", None)
     volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
+    fr_ok = _is_fr_available_flag(sig)
+
+    if not fr_ok:
+        return False, "fr_unavailable"
+
+    if btc_mode_compat != "DOWN":
+        return False, f"long_mode_not_whitelisted btc_mode={btc_mode_compat}"
+
+    if not _is_long_down_win_bucket(sig):
+        return False, (
+            f"long_down_bucket_miss "
+            f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')} "
+            f"rsi={_fmt_sig_num_or_blank(sig, 'rsi')} "
+            f"btc_mode={btc_mode_compat} "
+            f"fr_ok={fr_ok}"
+        )
 
     if not np.isfinite(p1):
         return False, "missing_p1_score"
