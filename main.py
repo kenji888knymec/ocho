@@ -3798,7 +3798,7 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
     if hour in V2_SHORT_BLOCK_HOURS:
         return False
 
-    if btc_mode_compat != "DOWN":
+    if btc_mode_compat not in ("DOWN", "RANGE"):
         return False
 
     if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
