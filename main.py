@@ -8344,13 +8344,13 @@ def logic_main(force: bool = False):
                         ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
 
                         ai_sig = {
-                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
-                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
-                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
-                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
-                            "hour_jst": row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))),
-                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
-                            "vol_ratio": row.get("VolRatio", row.get("vol_ratio", np.nan)),
+                            "p1_score": sig.get("p1_score", row.get("P1_TrendScore", row.get("p1_score", np.nan))),
+                            "p2_score": sig.get("p2_score", row.get("P2_FundingScore", row.get("p2_score", np.nan))),
+                            "rsi": sig.get("rsi", row.get("RSI", row.get("rsi", np.nan))),
+                            "btc_mode_compat": sig.get("btc_mode_compat", row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode))),
+                            "hour_jst": sig.get("hour_jst", row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan)))),
+                            "fr_available": sig.get("fr_available", row.get("FR_Available", row.get("fr_available", ""))),
+                            "vol_ratio": sig.get("vol_ratio", row.get("VolRatio", row.get("vol_ratio", np.nan))),
                         }
 
                         if _is_short_strong_hour_bucket(ai_sig):
