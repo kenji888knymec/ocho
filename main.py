@@ -2762,36 +2762,37 @@ V2_SHORT_RSI_WEAK_MIN      = _env_float("V2_SHORT_RSI_WEAK_MIN", 35.0)
 V2_SHORT_RSI_WEAK_MAX      = _env_float("V2_SHORT_RSI_WEAK_MAX", 40.0)
 
 V2_SHORT_RSI_DEEP_MAX      = _env_float("V2_SHORT_RSI_DEEP_MAX", 35.0)
-
-V2_SHORT_BLOCK_HOURS = {
-    int(float(x.strip()))
-    for x in str(os.environ.get("V2_SHORT_BLOCK_HOURS", "3,4,8,9,13,22,23")).split(",")
-    if str(x).strip()
-}
-V2_SHORT_STRONG_HOURS = {
-    int(float(x.strip()))
-    for x in str(os.environ.get("V2_SHORT_STRONG_HOURS", "0,1,2,10,11,12,15,16,17,18,19,20,21")).split(",")
-    if str(x).strip()
-}
-
-V2_SHORT_BUCKET_P1_MIN = _env_float("V2_SHORT_BUCKET_P1_MIN", 1.0)
-V2_SHORT_BUCKET_P1_MAX = _env_float("V2_SHORT_BUCKET_P1_MAX", 3.0)
-V2_SHORT_BUCKET_RSI_MIN = _env_float("V2_SHORT_BUCKET_RSI_MIN", 30.0)
-V2_SHORT_BUCKET_RSI_MAX = _env_float("V2_SHORT_BUCKET_RSI_MAX", 50.0)
-V2_SHORT_BUCKET_P2_MIN = _env_float("V2_SHORT_BUCKET_P2_MIN", -0.30)
-
-V2_SHORT_STRONG_P2_MIN = _env_float("V2_SHORT_STRONG_P2_MIN", 0.0)
-V2_SHORT_STRONG_VOLRATIO_MIN = _env_float("V2_SHORT_STRONG_VOLRATIO_MIN", 1.0)
-V2_SHORT_STRONG_VOLRATIO_MAX = _env_float("V2_SHORT_STRONG_VOLRATIO_MAX", 1.5)
-
-V2_SHORT_GOOD_HOUR_AI_TH = _env_float("V2_SHORT_GOOD_HOUR_AI_TH", 0.15)
-V2_SHORT_STRONG_AI_TH = _env_float("V2_SHORT_STRONG_AI_TH", 0.10)
 V2_SHORT_RSI_REBOUND_MIN   = _env_float("V2_SHORT_RSI_REBOUND_MIN", 45.0)
 V2_SHORT_RSI_REBOUND_MAX   = _env_float("V2_SHORT_RSI_REBOUND_MAX", 50.0)
 
 V2_SHORT_QS_W_P2_NEG       = _env_float("V2_SHORT_QS_W_P2_NEG", -0.20)
 V2_SHORT_QS_W_P1_GE2       = _env_float("V2_SHORT_QS_W_P1_GE2", -0.15)
 V2_SHORT_QS_W_P3_FLAT      = _env_float("V2_SHORT_QS_W_P3_FLAT", 0.15)
+
+V2_SHORT_ALLOWED_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_ALLOWED_HOURS", "10,11,12,15,16,17,18,19,20")).split(",")
+    if str(x).strip()
+}
+V2_SHORT_STRONG_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_STRONG_HOURS", "10,11,12,15,16,17,18,19,20")).split(",")
+    if str(x).strip()
+}
+V2_SHORT_BUCKET_BTC_MODES = {
+    s.strip().upper()
+    for s in str(os.environ.get("V2_SHORT_BUCKET_BTC_MODES", "DOWN,RANGE")).split(",")
+    if s.strip()
+}
+V2_SHORT_BUCKET_P1_MIN       = _env_float("V2_SHORT_BUCKET_P1_MIN", 1.3)
+V2_SHORT_BUCKET_P1_MAX       = _env_float("V2_SHORT_BUCKET_P1_MAX", 3.0)
+V2_SHORT_BUCKET_RSI_MIN      = _env_float("V2_SHORT_BUCKET_RSI_MIN", 30.0)
+V2_SHORT_BUCKET_RSI_MAX      = _env_float("V2_SHORT_BUCKET_RSI_MAX", 50.0)
+V2_SHORT_BUCKET_P2_MIN       = _env_float("V2_SHORT_BUCKET_P2_MIN", -0.30)
+V2_SHORT_STRONG_P2_MIN       = _env_float("V2_SHORT_STRONG_P2_MIN", 0.0)
+V2_SHORT_STRONG_VOLRATIO_MIN = _env_float("V2_SHORT_STRONG_VOLRATIO_MIN", 1.2)
+V2_SHORT_GOOD_HOUR_AI_TH     = _env_float("V2_SHORT_GOOD_HOUR_AI_TH", 0.15)
+V2_SHORT_STRONG_AI_TH        = _env_float("V2_SHORT_STRONG_AI_TH", 0.10)
 
 # --- V2 SHORT Training Filters ---
 V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -2803,6 +2804,17 @@ V2_LONG_DEF_REQUIRE_VOLCONF        = str(os.environ.get("V2_LONG_DEF_REQUIRE_VOL
 V2_LONG_TRAIN_REQUIRE_VOLCONF      = str(os.environ.get("V2_LONG_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_TRAIN_EXCLUDE_BLOCKLIST    = str(os.environ.get("V2_LONG_TRAIN_EXCLUDE_BLOCKLIST", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_TRAIN_MODE                 = str(os.environ.get("V2_LONG_TRAIN_MODE", "UP")).strip().upper()
+
+V2_LONG_ALLOWED_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_LONG_ALLOWED_HOURS", "11,12,13,14,19,20")).split(",")
+    if str(x).strip()
+}
+V2_LONG_BUCKET_P1_MIN  = _env_float("V2_LONG_BUCKET_P1_MIN", 2.0)
+V2_LONG_BUCKET_P1_MAX  = _env_float("V2_LONG_BUCKET_P1_MAX", 2.5)
+V2_LONG_BUCKET_RSI_MIN = _env_float("V2_LONG_BUCKET_RSI_MIN", 40.0)
+V2_LONG_BUCKET_RSI_MAX = _env_float("V2_LONG_BUCKET_RSI_MAX", 50.0)
+V2_LONG_BUCKET_P2_MIN  = _env_float("V2_LONG_BUCKET_P2_MIN", 0.0)
 
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
@@ -3770,18 +3782,16 @@ def _is_fr_available_flag(sig: Dict[str, Any]) -> bool:
 
 
 def _sig_hour_jst(sig: Dict[str, Any]) -> Optional[int]:
-    try:
-        dtv = sig.get("dt", None)
-        if dtv is not None and hasattr(dtv, "hour"):
-            return int(dtv.hour)
-    except Exception:
-        pass
-
     for key in ("hour", "hour_jst", "Hour_JST"):
-        v = _safe_float_or_nan(sig.get(key))
-        if np.isfinite(v):
-            return int(v)
-
+        try:
+            v = sig.get(key, None)
+            if v is None:
+                continue
+            fv = float(v)
+            if np.isfinite(fv):
+                return int(fv)
+        except Exception:
+            continue
     return None
 
 
@@ -3794,51 +3804,40 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
 
     if not _is_fr_available_flag(sig):
         return False
-
-    if hour in V2_SHORT_BLOCK_HOURS:
+    if hour is None:
         return False
-
-    if btc_mode_compat not in ("DOWN", "RANGE"):
+    if hour not in V2_SHORT_ALLOWED_HOURS:
         return False
-
+    if btc_mode_compat not in V2_SHORT_BUCKET_BTC_MODES:
+        return False
     if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
         return False
-
     if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
         return False
-
     if not (float(V2_SHORT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_SHORT_BUCKET_RSI_MAX)):
         return False
-
     if float(p2) < float(V2_SHORT_BUCKET_P2_MIN):
         return False
-
     return True
 
 
-def _is_short_good_hour_common_bucket(sig: Dict[str, Any]) -> bool:
+def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
+    if not _is_short_win_bucket(sig):
+        return False
+
     hour = _sig_hour_jst(sig)
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    volratio = _safe_float_or_nan(sig.get("vol_ratio"))
+
     if hour is None:
         return False
     if hour not in V2_SHORT_STRONG_HOURS:
         return False
-    return _is_short_win_bucket(sig)
-
-
-def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
-    volratio = _safe_float_or_nan(sig.get("vol_ratio"))
-    p2 = _safe_float_or_nan(sig.get("p2_score"))
-
-    if not _is_short_good_hour_common_bucket(sig):
+    if not np.isfinite(p2) or not np.isfinite(volratio):
         return False
-
-    if not np.isfinite(volratio) or not np.isfinite(p2):
-        return False
-
     if float(p2) < float(V2_SHORT_STRONG_P2_MIN):
         return False
-
-    if not (float(V2_SHORT_STRONG_VOLRATIO_MIN) <= float(volratio) <= float(V2_SHORT_STRONG_VOLRATIO_MAX)):
+    if float(volratio) < float(V2_SHORT_STRONG_VOLRATIO_MIN):
         return False
 
     return True
@@ -3846,18 +3845,26 @@ def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
 
 def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    hour = _sig_hour_jst(sig)
 
     if not _is_fr_available_flag(sig):
         return False
+    if hour is None:
+        return False
+    if hour not in V2_LONG_ALLOWED_HOURS:
+        return False
     if btc_mode_compat != "DOWN":
         return False
-    if not np.isfinite(p1) or not np.isfinite(rsi):
+    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
         return False
-    if not (2.0 <= float(p1) < 2.5):
+    if not (float(V2_LONG_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_BUCKET_P1_MAX)):
         return False
-    if not (40.0 <= float(rsi) < 50.0):
+    if not (float(V2_LONG_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_BUCKET_RSI_MAX)):
+        return False
+    if float(p2) < float(V2_LONG_BUCKET_P2_MIN):
         return False
     return True
 
@@ -3870,10 +3877,10 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     欠損は埋めずに reject する。
 
     今回の方針:
-      - SHORT は勝ちバケットだけを通す
-      - 共通条件として FR_Available=False は切る
-      - SHORT バケットは 1.5<=P1<2.0, 30<=RSI<50, P2>=0 を必須にする
-      - 既存の total / btcstr / weak pocket / VolConfirmed 条件は残す
+      - SHORT は「勝てる時間帯 + 共通条件」だけを通す
+      - FR_Available=False は切る
+      - 時間帯 / BTC_Mode / P1 / RSI / P2 の共通条件でまず絞る
+      - 既存の score / btcstr / volconf / weak pocket の hard reject は SHORTでは使わない
     """
     direction = str(sig.get("direction", "")).strip().upper()
     if direction != "SHORT":
@@ -3887,10 +3894,9 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     btcstr = _safe_float_or_nan(sig.get("btc_htf_strength"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
+    hour = _sig_hour_jst(sig)
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
-    volconf_raw = sig.get("vol_confirmed", None)
-    volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
     fr_ok = _is_fr_available_flag(sig)
 
     if not np.isfinite(p1):
@@ -3911,36 +3917,15 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not fr_ok:
         return False, "fr_unavailable"
 
-    if V2_SHORT_DEF_REQUIRE_VOLCONF and (not volconf):
-        return False, "vol_not_confirmed"
-
-    if p1 < V2_SHORT_DEF_P1_MIN:
-        return False, f"p1_below_min p1={p1:.4f} min={V2_SHORT_DEF_P1_MIN:.4f}"
-
-    if total < V2_SHORT_DEF_SCORE_MIN:
-        return False, f"score_below_min total={total:.4f} min={V2_SHORT_DEF_SCORE_MIN:.4f}"
-
-    if btcstr < V2_SHORT_DEF_BTCSTR_MIN:
-        return False, f"btcstr_below_min btcstr={btcstr:.4f} min={V2_SHORT_DEF_BTCSTR_MIN:.4f}"
-
-    if np.isfinite(V2_SHORT_DEF_BTCSTR_MAX) and btcstr > V2_SHORT_DEF_BTCSTR_MAX:
-        return False, f"btcstr_above_max btcstr={btcstr:.4f} max={V2_SHORT_DEF_BTCSTR_MAX:.4f}"
-
     if not _is_short_win_bucket(sig):
         return False, (
             f"short_bucket_miss "
             f"p1={p1:.4f} "
             f"p2={p2:.4f} "
             f"rsi={rsi:.4f} "
-            f"hour={_sig_hour_jst(sig)} "
+            f"hour={hour} "
             f"btc_mode={btc_mode_compat} "
             f"fr_ok={fr_ok}"
-        )
-
-    if V2_SHORT_RSI_WEAK_MIN <= rsi < V2_SHORT_RSI_WEAK_MAX:
-        return False, (
-            f"rsi_weak_pocket rsi={rsi:.4f} "
-            f"weak_min={V2_SHORT_RSI_WEAK_MIN:.1f} weak_max={V2_SHORT_RSI_WEAK_MAX:.1f}"
         )
 
     return True, "pass"
@@ -8358,9 +8343,29 @@ def logic_main(force: bool = False):
 
                         ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
 
-                        if _is_short_strong_hour_bucket(sig):
+                        hour_for_ai = _safe_float_or_nan(row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))))
+                        p2_for_ai = _safe_float_or_nan(row.get("P2_FundingScore", row.get("p2_score", np.nan)))
+                        volratio_for_ai = _safe_float_or_nan(row.get("VolRatio", row.get("vol_ratio", np.nan)))
+                        btc_mode_compat_for_ai = str(row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)) or "").strip().upper()
+
+                        short_good_hour_common = (
+                            np.isfinite(hour_for_ai)
+                            and int(hour_for_ai) in V2_SHORT_ALLOWED_HOURS
+                            and btc_mode_compat_for_ai in V2_SHORT_BUCKET_BTC_MODES
+                            and np.isfinite(p2_for_ai)
+                            and float(p2_for_ai) >= float(V2_SHORT_BUCKET_P2_MIN)
+                        )
+                        short_strong_hour = (
+                            short_good_hour_common
+                            and np.isfinite(volratio_for_ai)
+                            and int(hour_for_ai) in V2_SHORT_STRONG_HOURS
+                            and float(p2_for_ai) >= float(V2_SHORT_STRONG_P2_MIN)
+                            and float(volratio_for_ai) >= float(V2_SHORT_STRONG_VOLRATIO_MIN)
+                        )
+
+                        if short_strong_hour:
                             ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_STRONG_AI_TH))
-                        elif _is_short_good_hour_common_bucket(sig):
+                        elif short_good_hour_common:
                             ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_GOOD_HOUR_AI_TH))
 
                         if str(btc_mode).strip() == "Up":
