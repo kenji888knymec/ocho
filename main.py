@@ -8343,29 +8343,19 @@ def logic_main(force: bool = False):
 
                         ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
 
-                        hour_for_ai = _safe_float_or_nan(row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))))
-                        p2_for_ai = _safe_float_or_nan(row.get("P2_FundingScore", row.get("p2_score", np.nan)))
-                        volratio_for_ai = _safe_float_or_nan(row.get("VolRatio", row.get("vol_ratio", np.nan)))
-                        btc_mode_compat_for_ai = str(row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)) or "").strip().upper()
+                        ai_sig = {
+                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
+                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
+                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
+                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
+                            "hour_jst": row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))),
+                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
+                            "vol_ratio": row.get("VolRatio", row.get("vol_ratio", np.nan)),
+                        }
 
-                        short_good_hour_common = (
-                            np.isfinite(hour_for_ai)
-                            and int(hour_for_ai) in V2_SHORT_ALLOWED_HOURS
-                            and btc_mode_compat_for_ai in V2_SHORT_BUCKET_BTC_MODES
-                            and np.isfinite(p2_for_ai)
-                            and float(p2_for_ai) >= float(V2_SHORT_BUCKET_P2_MIN)
-                        )
-                        short_strong_hour = (
-                            short_good_hour_common
-                            and np.isfinite(volratio_for_ai)
-                            and int(hour_for_ai) in V2_SHORT_STRONG_HOURS
-                            and float(p2_for_ai) >= float(V2_SHORT_STRONG_P2_MIN)
-                            and float(volratio_for_ai) >= float(V2_SHORT_STRONG_VOLRATIO_MIN)
-                        )
-
-                        if short_strong_hour:
+                        if _is_short_strong_hour_bucket(ai_sig):
                             ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_STRONG_AI_TH))
-                        elif short_good_hour_common:
+                        elif _is_short_win_bucket(ai_sig):
                             ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_GOOD_HOUR_AI_TH))
 
                         if str(btc_mode).strip() == "Up":
