@@ -3394,7 +3394,7 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
       1) 生の symbol
       2) _resolve_okx_symbol() の解決結果
       3) exchange.markets 上で base/quote が一致する swap / linear 候補
-      4) markets の id / symbol / info から拾える候補
+      4) markets の id / symbol から拾える候補
     を重複なく並べる。
     """
     out: List[str] = []
@@ -3420,6 +3420,12 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
         _add(resolved)
     except Exception:
         resolved = raw
+
+    # まず markets を確実に読み込む
+    try:
+        exchange.load_markets()
+    except Exception:
+        pass
 
     # base / quote を決める
     base = ""
@@ -3462,12 +3468,9 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
                 _add(market_symbol)
                 _add(market_id)
 
-                # id だけ "FET-USDT-SWAP" 形式で symbol が弱いケースの保険
                 if market_id:
-                    # CCXT の symbol 形式に近い候補も追加
-                    if q:
-                        _add(f"{b}/{q}:{q}")
-                        _add(f"{b}/{q}")
+                    _add(f"{b}/{q}:{q}")
+                    _add(f"{b}/{q}")
             except Exception:
                 continue
 
