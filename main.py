@@ -110,10 +110,12 @@ ENABLE_LEGACY_REGIME_NOTIFY = str(
     os.environ.get("ENABLE_LEGACY_REGIME_NOTIFY", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+V1_DISABLE = str(
+    os.environ.get("V1_DISABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
 V2_LONG_FR_FAIL_OPEN = str(
     os.environ.get("V2_LONG_FR_FAIL_OPEN", "0")
-).strip().lower() in ("1", "true", "yes", "on")
-    os.environ.get("V1_DISABLE", "1")
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # --- Thresholds (env configurable) ---
