@@ -90,6 +90,9 @@ if not _route_exists("/train_ping", "GET"):
 discord_webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
 print(f"[CFG] DISCORD_WEBHOOK_URL_LEN={len(discord_webhook_url)}")
 daily_discord_webhook_url = os.environ.get("DAILY_DISCORD_WEBHOOK_URL", "").strip()
+V2_NOTIFY_IGNORE_RUNTIME_DEDUP = str(
+    os.environ.get("V2_NOTIFY_IGNORE_RUNTIME_DEDUP", "0")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Hyperliquid: 最大5倍銘柄（この銘柄だけ HL 表示を x5 にする）
 # ※環境変数 MAX_LEV_5X_SYMBOLS が未設定（空）の場合は、このデフォルトセットを使う
@@ -1134,13 +1137,16 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     return "\n".join([x for x in lines if x])
 
 
-def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> int:
+def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tuple[int, int]:
     """
     V2 の notify_pass=1 候補を Discord に送る。
+    戻り値:
+      (sent_n, runtime_dedup_skipped_n)
     """
     global last_alert_records
 
     sent = 0
+    runtime_dedup_skipped = 0
     now_ts = int(time.time())
 
     try:
@@ -1154,21 +1160,40 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> int:
 
     for sig in notify_candidates:
         key = _v2_notify_key(sig)
-        if key in last_alert_records:
+
+        if (not V2_NOTIFY_IGNORE_RUNTIME_DEDUP) and key in last_alert_records:
+            runtime_dedup_skipped += 1
+            print(
+                f"[V2-NOTIFY-SKIP] runtime_dedup "
+                f"symbol={sig.get('symbol', '')} "
+                f"direction={sig.get('direction', '')} "
+                f"key={key}"
+            )
             continue
 
         msg = _build_v2_discord_message(sig)
         if not msg:
+            print(
+                f"[V2-NOTIFY-SKIP] empty_message "
+                f"symbol={sig.get('symbol', '')} "
+                f"direction={sig.get('direction', '')}"
+            )
             continue
 
         try:
             send_discord_message(msg)
             last_alert_records[key] = now_ts
             sent += 1
+            print(
+                f"[V2-NOTIFY-SENT] "
+                f"symbol={sig.get('symbol', '')} "
+                f"direction={sig.get('direction', '')} "
+                f"key={key}"
+            )
         except Exception as e:
             print(f"[WARN] send_v2_live_discord_alerts failed: {type(e).__name__}: {e}")
 
-    return sent
+    return sent, runtime_dedup_skipped
 
 
 # ==========================================
@@ -7976,12 +8001,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             if str(x.get("_notify_pass", "0")) == "1"
         ]
 
-        sent_n = send_v2_live_discord_alerts(notify_candidates)
+        sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
 
         print(
             f"[V2] engine_mode=v2_live "
             f"notify_candidates={len(notify_candidates)} "
-            f"discord_sent={sent_n}"
+            f"discord_sent={sent_n} "
+            f"discord_runtime_dedup_skipped={runtime_dedup_skipped_n} "
+            f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)}"
         )
 
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
