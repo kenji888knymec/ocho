@@ -110,7 +110,9 @@ ENABLE_LEGACY_REGIME_NOTIFY = str(
     os.environ.get("ENABLE_LEGACY_REGIME_NOTIFY", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
-V1_DISABLE = str(
+V2_LONG_FR_FAIL_OPEN = str(
+    os.environ.get("V2_LONG_FR_FAIL_OPEN", "0")
+).strip().lower() in ("1", "true", "yes", "on")
     os.environ.get("V1_DISABLE", "1")
 ).strip().lower() in ("1", "true", "yes", "on")
 
@@ -4584,7 +4586,17 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     fr_ok = _is_fr_available_flag(sig)
 
     if not fr_ok:
-        return False, "fr_unavailable"
+        if V2_LONG_FR_FAIL_OPEN:
+            sig["fr_fail_open_applied"] = True
+            print(
+                f"[V2-LONG-FR-BYPASS] "
+                f"sym={str(sig.get('symbol', ''))} "
+                f"direction={str(sig.get('direction', ''))} "
+                f"reason=fr_unavailable "
+                f"p2_as_zero=1"
+            )
+        else:
+            return False, "fr_unavailable"
 
     primary_long_ok = _is_long_down_win_bucket(sig)
     alt_long_ok = _is_long_alt_win_bucket(sig)
