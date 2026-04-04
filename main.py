@@ -4074,7 +4074,20 @@ def _check_long_strong_bucket(sig: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "long_strong_disabled"
 
     if not fr_ok:
-        return False, "long_strong_fr_unavailable"
+        if V2_LONG_FR_FAIL_OPEN:
+            try:
+                sig["fr_fail_open_applied"] = True
+            except Exception:
+                pass
+            print(
+                f"[V2-LONG-STRONG-FR-BYPASS] "
+                f"sym={str(sig.get('symbol', ''))} "
+                f"direction={str(sig.get('direction', 'LONG'))} "
+                f"reason=long_strong_fr_unavailable "
+                f"p2_as_zero=1"
+            )
+        else:
+            return False, "long_strong_fr_unavailable"
 
     if hour is None:
         return False, "long_strong_hour_missing"
