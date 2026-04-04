@@ -3385,12 +3385,13 @@ def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
 
 def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
     """
-    FR取得用の候補シンボルを、OKXの実在marketsベースで組み立てる。
-    目的:
-      - 生の symbol
-      - _resolve_okx_symbol() の解決結果
-      - 実在する USDT perp/swap 候補
-    を重複なく試す。
+    Funding Rate 取得用の候補シンボルを構築する。
+    方針:
+      1) 生の symbol
+      2) _resolve_okx_symbol() の解決結果
+      3) exchange.markets 上で base/quote が一致する swap / linear 候補
+      4) markets の id / symbol / info から拾える候補
+    を重複なく並べる。
     """
     out: List[str] = []
     seen: Set[str] = set()
@@ -3406,34 +3407,41 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
     if not raw:
         return out
 
-    # まずは既存の解決器を使う
+    # 生の symbol
+    _add(raw)
+
+    # 既存の解決器
     try:
         resolved = _resolve_okx_symbol(exchange, raw)
         _add(resolved)
     except Exception:
-        pass
+        resolved = raw
 
-    # 元のsymbolも残す
-    _add(raw)
-
+    # base / quote を決める
     base = ""
     quote = "USDT"
 
-    if "/" in raw:
-        left, right = raw.split("/", 1)
+    src = resolved if resolved else raw
+    if "/" in src:
+        left, right = src.split("/", 1)
         base = left.strip().upper()
         quote = right.split(":", 1)[0].strip().upper() or "USDT"
     else:
-        base = raw.strip().upper()
+        base = src.strip().upper()
 
     mk = getattr(exchange, "markets", None) or {}
     if isinstance(mk, dict) and mk:
-        for cand, info in mk.items():
+        for cand_symbol, info in mk.items():
             try:
                 info = info or {}
-                cand_s = str(cand).strip()
+
+                cand_symbol = str(cand_symbol).strip()
+                market_id = str(info.get("id", "") or "").strip()
+                market_symbol = str(info.get("symbol", "") or "").strip()
+
                 b = str(info.get("base", "") or "").strip().upper()
                 q = str(info.get("quote", "") or "").strip().upper()
+
                 active = info.get("active", True)
                 is_swap = bool(info.get("swap", False))
                 is_linear = bool(info.get("linear", False))
@@ -3446,11 +3454,20 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
                 if not (is_swap or is_linear or typ == "swap"):
                     continue
 
-                _add(cand_s)
+                _add(cand_symbol)
+                _add(market_symbol)
+                _add(market_id)
+
+                # id だけ "FET-USDT-SWAP" 形式で symbol が弱いケースの保険
+                if market_id:
+                    # CCXT の symbol 形式に近い候補も追加
+                    if q:
+                        _add(f"{b}/{q}:{q}")
+                        _add(f"{b}/{q}")
             except Exception:
                 continue
 
-    # 最後に従来の :USDT もフォールバック候補として残す
+    # 従来候補も最後に残す
     if ":" not in raw and "/USDT" in raw:
         _add(raw + ":USDT")
 
@@ -3459,18 +3476,20 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
 
 def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
     """
-    ccxt で FR 取得。失敗なら None（Pillar2無効化するだけ）。
-    修正方針:
-      - 生の symbol と単純な :USDT 付与だけに頼らない
-      - _resolve_okx_symbol() と実在marketsから候補を作る
-      - 実在しない候補での BadSymbol を減らす
+    ccxt で Funding Rate を取得する。
+    取得できなければ None を返す。
+    重要:
+      - 候補は _build_fr_symbol_candidates() で広く作る
+      - fetch_funding_rate で失敗した候補は fetch_ticker でも fundingRate を試す
     """
     candidates = _build_fr_symbol_candidates(exchange, symbol)
     if not candidates:
         candidates = [symbol]
 
     last_err = ""
+
     for sym in candidates:
+        # 1) まず fetch_funding_rate
         try:
             result = exchange.fetch_funding_rate(sym)
             if result and "fundingRate" in result:
@@ -3481,14 +3500,45 @@ def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
                         if V2_DEBUG_REJECTS:
                             print(f"[V2-FR] success sym={symbol} used={sym} fr={v}")
                         return v
-                    last_err = f"non_finite fr={fr}"
+                    last_err = f"non_finite fundingRate={fr}"
                 else:
                     last_err = "fundingRate is None"
             else:
-                last_err = "no fundingRate key in result"
+                last_err = "no fundingRate key in fetch_funding_rate result"
         except Exception as e:
-            last_err = f"{type(e).__name__}:{e}"
-            continue
+            last_err = f"fetch_funding_rate {type(e).__name__}:{e}"
+
+        # 2) ダメなら fetch_ticker も試す
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            if ticker:
+                fr = ticker.get("fundingRate", None)
+                if fr is not None:
+                    v = float(fr)
+                    if np.isfinite(v):
+                        if V2_DEBUG_REJECTS:
+                            print(f"[V2-FR] success sym={symbol} used={sym} fr={v} via=ticker")
+                        return v
+                    last_err = f"non_finite ticker fundingRate={fr}"
+                else:
+                    info = ticker.get("info", {}) or {}
+                    for key in ("fundingRate", "lastFundingRate", "nextFundingRate"):
+                        raw_v = info.get(key, None)
+                        if raw_v is None or str(raw_v).strip() == "":
+                            continue
+                        try:
+                            v = float(raw_v)
+                            if np.isfinite(v):
+                                if V2_DEBUG_REJECTS:
+                                    print(f"[V2-FR] success sym={symbol} used={sym} fr={v} via=ticker.info.{key}")
+                                return v
+                        except Exception:
+                            continue
+                    last_err = "ticker has no usable fundingRate"
+            else:
+                last_err = "fetch_ticker returned empty"
+        except Exception as e:
+            last_err = f"fetch_ticker {type(e).__name__}:{e}"
 
     if V2_DEBUG_REJECTS:
         print(f"[V2-FR] unavailable sym={symbol} candidates={candidates} last_err={last_err}")
