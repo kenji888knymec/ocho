@@ -3395,6 +3395,7 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
       2) _resolve_okx_symbol() の解決結果
       3) exchange.markets 上で base/quote が一致する swap / linear 候補
       4) markets の id / symbol から拾える候補
+      5) FET/USDT のように markets 走査で拾えない場合の明示 fallback
     を重複なく並べる。
     """
     out: List[str] = []
@@ -3411,23 +3412,19 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
     if not raw:
         return out
 
-    # 生の symbol
     _add(raw)
 
-    # 既存の解決器
     try:
         resolved = _resolve_okx_symbol(exchange, raw)
         _add(resolved)
     except Exception:
         resolved = raw
 
-    # まず markets を確実に読み込む
     try:
         exchange.load_markets()
     except Exception:
         pass
 
-    # base / quote を決める
     base = ""
     quote = "USDT"
 
@@ -3474,9 +3471,18 @@ def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
             except Exception:
                 continue
 
-    # 従来候補も最後に残す
+    # 従来候補
     if ":" not in raw and "/USDT" in raw:
         _add(raw + ":USDT")
+
+    # FET/USDT 専用 fallback
+    if base == "FET" and quote == "USDT":
+        _add("FET/USDT")
+        _add("FET/USDT:USDT")
+        _add("FET-USDT-SWAP")
+        _add("FET-USDT")
+        _add("FETUSDT")
+        _add("FET-USDT-PERP")
 
     return out
 
