@@ -118,6 +118,10 @@ V2_LONG_FR_FAIL_OPEN = str(
     os.environ.get("V2_LONG_FR_FAIL_OPEN", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+V2_FET_HTF_NEUTRAL_FAIL_OPEN = str(
+    os.environ.get("V2_FET_HTF_NEUTRAL_FAIL_OPEN", "0")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # --- Thresholds (env configurable) ---
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
@@ -3773,11 +3777,21 @@ def v2_generate_signal(
             )
 
     if direction == "NEUTRAL":
-        _v2_reject(
-            "sym_htf_neutral",
-            f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf_strength}"
-        )
-        return None
+        if V2_FET_HTF_NEUTRAL_FAIL_OPEN and sym == "FET":
+            print(
+                f"[V2-FET-HTF-BYPASS] "
+                f"sym={sym} "
+                f"reason=sym_htf_neutral "
+                f"sym_htf_dir={sym_htf.get('direction')} "
+                f"sym_htf_strength={sym_htf_strength}"
+            )
+            direction = "LONG"
+        else:
+            _v2_reject(
+                "sym_htf_neutral",
+                f"sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf_strength}"
+            )
+            return None
 
     # side別シンボル blocklist
     long_block = set(V2_LONG_SYMBOL_BLOCKLIST or [])
