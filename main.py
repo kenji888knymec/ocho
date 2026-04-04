@@ -3379,15 +3379,91 @@ def assess_ltf_short(ltf_df: pd.DataFrame) -> Dict[str, Any]:
 # Pillar 2: ファンディングレート
 # ==========================================
 
+def _build_fr_symbol_candidates(exchange, symbol: str) -> List[str]:
+    """
+    FR取得用の候補シンボルを、OKXの実在marketsベースで組み立てる。
+    目的:
+      - 生の symbol
+      - _resolve_okx_symbol() の解決結果
+      - 実在する USDT perp/swap 候補
+    を重複なく試す。
+    """
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(v: Any) -> None:
+        s = ("" if v is None else str(v)).strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    raw = ("" if symbol is None else str(symbol)).strip()
+    if not raw:
+        return out
+
+    # まずは既存の解決器を使う
+    try:
+        resolved = _resolve_okx_symbol(exchange, raw)
+        _add(resolved)
+    except Exception:
+        pass
+
+    # 元のsymbolも残す
+    _add(raw)
+
+    base = ""
+    quote = "USDT"
+
+    if "/" in raw:
+        left, right = raw.split("/", 1)
+        base = left.strip().upper()
+        quote = right.split(":", 1)[0].strip().upper() or "USDT"
+    else:
+        base = raw.strip().upper()
+
+    mk = getattr(exchange, "markets", None) or {}
+    if isinstance(mk, dict) and mk:
+        for cand, info in mk.items():
+            try:
+                info = info or {}
+                cand_s = str(cand).strip()
+                b = str(info.get("base", "") or "").strip().upper()
+                q = str(info.get("quote", "") or "").strip().upper()
+                active = info.get("active", True)
+                is_swap = bool(info.get("swap", False))
+                is_linear = bool(info.get("linear", False))
+                typ = str(info.get("type", "") or "").strip().lower()
+
+                if active is False:
+                    continue
+                if b != base or q != quote:
+                    continue
+                if not (is_swap or is_linear or typ == "swap"):
+                    continue
+
+                _add(cand_s)
+            except Exception:
+                continue
+
+    # 最後に従来の :USDT もフォールバック候補として残す
+    if ":" not in raw and "/USDT" in raw:
+        _add(raw + ":USDT")
+
+    return out
+
+
 def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
     """
     ccxt で FR 取得。失敗なら None（Pillar2無効化するだけ）。
-    OKX swap は BTC/USDT:USDT 形式が必要なケースがあるため、
-    元の形式で失敗したら :USDT 付きでリトライする。
+    修正方針:
+      - 生の symbol と単純な :USDT 付与だけに頼らない
+      - _resolve_okx_symbol() と実在marketsから候補を作る
+      - 実在しない候補での BadSymbol を減らす
     """
-    candidates = [symbol]
-    if ":" not in symbol and "/USDT" in symbol:
-        candidates.append(symbol + ":USDT")
+    candidates = _build_fr_symbol_candidates(exchange, symbol)
+    if not candidates:
+        candidates = [symbol]
 
     last_err = ""
     for sym in candidates:
@@ -3405,7 +3481,7 @@ def fetch_funding_rate_safe(exchange, symbol: str) -> Optional[float]:
                 else:
                     last_err = "fundingRate is None"
             else:
-                last_err = f"no fundingRate key in result"
+                last_err = "no fundingRate key in result"
         except Exception as e:
             last_err = f"{type(e).__name__}:{e}"
             continue
