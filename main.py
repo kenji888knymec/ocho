@@ -2816,6 +2816,26 @@ V2_LONG_BUCKET_RSI_MIN = _env_float("V2_LONG_BUCKET_RSI_MIN", 40.0)
 V2_LONG_BUCKET_RSI_MAX = _env_float("V2_LONG_BUCKET_RSI_MAX", 50.0)
 V2_LONG_BUCKET_P2_MIN  = _env_float("V2_LONG_BUCKET_P2_MIN", 0.0)
 
+V2_LONG_ALT_ENABLE = str(os.environ.get("V2_LONG_ALT_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_ALT_ALLOWED_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_LONG_ALT_ALLOWED_HOURS", "11,12,13,14")).split(",")
+    if str(x).strip()
+}
+V2_LONG_ALT_BUCKET_P1_MIN  = _env_float("V2_LONG_ALT_BUCKET_P1_MIN", 1.3)
+V2_LONG_ALT_BUCKET_P1_MAX  = _env_float("V2_LONG_ALT_BUCKET_P1_MAX", 3.0)
+V2_LONG_ALT_BUCKET_RSI_MIN = _env_float("V2_LONG_ALT_BUCKET_RSI_MIN", 40.0)
+V2_LONG_ALT_BUCKET_RSI_MAX = _env_float("V2_LONG_ALT_BUCKET_RSI_MAX", 55.0)
+V2_LONG_ALT_BUCKET_P2_MIN  = _env_float("V2_LONG_ALT_BUCKET_P2_MIN", 0.0)
+V2_LONG_ALT_AI_TH          = _env_float("V2_LONG_ALT_AI_TH", 0.15)
+
+V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
+V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8")))
+V2_SHORT_PAUSE_STOP_WINRATE = _env_float("V2_SHORT_PAUSE_STOP_WINRATE", 0.40)
+V2_SHORT_PAUSE_STOP_AVGPNL = _env_float("V2_SHORT_PAUSE_STOP_AVGPNL", 0.0)
+V2_SHORT_PAUSE_CACHE_TTL_SEC = int(float(os.environ.get("V2_SHORT_PAUSE_CACHE_TTL_SEC", "300")))
+
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
 # --- V2 SHORT Brake / Recovery ---
@@ -3869,6 +3889,39 @@ def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
     return True
 
 
+def _is_long_alt_win_bucket(sig: Dict[str, Any]) -> bool:
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    hour = _sig_hour_jst(sig)
+
+    if not V2_LONG_ALT_ENABLE:
+        return False
+
+    if not _is_fr_available_flag(sig):
+        return False
+
+    if hour is None:
+        return False
+
+    if hour not in V2_LONG_ALT_ALLOWED_HOURS:
+        return False
+
+    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
+        return False
+
+    if not (float(V2_LONG_ALT_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_ALT_BUCKET_P1_MAX)):
+        return False
+
+    if not (float(V2_LONG_ALT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_ALT_BUCKET_RSI_MAX)):
+        return False
+
+    if float(p2) < float(V2_LONG_ALT_BUCKET_P2_MIN):
+        return False
+
+    return True
+
+
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
@@ -3888,6 +3941,10 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     if not V2_SHORT_DEF_ENABLE:
         return True, "short_def_disabled"
+
+    short_recent = _get_recent_short_strict_health()
+    if bool(short_recent.get("paused")):
+        return False, f"short_recent_pause {short_recent.get('reason_text', '')}"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
@@ -4284,17 +4341,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
 
-    if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
-        if not long_raw_rescue:
-            return False, "range_mode_block"
-
-    if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
-        if not long_raw_rescue and (not _is_long_down_win_bucket(sig)):
-            return False, "down_mode_block"
-
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    hour = _sig_hour_jst(sig)
 
     volconf_raw = sig.get("vol_confirmed", None)
     volconf = str(volconf_raw).strip().lower() in ("1", "true", "yes", "on")
@@ -4303,14 +4354,22 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not fr_ok:
         return False, "fr_unavailable"
 
-    if btc_mode_compat != "DOWN":
-        return False, f"long_mode_not_whitelisted btc_mode={btc_mode_compat}"
+    primary_long_ok = _is_long_down_win_bucket(sig)
+    alt_long_ok = _is_long_alt_win_bucket(sig)
 
-    if not _is_long_down_win_bucket(sig):
+    if alt_long_ok:
+        return True, "long_alt_bucket_pass"
+
+    if not primary_long_ok:
+        if btc_mode_compat != "DOWN":
+            return False, f"long_mode_not_whitelisted btc_mode={btc_mode_compat}"
+
         return False, (
-            f"long_down_bucket_miss "
+            f"long_bucket_miss "
             f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')} "
+            f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')} "
             f"rsi={_fmt_sig_num_or_blank(sig, 'rsi')} "
+            f"hour={hour if hour is not None else ''} "
             f"btc_mode={btc_mode_compat} "
             f"fr_ok={fr_ok}"
         )
@@ -6236,6 +6295,167 @@ def get_v2_regime_health_snapshot(now_jst: Optional[datetime] = None) -> Dict[st
         out["SHORT"]["reason"] = f"snapshot_error:{type(e).__name__}:{e}"
         out["LONG"]["reason"] = f"snapshot_error:{type(e).__name__}:{e}"
         return out
+
+
+_v2_short_pause_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "state": {
+        "paused": False,
+        "reason": "init",
+        "reason_text": "",
+        "n": 0,
+        "win_rate": np.nan,
+        "avg_pnl": np.nan,
+    },
+}
+
+
+def _get_recent_short_strict_health(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    now_jst = now_jst or datetime.now(JST)
+    now_ts = time.time()
+
+    cached = _v2_short_pause_cache.get("state", {})
+    if (now_ts - float(_v2_short_pause_cache.get("ts", 0.0))) <= float(V2_SHORT_PAUSE_CACHE_TTL_SEC):
+        return dict(cached)
+
+    out: Dict[str, Any] = {
+        "paused": False,
+        "reason": "init",
+        "reason_text": "",
+        "n": 0,
+        "win_rate": np.nan,
+        "avg_pnl": np.nan,
+    }
+
+    if not V2_SHORT_PAUSE_ENABLE:
+        out["reason"] = "disabled"
+        out["reason_text"] = "short_pause_disabled"
+        _v2_short_pause_cache["ts"] = now_ts
+        _v2_short_pause_cache["state"] = dict(out)
+        return out
+
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            out["reason"] = "shadow_empty"
+            out["reason_text"] = "shadow_empty"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        work = df.copy()
+
+        if "Datetime_JST" not in work.columns:
+            out["reason"] = "missing_datetime"
+            out["reason_text"] = "missing_datetime"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        work["Datetime_JST"] = pd.to_datetime(work["Datetime_JST"], errors="coerce")
+        work = work.dropna(subset=["Datetime_JST"]).copy()
+
+        since = now_jst - timedelta(hours=int(V2_SHORT_PAUSE_LOOKBACK_HOURS))
+        since_ts = pd.Timestamp(since)
+        if since_ts.tzinfo is not None:
+            since_ts = since_ts.tz_localize(None)
+
+        work = work[work["Datetime_JST"] >= since_ts].copy()
+
+        if "EvalStatus" in work.columns:
+            work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+            work = work[work["EvalStatus"] == "DONE"].copy()
+
+        if {"Datetime_JST", "Symbol", "Direction"}.issubset(work.columns):
+            work = work.sort_values("Datetime_JST").drop_duplicates(
+                subset=["Datetime_JST", "Symbol", "Direction"],
+                keep="last",
+            )
+
+        if "Direction" in work.columns:
+            work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+            work = work[work["Direction"] == "SHORT"].copy()
+
+        if "FR_Available" in work.columns:
+            work["FR_Available"] = work["FR_Available"].apply(_normalize_bool01)
+            work = work[work["FR_Available"] == 1.0].copy()
+        else:
+            out["reason"] = "missing_fr_available"
+            out["reason_text"] = "missing_fr_available"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        for col in ("Hour_JST", "P1_TrendScore", "P2_FundingScore", "RSI", "PnL_Pct"):
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+
+        if "BTC_Mode_Compat" in work.columns:
+            work["BTC_Mode_Compat"] = work["BTC_Mode_Compat"].astype(str).str.strip().str.upper()
+        else:
+            out["reason"] = "missing_btc_mode"
+            out["reason_text"] = "missing_btc_mode"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        work = work[
+            work["Hour_JST"].isin(V2_SHORT_ALLOWED_HOURS)
+            & work["BTC_Mode_Compat"].isin(V2_SHORT_BUCKET_BTC_MODES)
+            & (work["P1_TrendScore"] >= float(V2_SHORT_BUCKET_P1_MIN))
+            & (work["P1_TrendScore"] < float(V2_SHORT_BUCKET_P1_MAX))
+            & (work["RSI"] >= float(V2_SHORT_BUCKET_RSI_MIN))
+            & (work["RSI"] < float(V2_SHORT_BUCKET_RSI_MAX))
+            & (work["P2_FundingScore"] >= float(V2_SHORT_BUCKET_P2_MIN))
+        ].copy()
+
+        out["n"] = int(len(work))
+        if out["n"] <= 0:
+            out["reason"] = "no_recent_strict_short"
+            out["reason_text"] = "no_recent_strict_short"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        if "WinLose" not in work.columns:
+            out["reason"] = "missing_winlose"
+            out["reason_text"] = "missing_winlose"
+            _v2_short_pause_cache["ts"] = now_ts
+            _v2_short_pause_cache["state"] = dict(out)
+            return out
+
+        work["__win__"] = work["WinLose"].astype(str).str.strip().str.upper().eq("WIN")
+        wr = float(work["__win__"].mean()) if len(work) > 0 else np.nan
+        avg_pnl = float(work["PnL_Pct"].mean()) if len(work) > 0 else np.nan
+
+        out["win_rate"] = wr
+        out["avg_pnl"] = avg_pnl
+
+        paused = (
+            int(out["n"]) >= int(V2_SHORT_PAUSE_MIN_DONE)
+            and (
+                (np.isfinite(wr) and float(wr) < float(V2_SHORT_PAUSE_STOP_WINRATE))
+                or (np.isfinite(avg_pnl) and float(avg_pnl) <= float(V2_SHORT_PAUSE_STOP_AVGPNL))
+            )
+        )
+
+        out["paused"] = bool(paused)
+        out["reason"] = "paused" if paused else "ok"
+        out["reason_text"] = (
+            f"n={int(out['n'])} "
+            f"wr={'' if not np.isfinite(wr) else format(float(wr), '.4f')} "
+            f"avg_pnl={'' if not np.isfinite(avg_pnl) else format(float(avg_pnl), '.4f')} "
+            f"lookback_h={int(V2_SHORT_PAUSE_LOOKBACK_HOURS)}"
+        )
+
+    except Exception as e:
+        out["paused"] = False
+        out["reason"] = "error"
+        out["reason_text"] = f"short_pause_check_error:{type(e).__name__}:{e}"
+
+    _v2_short_pause_cache["ts"] = now_ts
+    _v2_short_pause_cache["state"] = dict(out)
+    return out
 
 
 def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -8338,6 +8558,17 @@ def logic_main(force: bool = False):
                     if chosen_side == "LONG":
 
                         ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
+
+                        long_ai_sig = {
+                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
+                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
+                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
+                            "hour_jst": row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))),
+                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
+                        }
+
+                        if _is_long_alt_win_bucket(long_ai_sig):
+                            ai_th_effective = min(float(ai_th_effective), float(V2_LONG_ALT_AI_TH))
 
                     else:
 
