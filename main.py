@@ -4341,6 +4341,18 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
 
+    # まず第2 whitelist を最優先で通す
+    if _is_long_alt_win_bucket(sig):
+        return True, "long_alt_bucket_pass"
+
+    if V2_LONG_BLOCK_RANGE and btc_mode_compat == "RANGE":
+        if not long_raw_rescue:
+            return False, "range_mode_block"
+
+    if V2_LONG_REJECT_MODE_DOWN and btc_mode_compat == "DOWN":
+        if not long_raw_rescue and (not _is_long_down_win_bucket(sig)):
+            return False, "down_mode_block"
+
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
@@ -8570,11 +8582,11 @@ def logic_main(force: bool = False):
                         if _is_long_alt_win_bucket(long_ai_sig):
                             ai_th_effective = min(float(ai_th_effective), float(V2_LONG_ALT_AI_TH))
 
+                        ai_pass = (float(ai_score) >= float(ai_th_effective))
+
                     else:
 
-                        ai_th_effective = min(float(ai_th_used), float(SHORT_AI_TH))
-
-                        ai_sig = {
+                        short_ai_sig = {
                             "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
                             "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
                             "rsi": row.get("RSI", row.get("rsi", np.nan)),
@@ -8584,15 +8596,24 @@ def logic_main(force: bool = False):
                             "vol_ratio": row.get("VolRatio", row.get("vol_ratio", np.nan)),
                         }
 
-                        if _is_short_strong_hour_bucket(ai_sig):
-                            ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_STRONG_AI_TH))
-                        elif _is_short_win_bucket(ai_sig):
-                            ai_th_effective = min(float(ai_th_effective), float(V2_SHORT_GOOD_HOUR_AI_TH))
+                        short_core_ok = _is_short_win_bucket(short_ai_sig)
+                        short_push_ok = _is_short_strong_hour_bucket(short_ai_sig)
 
-                        if str(btc_mode).strip() == "Up":
-                            ai_th_effective = max(float(ai_th_effective), float(SHORT_AI_TH_UP))
+                        # SHORT は AI を hard gate に使わない
+                        ai_th_effective = 0.0
+                        ai_pass = bool(short_core_ok)
 
-                    ai_pass = (float(ai_score) >= float(ai_th_effective))
+                        dbg["short_ai_mode"] = "soft"
+                        dbg["short_ai_core_ok"] = bool(short_core_ok)
+                        dbg["short_ai_push_ok"] = bool(short_push_ok)
+                        dbg["short_ai_score"] = float(ai_score)
+                        dbg["short_ai_th_effective"] = 0.0
+                        dbg["short_ai_below_old_threshold"] = bool(
+                            float(ai_score) < float(min(float(ai_th_used), float(SHORT_AI_TH)))
+                        )
+
+                        if short_push_ok:
+                            signal_type = "SHORT_PUSH"
 
 
 
