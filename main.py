@@ -3969,41 +3969,75 @@ def _is_long_alt_win_bucket(sig: Dict[str, Any]) -> bool:
     return True
 
 
-def _is_long_strong_bucket(sig: Dict[str, Any]) -> bool:
+def _check_long_strong_bucket(sig: Dict[str, Any]) -> Tuple[bool, str]:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     hour = _sig_hour_jst(sig)
+    fr_ok = _is_fr_available_flag(sig)
 
     if not V2_LONG_STRONG_ENABLE:
-        return False
+        return False, "long_strong_disabled"
 
-    if not _is_fr_available_flag(sig):
-        return False
+    if not fr_ok:
+        return False, "long_strong_fr_unavailable"
 
     if hour is None:
-        return False
+        return False, "long_strong_hour_missing"
 
     if hour not in V2_LONG_STRONG_ALLOWED_HOURS:
-        return False
+        return False, (
+            f"long_strong_hour_out_of_range "
+            f"hour={hour} "
+            f"allowed={sorted(list(V2_LONG_STRONG_ALLOWED_HOURS))}"
+        )
 
     if btc_mode_compat not in V2_LONG_STRONG_BUCKET_BTC_MODES:
-        return False
+        return False, (
+            f"long_strong_btc_mode_miss "
+            f"btc_mode={btc_mode_compat} "
+            f"allowed={sorted(list(V2_LONG_STRONG_BUCKET_BTC_MODES))}"
+        )
 
-    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
-        return False
+    if not np.isfinite(p1):
+        return False, "long_strong_missing_p1"
+
+    if not np.isfinite(p2):
+        return False, "long_strong_missing_p2"
+
+    if not np.isfinite(rsi):
+        return False, "long_strong_missing_rsi"
 
     if not (float(V2_LONG_STRONG_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_STRONG_BUCKET_P1_MAX)):
-        return False
+        return False, (
+            f"long_strong_p1_out_of_range "
+            f"p1={float(p1):.4f} "
+            f"min={float(V2_LONG_STRONG_BUCKET_P1_MIN):.4f} "
+            f"max={float(V2_LONG_STRONG_BUCKET_P1_MAX):.4f}"
+        )
 
     if not (float(V2_LONG_STRONG_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_STRONG_BUCKET_RSI_MAX)):
-        return False
+        return False, (
+            f"long_strong_rsi_out_of_range "
+            f"rsi={float(rsi):.4f} "
+            f"min={float(V2_LONG_STRONG_BUCKET_RSI_MIN):.4f} "
+            f"max={float(V2_LONG_STRONG_BUCKET_RSI_MAX):.4f}"
+        )
 
     if float(p2) < float(V2_LONG_STRONG_BUCKET_P2_MIN):
-        return False
+        return False, (
+            f"long_strong_p2_below_min "
+            f"p2={float(p2):.4f} "
+            f"min={float(V2_LONG_STRONG_BUCKET_P2_MIN):.4f}"
+        )
 
-    return True
+    return True, "long_strong_bucket_pass"
+
+
+def _is_long_strong_bucket(sig: Dict[str, Any]) -> bool:
+    ok, _ = _check_long_strong_bucket(sig)
+    return ok
 
 
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
@@ -4434,8 +4468,9 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
 
     # まず LONG_STRONG を最優先で通す
-    if _is_long_strong_bucket(sig):
-        return True, "long_strong_bucket_pass"
+    strong_ok, strong_reason = _check_long_strong_bucket(sig)
+    if strong_ok:
+        return True, strong_reason
 
     # 次に、必要なら LONG_ALT を通す
     if _is_long_alt_win_bucket(sig):
