@@ -110,6 +110,10 @@ ENABLE_LEGACY_REGIME_NOTIFY = str(
     os.environ.get("ENABLE_LEGACY_REGIME_NOTIFY", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+V1_DISABLE = str(
+    os.environ.get("V1_DISABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # --- Thresholds (env configurable) ---
 CAND_SIGMA = float(os.environ.get("CAND_SIGMA", "1.2"))
 ALERT_SIGMA = float(os.environ.get("ALERT_SIGMA", "2.0"))
@@ -852,6 +856,10 @@ def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_v
     return out
 
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
+    if V1_DISABLE and sheet_name in (LEARN_SHEET_NAME, MAIN_SHEET_NAME):
+        print(f"[V1-DISABLED] skip append_rows_to_sheet sheet={sheet_name}")
+        return
+
     headers, colcount, ok = get_headers_and_len(sheet_name)
 
     if not headers:
@@ -2695,6 +2703,11 @@ def get_ai_model_for_side(side: str, sym_code: str):
 def self_heal_prerequisites() -> Tuple[bool, str]:
     try:
         ok_lock = ensure_sheet_exists(RUN_MUTEX_SHEET, min_rows=50, min_cols=5)
+
+        if V1_DISABLE:
+            ok_all = bool(ok_lock)
+            return ok_all, f"lock={ok_lock} learn=skipped table=skipped v1_disable={V1_DISABLE}"
+
         ok_learn = ensure_learn_headers()
         ok_table = ensure_table_headers()
         ok_all = bool(ok_lock and ok_learn and ok_table)
@@ -10192,6 +10205,10 @@ def judge_sheet(sheet_name: str, lookback_rows: int = JUDGE_LOOKBACK_ROWS, max_j
     return judged
 
 def judge_main():
+    if V1_DISABLE:
+        print("[V1-DISABLED] judge_main skipped")
+        return "V1 judge disabled"
+
     total = 0
     total += judge_sheet(MAIN_SHEET_NAME)
     total += judge_sheet(LEARN_SHEET_NAME)
