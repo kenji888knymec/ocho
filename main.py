@@ -8713,10 +8713,40 @@ def logic_main(force: bool = False):
                             "fr_available": row.get("FR_Available", row.get("fr_available", "")),
                         }
 
-                        if _is_long_strong_bucket(long_ai_sig):
+                        strong_ok, strong_reason = _check_long_strong_bucket(long_ai_sig)
+                        alt_ok = _is_long_alt_win_bucket(long_ai_sig)
+
+                        if strong_ok:
                             ai_th_effective = min(float(ai_th_effective), float(V2_LONG_STRONG_AI_TH))
-                        elif _is_long_alt_win_bucket(long_ai_sig):
+                        elif alt_ok:
                             ai_th_effective = min(float(ai_th_effective), float(V2_LONG_ALT_AI_TH))
+
+                        dbg["long_ai_mode"] = "soft"
+                        dbg["long_ai_strong_ok"] = bool(strong_ok)
+                        dbg["long_ai_strong_reason"] = str(strong_reason)
+                        dbg["long_ai_alt_ok"] = bool(alt_ok)
+                        dbg["long_ai_score"] = float(ai_score)
+                        dbg["long_ai_th_effective"] = float(ai_th_effective)
+
+                        print(
+                            "[V2-LONG-AI-CHECK] "
+                            f"sym={row.get('Symbol', row.get('symbol', ''))} "
+                            f"strong_ok={strong_ok} "
+                            f"strong_reason={strong_reason} "
+                            f"alt_ok={alt_ok} "
+                            f"ai_score={float(ai_score):.6f} "
+                            f"ai_th_used={float(ai_th_used):.6f} "
+                            f"long_ai_th={float(LONG_AI_TH):.6f} "
+                            f"strong_ai_th={float(V2_LONG_STRONG_AI_TH):.6f} "
+                            f"alt_ai_th={float(V2_LONG_ALT_AI_TH):.6f} "
+                            f"ai_th_effective={float(ai_th_effective):.6f} "
+                            f"p1={_safe_float_or_nan(long_ai_sig.get('p1_score'))} "
+                            f"p2={_safe_float_or_nan(long_ai_sig.get('p2_score'))} "
+                            f"rsi={_safe_float_or_nan(long_ai_sig.get('rsi'))} "
+                            f"btc_mode={str(long_ai_sig.get('btc_mode_compat', ''))} "
+                            f"hour={long_ai_sig.get('hour_jst')} "
+                            f"fr_available={long_ai_sig.get('fr_available')}"
+                        )
 
                         ai_pass = (float(ai_score) >= float(ai_th_effective))
 
