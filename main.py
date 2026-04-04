@@ -2854,6 +2854,28 @@ V2_LONG_ALT_BUCKET_RSI_MAX = _env_float("V2_LONG_ALT_BUCKET_RSI_MAX", 55.0)
 V2_LONG_ALT_BUCKET_P2_MIN  = _env_float("V2_LONG_ALT_BUCKET_P2_MIN", 0.0)
 V2_LONG_ALT_AI_TH          = _env_float("V2_LONG_ALT_AI_TH", 0.15)
 
+V2_SHORT_PAUSE_ALLOW_STRONG_BUCKET = str(
+    os.environ.get("V2_SHORT_PAUSE_ALLOW_STRONG_BUCKET", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_LONG_STRONG_ENABLE = str(os.environ.get("V2_LONG_STRONG_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_STRONG_ALLOWED_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_LONG_STRONG_ALLOWED_HOURS", "11,12,13,14")).split(",")
+    if str(x).strip()
+}
+V2_LONG_STRONG_BUCKET_BTC_MODES = {
+    s.strip().upper()
+    for s in str(os.environ.get("V2_LONG_STRONG_BUCKET_BTC_MODES", "DOWN,UP")).split(",")
+    if s.strip()
+}
+V2_LONG_STRONG_BUCKET_P1_MIN  = _env_float("V2_LONG_STRONG_BUCKET_P1_MIN", 2.0)
+V2_LONG_STRONG_BUCKET_P1_MAX  = _env_float("V2_LONG_STRONG_BUCKET_P1_MAX", 2.5)
+V2_LONG_STRONG_BUCKET_RSI_MIN = _env_float("V2_LONG_STRONG_BUCKET_RSI_MIN", 40.0)
+V2_LONG_STRONG_BUCKET_RSI_MAX = _env_float("V2_LONG_STRONG_BUCKET_RSI_MAX", 60.0)
+V2_LONG_STRONG_BUCKET_P2_MIN  = _env_float("V2_LONG_STRONG_BUCKET_P2_MIN", 0.0)
+V2_LONG_STRONG_AI_TH          = _env_float("V2_LONG_STRONG_AI_TH", 0.15)
+
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
 V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8")))
@@ -3947,6 +3969,43 @@ def _is_long_alt_win_bucket(sig: Dict[str, Any]) -> bool:
     return True
 
 
+def _is_long_strong_bucket(sig: Dict[str, Any]) -> bool:
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
+    p2 = _safe_float_or_nan(sig.get("p2_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    hour = _sig_hour_jst(sig)
+
+    if not V2_LONG_STRONG_ENABLE:
+        return False
+
+    if not _is_fr_available_flag(sig):
+        return False
+
+    if hour is None:
+        return False
+
+    if hour not in V2_LONG_STRONG_ALLOWED_HOURS:
+        return False
+
+    if btc_mode_compat not in V2_LONG_STRONG_BUCKET_BTC_MODES:
+        return False
+
+    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
+        return False
+
+    if not (float(V2_LONG_STRONG_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_STRONG_BUCKET_P1_MAX)):
+        return False
+
+    if not (float(V2_LONG_STRONG_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_STRONG_BUCKET_RSI_MAX)):
+        return False
+
+    if float(p2) < float(V2_LONG_STRONG_BUCKET_P2_MIN):
+        return False
+
+    return True
+
+
 def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Stage A:
@@ -3969,7 +4028,15 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     short_recent = _get_recent_short_strict_health()
     if bool(short_recent.get("paused")):
-        return False, f"short_recent_pause {short_recent.get('reason_text', '')}"
+        if V2_SHORT_PAUSE_ALLOW_STRONG_BUCKET and _is_short_strong_hour_bucket(sig):
+            print(
+                f"[V2-PAUSE-BYPASS] strong_short "
+                f"symbol={sig.get('symbol', '')} "
+                f"direction={sig.get('direction', '')} "
+                f"reason={short_recent.get('reason_text', '')}"
+            )
+        else:
+            return False, f"short_recent_pause {short_recent.get('reason_text', '')}"
 
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
@@ -4366,7 +4433,11 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
 
-    # まず第2 whitelist を最優先で通す
+    # まず LONG_STRONG を最優先で通す
+    if _is_long_strong_bucket(sig):
+        return True, "long_strong_bucket_pass"
+
+    # 次に、必要なら LONG_ALT を通す
     if _is_long_alt_win_bucket(sig):
         return True, "long_alt_bucket_pass"
 
@@ -8602,11 +8673,14 @@ def logic_main(force: bool = False):
                             "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
                             "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
                             "rsi": row.get("RSI", row.get("rsi", np.nan)),
+                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
                             "hour_jst": row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))),
                             "fr_available": row.get("FR_Available", row.get("fr_available", "")),
                         }
 
-                        if _is_long_alt_win_bucket(long_ai_sig):
+                        if _is_long_strong_bucket(long_ai_sig):
+                            ai_th_effective = min(float(ai_th_effective), float(V2_LONG_STRONG_AI_TH))
+                        elif _is_long_alt_win_bucket(long_ai_sig):
                             ai_th_effective = min(float(ai_th_effective), float(V2_LONG_ALT_AI_TH))
 
                         ai_pass = (float(ai_score) >= float(ai_th_effective))
@@ -8626,9 +8700,12 @@ def logic_main(force: bool = False):
                         short_core_ok = _is_short_win_bucket(short_ai_sig)
                         short_push_ok = _is_short_strong_hour_bucket(short_ai_sig)
 
-                        # SHORT は AI を hard gate に使わない
+                        # 強いSHORTは AI hard gate を bypass
                         ai_th_effective = 0.0
-                        ai_pass = bool(short_core_ok)
+                        if short_push_ok and V2_SHORT_PAUSE_ALLOW_STRONG_BUCKET:
+                            ai_pass = True
+                        else:
+                            ai_pass = bool(short_core_ok)
 
                         dbg["short_ai_mode"] = "soft"
                         dbg["short_ai_core_ok"] = bool(short_core_ok)
