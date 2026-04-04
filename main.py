@@ -4505,7 +4505,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     if not primary_long_ok:
         if btc_mode_compat != "DOWN":
-            return False, f"long_mode_not_whitelisted btc_mode={btc_mode_compat}"
+            return False, f"long_mode_not_whitelisted btc_mode={btc_mode_compat} strong_reason={strong_reason}"
 
         return False, (
             f"long_bucket_miss "
