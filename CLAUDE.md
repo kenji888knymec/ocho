@@ -66,7 +66,7 @@
 
 ## pushルール
 
-- 私が「OK」と言うまでcommit・pushは絶対にしない
+- コード変更が完了したら、確認を待たずにそのままcommit・pushまで進めてよい
 - pushブランチ: `claude/crypto-bot-assistant-QlA5G`
 - mainブランチへの直接pushは禁止
 
