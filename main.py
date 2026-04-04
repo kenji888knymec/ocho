@@ -8704,13 +8704,18 @@ def logic_main(force: bool = False):
 
                         ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
 
+                        src_sig = locals().get("item", {})
+                        if not isinstance(src_sig, dict):
+                            src_sig = {}
+
                         long_ai_sig = {
-                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
-                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
-                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
-                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
-                            "hour_jst": row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan))),
-                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
+                            "symbol": src_sig.get("symbol", row.get("Symbol", row.get("symbol", sym_code))),
+                            "p1_score": src_sig.get("p1_score", row.get("P1_TrendScore", row.get("p1_score", np.nan))),
+                            "p2_score": src_sig.get("p2_score", row.get("P2_FundingScore", row.get("p2_score", np.nan))),
+                            "rsi": src_sig.get("rsi", row.get("RSI", row.get("rsi", np.nan))),
+                            "btc_mode_compat": src_sig.get("btc_mode_compat", row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode))),
+                            "hour_jst": src_sig.get("hour", row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan)))),
+                            "fr_available": src_sig.get("fr_available", row.get("FR_Available", row.get("fr_available", ""))),
                         }
 
                         strong_ok, strong_reason = _check_long_strong_bucket(long_ai_sig)
@@ -8727,10 +8732,19 @@ def logic_main(force: bool = False):
                         dbg["long_ai_alt_ok"] = bool(alt_ok)
                         dbg["long_ai_score"] = float(ai_score)
                         dbg["long_ai_th_effective"] = float(ai_th_effective)
+                        dbg["long_ai_sig"] = {
+                            "symbol": str(long_ai_sig.get("symbol", "")),
+                            "p1_score": _safe_float_or_nan(long_ai_sig.get("p1_score")),
+                            "p2_score": _safe_float_or_nan(long_ai_sig.get("p2_score")),
+                            "rsi": _safe_float_or_nan(long_ai_sig.get("rsi")),
+                            "btc_mode_compat": str(long_ai_sig.get("btc_mode_compat", "")),
+                            "hour_jst": long_ai_sig.get("hour_jst"),
+                            "fr_available": long_ai_sig.get("fr_available"),
+                        }
 
                         print(
                             "[V2-LONG-AI-CHECK] "
-                            f"sym={row.get('Symbol', row.get('symbol', ''))} "
+                            f"sym={str(long_ai_sig.get('symbol', ''))} "
                             f"strong_ok={strong_ok} "
                             f"strong_reason={strong_reason} "
                             f"alt_ok={alt_ok} "
