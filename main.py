@@ -2825,9 +2825,22 @@ V2_SHORT_STRONG_HOURS = {
     for x in str(os.environ.get("V2_SHORT_STRONG_HOURS", "10,11,12,15,16,17,18,19,20")).split(",")
     if str(x).strip()
 }
+
+V2_SHORT_PUSH_ALLOWED_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_PUSH_ALLOWED_HOURS", "0,1,17,18,19,20,21,22")).split(",")
+    if str(x).strip()
+}
+
 V2_SHORT_BUCKET_BTC_MODES = {
     s.strip().upper()
     for s in str(os.environ.get("V2_SHORT_BUCKET_BTC_MODES", "DOWN,RANGE")).split(",")
+    if s.strip()
+}
+
+V2_SHORT_PUSH_BUCKET_BTC_MODES = {
+    s.strip().upper()
+    for s in str(os.environ.get("V2_SHORT_PUSH_BUCKET_BTC_MODES", "DOWN,RANGE,UP")).split(",")
     if s.strip()
 }
 V2_SHORT_BUCKET_P1_MIN       = _env_float("V2_SHORT_BUCKET_P1_MIN", 1.3)
@@ -4055,21 +4068,41 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
 
 
 def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
-    if not _is_short_win_bucket(sig):
-        return False
-
-    hour = _sig_hour_jst(sig)
+    """
+    SHORT_PUSH / pause bypass 用の「強いSHORT」判定。
+    通常の _is_short_win_bucket(sig) に依存させず、
+    push 専用の hour / btc_mode で判定する。
+    """
+    p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
+    rsi = _safe_float_or_nan(sig.get("rsi"))
     volratio = _safe_float_or_nan(sig.get("vol_ratio"))
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    hour = _sig_hour_jst(sig)
+
+    if not _is_fr_available_flag(sig):
+        return False
 
     if hour is None:
         return False
-    if hour not in V2_SHORT_STRONG_HOURS:
+    if hour not in V2_SHORT_PUSH_ALLOWED_HOURS:
         return False
-    if not np.isfinite(p2) or not np.isfinite(volratio):
+
+    if btc_mode_compat not in V2_SHORT_PUSH_BUCKET_BTC_MODES:
         return False
+
+    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi) or not np.isfinite(volratio):
+        return False
+
+    if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
+        return False
+
+    if not (float(V2_SHORT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_SHORT_BUCKET_RSI_MAX)):
+        return False
+
     if float(p2) < float(V2_SHORT_STRONG_P2_MIN):
         return False
+
     if float(volratio) < float(V2_SHORT_STRONG_VOLRATIO_MIN):
         return False
 
