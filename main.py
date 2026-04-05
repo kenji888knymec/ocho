@@ -1012,8 +1012,8 @@ def _safe_pct_str(v, digits: int = 2) -> str:
 
 def _get_v2_symbol_recent_stats(symbol: str, direction: str, lookback_n: int = 20) -> Dict[str, Any]:
     """
-    v2_shadow_ai から同一銘柄・同方向の直近成績を取得する。
-    通知本文に「直近20件勝率」を出すための補助。
+    v2_shadow_ai から同一銘柄・同方向の直近成績を取得する（通知ベース）。
+    notify_pass=1 または AI_Pass==1 のエントリのみ対象。
     """
     try:
         df = get_v2_shadow_ai_data()
@@ -1040,10 +1040,80 @@ def _get_v2_symbol_recent_stats(symbol: str, direction: str, lookback_n: int = 2
             work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
             work = work[work["EvalStatus"] == "DONE"].copy()
 
+        # 通知ベースフィルター: notify_pass=1 または AI_Pass==1
+        notify_mask = pd.Series([False] * len(work), index=work.index)
+        if "AI_Note" in work.columns:
+            note_col = work["AI_Note"].astype(str).str.lower()
+            notify_mask = notify_mask | note_col.str.contains("notify_pass=1", na=False)
+        if "AI_Pass" in work.columns:
+            ai_pass_col = work["AI_Pass"].astype(str).str.strip().str.lower()
+            notify_mask = notify_mask | ai_pass_col.isin(["1", "true", "yes"])
+        work = work[notify_mask].copy()
+
         sub = work[
             (work["Symbol"] == str(symbol).strip().upper()) &
             (work["Direction"] == str(direction).strip().upper())
         ].copy()
+
+        if sub.empty:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        sub = sub.head(int(lookback_n))
+
+        if "WinLose" not in sub.columns:
+            return {"n": int(len(sub)), "wins": 0, "wr": np.nan}
+
+        wl = sub["WinLose"].astype(str).str.strip().str.lower()
+        wins = int(wl.isin(["win", "w", "1", "true"]).sum())
+        n = int(len(sub))
+        wr = float(wins / n) if n > 0 else np.nan
+
+        return {"n": n, "wins": wins, "wr": wr}
+
+    except Exception:
+        return {"n": 0, "wins": 0, "wr": np.nan}
+
+
+def _get_v2_global_recent_stats(direction: str, lookback_n: int = 20) -> Dict[str, Any]:
+    """
+    v2_shadow_ai から指定方向の全銘柄直近成績を取得する（通知ベース）。
+    notify_pass=1 または AI_Pass==1 のエントリのみ対象。
+    """
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        work = df.copy()
+
+        if "Direction" not in work.columns:
+            return {"n": 0, "wins": 0, "wr": np.nan}
+
+        if "Datetime_JST" in work.columns:
+            work["Datetime_JST"] = pd.to_datetime(
+                work["Datetime_JST"].astype(str).str.strip(),
+                errors="coerce",
+            )
+            work = work[work["Datetime_JST"].notna()].copy()
+            work = work.sort_values("Datetime_JST", ascending=False)
+
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+
+        if "EvalStatus" in work.columns:
+            work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+            work = work[work["EvalStatus"] == "DONE"].copy()
+
+        # 通知ベースフィルター: notify_pass=1 または AI_Pass==1
+        notify_mask = pd.Series([False] * len(work), index=work.index)
+        if "AI_Note" in work.columns:
+            note_col = work["AI_Note"].astype(str).str.lower()
+            notify_mask = notify_mask | note_col.str.contains("notify_pass=1", na=False)
+        if "AI_Pass" in work.columns:
+            ai_pass_col = work["AI_Pass"].astype(str).str.strip().str.lower()
+            notify_mask = notify_mask | ai_pass_col.isin(["1", "true", "yes"])
+        work = work[notify_mask].copy()
+
+        sub = work[work["Direction"] == str(direction).strip().upper()].copy()
 
         if sub.empty:
             return {"n": 0, "wins": 0, "wr": np.nan}
@@ -1117,7 +1187,8 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
             sl_lev_pct = ""
 
     ai_prob = _safe_pct_str(sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")), digits=1)
-    recent = _get_v2_symbol_recent_stats(symbol, direction, lookback_n=20)
+    recent_symbol = _get_v2_symbol_recent_stats(symbol, direction, lookback_n=20)
+    recent_global = _get_v2_global_recent_stats(direction, lookback_n=20)
 
     if direction == "LONG":
         side_emoji = "🟢"
@@ -1128,15 +1199,25 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
         tp_emoji = "🎯"
         sl_emoji = "🛑"
 
-    recent_line = ""
-    if int(recent.get("n", 0)) >= 10 and np.isfinite(recent.get("wr", np.nan)):
-        recent_line = (
-            f"📊 直近{int(recent['n'])}件勝率: "
-            f"{float(recent['wr']) * 100:.0f}% "
-            f"（{int(recent['wins'])}/{int(recent['n'])}）"
+    recent_symbol_line = ""
+    if int(recent_symbol.get("n", 0)) >= 10 and np.isfinite(recent_symbol.get("wr", np.nan)):
+        recent_symbol_line = (
+            f"📊 {symbol}直近{int(recent_symbol['n'])}件勝率: "
+            f"{float(recent_symbol['wr']) * 100:.0f}% "
+            f"（{int(recent_symbol['wins'])}/{int(recent_symbol['n'])}）"
         )
-    elif int(recent.get("n", 0)) > 0:
-        recent_line = f"📊 直近{int(recent['n'])}件: 参考不足"
+    elif int(recent_symbol.get("n", 0)) > 0:
+        recent_symbol_line = f"📊 {symbol}直近{int(recent_symbol['n'])}件: 参考不足"
+
+    recent_global_line = ""
+    if int(recent_global.get("n", 0)) >= 10 and np.isfinite(recent_global.get("wr", np.nan)):
+        recent_global_line = (
+            f"🌐 全体直近{int(recent_global['n'])}件勝率: "
+            f"{float(recent_global['wr']) * 100:.0f}% "
+            f"（{int(recent_global['wins'])}/{int(recent_global['n'])}）"
+        )
+    elif int(recent_global.get("n", 0)) > 0:
+        recent_global_line = f"🌐 全体直近{int(recent_global['n'])}件: 参考不足"
 
     lines = [
         f"{side_emoji}【{symbol} {direction}】",
@@ -1146,7 +1227,8 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
         f"📌 TP入力: {tp_pct}%（x{display_lev}で {tp_lev_pct}%）" if tp_pct else "",
         f"📌 SL入力: {sl_pct}%（x{display_lev}で {sl_lev_pct}%）" if sl_pct else "",
         f"🤖 AI判定: {ai_prob}%" if ai_prob else "",
-        recent_line,
+        recent_symbol_line,
+        recent_global_line,
         f"🕒 {dt_str}" if dt_str else "",
     ]
 
