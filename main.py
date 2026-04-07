@@ -8169,7 +8169,11 @@ def _build_hour_ranking_lines(
 ) -> list:
     """
     時間帯別ランキングを daily 用に出す。
-    Datetime_JST または _dt から JST の hour を作る。
+    優先順:
+      1) NotifiedAt_JST 列
+      2) _notified_at_jst 列
+      3) AI_Note / ai_note 内の notified_at_jst=YYYY-MM-DD HH:MM:SS
+      4) Datetime_JST / _dt / Hour_JST / hour
     """
     lines = [f"【{title}】"]
 
@@ -8178,20 +8182,57 @@ def _build_hour_ranking_lines(
         return lines
 
     work = df.copy()
+    work["_hour"] = pd.Series([np.nan] * len(work), index=work.index, dtype="float64")
 
-    if "_dt" in work.columns:
-        dt = pd.to_datetime(work["_dt"], errors="coerce")
+    # 1) 実送信時刻の専用列があれば最優先
+    if "NotifiedAt_JST" in work.columns:
+        dt = pd.to_datetime(work["NotifiedAt_JST"].astype(str).str.strip(), errors="coerce")
         work["_hour"] = dt.dt.hour
-    elif "Datetime_JST" in work.columns:
-        dt = pd.to_datetime(work["Datetime_JST"].astype(str).str.strip(), errors="coerce")
+
+    elif "_notified_at_jst" in work.columns:
+        dt = pd.to_datetime(work["_notified_at_jst"].astype(str).str.strip(), errors="coerce")
         work["_hour"] = dt.dt.hour
-    elif "Hour_JST" in work.columns:
-        work["_hour"] = pd.to_numeric(work["Hour_JST"], errors="coerce")
-    elif "hour" in work.columns:
-        work["_hour"] = pd.to_numeric(work["hour"], errors="coerce")
+
     else:
-        lines.append("・データなし")
-        return lines
+        # 2) AI_Note / ai_note から notified_at_jst=... を抜く
+        note_col = None
+        for c in ["AI_Note", "ai_note"]:
+            if c in work.columns:
+                note_col = c
+                break
+
+        if note_col is not None:
+            note_text = work[note_col].astype(str)
+            extracted = note_text.str.extract(r"notified_at_jst=([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})", expand=False)
+            dt = pd.to_datetime(extracted, errors="coerce")
+            work["_hour"] = dt.dt.hour
+
+        # 3) まだ取れていない行だけ、従来の列へフォールバック
+        missing_mask = work["_hour"].isna()
+
+        if missing_mask.any() and "_dt" in work.columns:
+            dt = pd.to_datetime(work.loc[missing_mask, "_dt"], errors="coerce")
+            work.loc[missing_mask, "_hour"] = dt.dt.hour
+
+        missing_mask = work["_hour"].isna()
+        if missing_mask.any() and "Datetime_JST" in work.columns:
+            dt = pd.to_datetime(
+                work.loc[missing_mask, "Datetime_JST"].astype(str).str.strip(),
+                errors="coerce",
+            )
+            work.loc[missing_mask, "_hour"] = dt.dt.hour
+
+        missing_mask = work["_hour"].isna()
+        if missing_mask.any() and "Hour_JST" in work.columns:
+            work.loc[missing_mask, "_hour"] = pd.to_numeric(
+                work.loc[missing_mask, "Hour_JST"], errors="coerce"
+            )
+
+        missing_mask = work["_hour"].isna()
+        if missing_mask.any() and "hour" in work.columns:
+            work.loc[missing_mask, "_hour"] = pd.to_numeric(
+                work.loc[missing_mask, "hour"], errors="coerce"
+            )
 
     work = work[work["_hour"].notna()].copy()
     if work.empty:
@@ -8258,8 +8299,6 @@ def analyze_v2_performance() -> str:
         return msg
 
     total_rows = len(df_all)
-    df_done = get_v2_done_records(df_all).copy()
-    n_done = len(df_done)
 
     if "EvalStatus" in df_all.columns:
         status_all = df_all["EvalStatus"].astype(str).str.strip().str.upper()
@@ -8269,6 +8308,23 @@ def analyze_v2_performance() -> str:
 
     now_jst = datetime.now(JST)
     now_str = now_jst.strftime("%Y-%m-%d %H:%M JST")
+    since_jst = now_jst - timedelta(hours=24)
+
+    # 1) DONEベースの集計用
+    df_done = get_v2_done_records(df_all).copy()
+    n_done = len(df_done)
+
+    # 2) 実送信ベースの集計用（OPENも含める）
+    df_report_all = df_all.copy()
+    if "Datetime_JST" in df_report_all.columns:
+        df_report_all["Datetime_JST"] = pd.to_datetime(
+            df_report_all["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        df_report_all = df_report_all[df_report_all["Datetime_JST"].notna()].copy()
+        df_report_all = df_report_all[df_report_all["Datetime_JST"] >= pd.Timestamp(since_jst.replace(tzinfo=None))].copy()
+    else:
+        df_report_all = pd.DataFrame(columns=df_all.columns)
 
     if n_done == 0:
         msg = "\n".join([
@@ -8301,8 +8357,16 @@ def analyze_v2_performance() -> str:
     else:
         df_done["_dt"] = pd.NaT
 
-    since = pd.Timestamp(now_jst.replace(tzinfo=None)) - pd.Timedelta(hours=24)
-    df_24h = df_done[df_done["_dt"] >= since].copy()
+    # 3) 従来の daily 本文の DONE は維持
+    if "Datetime_JST" in df_done.columns:
+        df_done["Datetime_JST"] = pd.to_datetime(
+            df_done["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        df_done = df_done[df_done["Datetime_JST"].notna()].copy()
+        df_24h = df_done[df_done["Datetime_JST"] >= pd.Timestamp(since_jst.replace(tzinfo=None))].copy()
+    else:
+        df_24h = pd.DataFrame(columns=df_done.columns)
 
     if df_24h.empty:
         msg = "\n".join([
@@ -8355,7 +8419,36 @@ def analyze_v2_performance() -> str:
         df_24h["AI_Band"] = ""
 
     notify_df = df_24h[df_24h["_notify_1"]].copy()
-    sent_df = df_24h[df_24h["_notify_sent_1"]].copy()
+
+    # 実送信は DONE に限定しない
+    sent_df = df_report_all.copy()
+
+    note_col_sent = None
+    for c in ["AI_Note", "ai_note"]:
+        if c in sent_df.columns:
+            note_col_sent = c
+            break
+
+    sent_ai_pass_series = pd.Series([False] * len(sent_df), index=sent_df.index)
+    if "AI_Pass" in sent_df.columns:
+        sent_ai_pass_text = sent_df["AI_Pass"].astype(str).str.strip().str.lower()
+        sent_ai_pass_series = sent_ai_pass_text.isin(["1", "true", "yes", "on"])
+
+    if note_col_sent:
+        sent_note = sent_df[note_col_sent].astype(str)
+        sent_has_notify_sent_tag = sent_note.str.contains("notify_sent=", na=False)
+        sent_has_notify_pass_tag = sent_note.str.contains("notify_pass=1", na=False)
+
+        sent_df["_notify_sent_1"] = (
+            sent_note.str.contains("notify_sent=1", na=False)
+            | (~sent_has_notify_sent_tag & sent_ai_pass_series)
+            | (~sent_has_notify_sent_tag & sent_has_notify_pass_tag)
+        )
+    else:
+        sent_df["_notify_sent_1"] = sent_ai_pass_series
+
+    sent_df = sent_df[sent_df["_notify_sent_1"]].copy()
+
     rank_reject_df = df_24h[df_24h["AI_Band"] == "RANK_REJECT"].copy()
     rejected_df = df_24h[df_24h["AI_Band"] == "REJECTED"].copy()
 
