@@ -1241,12 +1241,19 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
     V2 の notify_pass=1 候補を Discord に送る。
     戻り値:
       (sent_n, runtime_dedup_skipped_n)
+
+    重要:
+    実際に送れたものだけ ai_note に
+      notify_sent=1
+      notified_at_jst=YYYY-MM-DD HH:MM:SS
+    を追記する。
     """
     global last_alert_records
 
     sent = 0
     runtime_dedup_skipped = 0
     now_ts = int(time.time())
+    now_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
     try:
         expire_before = now_ts - 86400
@@ -1258,10 +1265,16 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
         pass
 
     for sig in notify_candidates:
+        sig["_notify_sent"] = "0"
+        sig["_notified_at_jst"] = ""
+
         key = _v2_notify_key(sig)
 
         if (not V2_NOTIFY_IGNORE_RUNTIME_DEDUP) and key in last_alert_records:
             runtime_dedup_skipped += 1
+            cur_note = str(sig.get("ai_note", "") or "")
+            add_note = "notify_sent=0;notify_send_reason=runtime_dedup_skip"
+            sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
             print(
                 f"[V2-NOTIFY-SKIP] runtime_dedup "
                 f"symbol={sig.get('symbol', '')} "
@@ -1272,6 +1285,9 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
 
         msg = _build_v2_discord_message(sig)
         if not msg:
+            cur_note = str(sig.get("ai_note", "") or "")
+            add_note = "notify_sent=0;notify_send_reason=empty_message"
+            sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
             print(
                 f"[V2-NOTIFY-SKIP] empty_message "
                 f"symbol={sig.get('symbol', '')} "
@@ -1283,6 +1299,14 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
             send_discord_message(msg)
             last_alert_records[key] = now_ts
             sent += 1
+
+            sig["_notify_sent"] = "1"
+            sig["_notified_at_jst"] = now_jst_str
+
+            cur_note = str(sig.get("ai_note", "") or "")
+            add_note = f"notify_sent=1;notified_at_jst={now_jst_str}"
+            sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
             print(
                 f"[V2-NOTIFY-SENT] "
                 f"symbol={sig.get('symbol', '')} "
@@ -1290,6 +1314,9 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
                 f"key={key}"
             )
         except Exception as e:
+            cur_note = str(sig.get("ai_note", "") or "")
+            add_note = f"notify_sent=0;notify_send_reason=send_error:{type(e).__name__}"
+            sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
             print(f"[WARN] send_v2_live_discord_alerts failed: {type(e).__name__}: {e}")
 
     return sent, runtime_dedup_skipped
@@ -8295,9 +8322,22 @@ def analyze_v2_performance() -> str:
 
     if note_col:
         note = df_24h[note_col].astype(str)
+
+        # 旧: notify_pass=1（採用判定）
         df_24h["_notify_1"] = note.str.contains("notify_pass=1", na=False)
+
+        # 新: notify_sent=1（実際にDiscord送信済み）
+        # 旧データとの互換のため、notify_sent= がまだ無い行は notify_pass=1 を仮採用
+        df_24h["_notify_sent_1"] = (
+            note.str.contains("notify_sent=1", na=False) |
+            (
+                ~note.str.contains("notify_sent=", na=False) &
+                note.str.contains("notify_pass=1", na=False)
+            )
+        )
     else:
         df_24h["_notify_1"] = False
+        df_24h["_notify_sent_1"] = False
 
     if "AI_Band" in df_24h.columns:
         df_24h["AI_Band"] = df_24h["AI_Band"].astype(str).str.strip().str.upper()
@@ -8305,6 +8345,7 @@ def analyze_v2_performance() -> str:
         df_24h["AI_Band"] = ""
 
     notify_df = df_24h[df_24h["_notify_1"]].copy()
+    sent_df = df_24h[df_24h["_notify_sent_1"]].copy()
     rank_reject_df = df_24h[df_24h["AI_Band"] == "RANK_REJECT"].copy()
     rejected_df = df_24h[df_24h["AI_Band"] == "REJECTED"].copy()
 
@@ -8322,37 +8363,46 @@ def analyze_v2_performance() -> str:
         notify_long_n = int((dir_notify == "LONG").sum())
         notify_short_n = int((dir_notify == "SHORT").sum())
 
-    notify_long_df = pd.DataFrame()
-    notify_short_df = pd.DataFrame()
-    if "Direction" in notify_df.columns:
-        dir_notify = notify_df["Direction"].astype(str).str.strip().str.upper()
-        notify_long_df = notify_df[dir_notify == "LONG"].copy()
-        notify_short_df = notify_df[dir_notify == "SHORT"].copy()
+    sent_long_n = 0
+    sent_short_n = 0
+    if "Direction" in sent_df.columns:
+        dir_sent = sent_df["Direction"].astype(str).str.strip().str.upper()
+        sent_long_n = int((dir_sent == "LONG").sum())
+        sent_short_n = int((dir_sent == "SHORT").sum())
+
+    sent_long_df = pd.DataFrame()
+    sent_short_df = pd.DataFrame()
+    if "Direction" in sent_df.columns:
+        dir_sent = sent_df["Direction"].astype(str).str.strip().str.upper()
+        sent_long_df = sent_df[dir_sent == "LONG"].copy()
+        sent_short_df = sent_df[dir_sent == "SHORT"].copy()
 
     lines = [
         "📘【V2 デイリーレポート】",
         f"🕒 {now_str}",
         f"📦 直近24h DONE {len(df_24h)}件 / OPEN {n_open}件",
-        f"📊 DONE内訳: 🟢 LONG {done_long_n}件 / 🔴 SHORT {done_short_n}件",
-        f"📣 採用内訳: 🟢 LONG {notify_long_n}件 / 🔴 SHORT {notify_short_n}件",
+        f"📊 DONE内訳: 🟢LONG {done_long_n}件 / 🔴SHORT {done_short_n}件",
+        f"🤖 採用判定内訳: 🟢LONG {notify_long_n}件 / 🔴SHORT {notify_short_n}件",
+        f"📣 実送信内訳: 🟢LONG {sent_long_n}件 / 🔴SHORT {sent_short_n}件",
         "",
-        _summarize_simple(notify_df, "採用", "✅"),
+        _summarize_simple(notify_df, "採用判定", "🤖"),
+        _summarize_simple(sent_df, "実送信", "📣"),
         _summarize_simple(rank_reject_df, "惜しくも落選", "🟡"),
         _summarize_simple(rejected_df, "除外", "🔴"),
         "",
     ]
 
     lines += _build_symbol_ranking_lines(
-        notify_df,
-        "良い銘柄ランキング",
+        sent_df,
+        "良い銘柄ランキング（実送信）",
         top_n=5,
         sort_bad=False,
         min_n=1,
     )
     lines += [""]
     lines += _build_symbol_ranking_lines(
-        notify_df,
-        "悪い銘柄ランキング",
+        sent_df,
+        "悪い銘柄ランキング（実送信）",
         top_n=5,
         sort_bad=True,
         min_n=1,
@@ -8367,15 +8417,15 @@ def analyze_v2_performance() -> str:
     )
     lines += [""]
     lines += _build_hour_ranking_lines(
-        notify_long_df,
-        "採用時間帯ランキング（LONG）",
+        sent_long_df,
+        "実送信時間帯ランキング（LONG）",
         top_n=8,
         min_n=1,
     )
     lines += [""]
     lines += _build_hour_ranking_lines(
-        notify_short_df,
-        "採用時間帯ランキング（SHORT）",
+        sent_short_df,
+        "実送信時間帯ランキング（SHORT）",
         top_n=8,
         min_n=1,
     )
@@ -8785,10 +8835,6 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
             )
 
-    # シート書き込み（選抜通過もREJECTも全部書く）
-    rows = [v2_build_shadow_row(sig) for sig in final_signals]
-    v2_write_shadow_rows(rows)
-
     if engine_mode == "v2_live":
         notify_candidates = [
             x for x in final_signals
@@ -8804,6 +8850,19 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             f"discord_runtime_dedup_skipped={runtime_dedup_skipped_n} "
             f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)}"
         )
+    else:
+        sent_n, runtime_dedup_skipped_n = 0, 0
+        for sig in final_signals:
+            sig["_notify_sent"] = "0"
+            sig["_notified_at_jst"] = ""
+            cur_note = str(sig.get("ai_note", "") or "")
+            add_note = "notify_sent=0;notify_send_reason=engine_not_v2_live"
+            sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+    # シート書き込み（選抜通過もREJECTも全部書く）
+    # 重要: 送信結果を ai_note に反映したあとで書く
+    rows = [v2_build_shadow_row(sig) for sig in final_signals]
+    v2_write_shadow_rows(rows)
 
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
 
