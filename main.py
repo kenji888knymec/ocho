@@ -1705,21 +1705,23 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
         "input_n_features": -1,
         "action": "none",
         "error": "",
-        # NaN原因特定用（常にキーを持たせる）
         "nan_cols": None,
         "nan_n_cols": None,
         "nan_cnt": None,
         "nan_filled": 0,
         "alias_renamed": None,
+        "schema_version_model": "",
+        "schema_version_runtime": str(V2_RUNTIME_FEATURE_SCHEMA_VERSION),
+        "schema_hash_expected": "",
+        "schema_hash_actual": "",
+        "schema_enforced": bool(V2_MODEL_SCHEMA_ENFORCE),
     }
 
     try:
-        # 0) model が None の場合は bypass（推測値で埋めない）
         if model is None:
             debug["action"] = "model_none_bypass"
             return None, True, debug
 
-        # 1) model が dict/tuple/list の wrapper の場合は中身(estimator)を取り出す
         if isinstance(model, dict):
             for k in ("model", "estimator", "clf", "pipeline", "sk_model"):
                 if k in model:
@@ -1731,24 +1733,20 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
             model = model[0]
             debug["action"] = "unwrapped_list_model"
 
-        # unwrap した結果でも predict_proba が無いなら bypass
         if not hasattr(model, "predict_proba"):
             debug["action"] = "no_predict_proba_bypass"
             debug["error"] = f"model_type={type(model)} has no predict_proba"
             print(f"[AI] safe_predict_proba bypass: {debug['error']}")
             return None, True, debug
 
-        # 2) feats の整形
         if feats is None:
             feats = pd.DataFrame([{}])
         elif not isinstance(feats, pd.DataFrame):
             feats = pd.DataFrame(feats)
 
-        # inf は NaN にする（埋めずに bypass 判定へ）
         feats = feats.replace([np.inf, -np.inf], np.nan)
         debug["input_n_features"] = int(feats.shape[1])
 
-        # 14列モデルに対して列順だけ固定したい場合
         FEATURE_COLUMNS_14 = [
             "EntryPrice",
             "ScoreSigma",
@@ -1765,6 +1763,7 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
             "BTC_1h_Change",
             "RSI",
         ]
+
         try:
             if isinstance(feats, pd.DataFrame) and hasattr(model, "n_features_in_"):
                 expected_n = int(getattr(model, "n_features_in_", 0) or 0)
@@ -1774,14 +1773,12 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
         except Exception:
             pass
 
-        # 3) 特徴量の整合（feature_names_in_ に追従）
         expected_cols = _extract_feature_names(model)
         if expected_cols:
             expected_cols = [str(c) for c in list(expected_cols)]
             debug["expected_cols"] = list(expected_cols)
             debug["expected_n_features"] = int(len(expected_cols))
 
-            # 列名揺れ吸収（スペース/アンダースコアの違い等）
             try:
                 rename_map = {}
                 if isinstance(feats, pd.DataFrame):
@@ -1825,7 +1822,42 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
                 debug["error"] = f"feature mismatch: X={feats.shape[1]} expected={expected_n}"
                 return None, True, debug
 
-        # 4) 方針：NaN が残っていたら「固定値で埋めずに予測しない（bypass）」
+        model_meta = _extract_model_meta(model)
+        if model_meta:
+            model_schema_version = str(model_meta.get("feature_schema_version", "") or "").strip()
+            model_feature_hash = str(model_meta.get("feature_hash", "") or "").strip()
+            meta_cols = [str(c) for c in list(model_meta.get("feature_columns", []) or [])]
+
+            debug["schema_version_model"] = model_schema_version
+            debug["schema_hash_expected"] = model_feature_hash
+
+            actual_cols = [str(c) for c in list(feats.columns)]
+            actual_hash = _feature_columns_hash(actual_cols)
+            debug["schema_hash_actual"] = actual_hash
+
+            if meta_cols and actual_cols != meta_cols:
+                debug["action"] = "schema_columns_mismatch_bypass"
+                debug["error"] = f"schema columns mismatch: actual={actual_cols} expected={meta_cols}"
+                if V2_MODEL_SCHEMA_ENFORCE:
+                    print(f"[AI-SCHEMA-BYPASS] {debug['error']}")
+                    return None, True, debug
+
+            if model_feature_hash and actual_hash != model_feature_hash:
+                debug["action"] = "schema_hash_mismatch_bypass"
+                debug["error"] = f"schema hash mismatch: actual={actual_hash} expected={model_feature_hash}"
+                if V2_MODEL_SCHEMA_ENFORCE:
+                    print(f"[AI-SCHEMA-BYPASS] {debug['error']}")
+                    return None, True, debug
+
+            if V2_MODEL_SCHEMA_ENFORCE and model_schema_version and model_schema_version != str(V2_RUNTIME_FEATURE_SCHEMA_VERSION):
+                debug["action"] = "schema_version_mismatch_bypass"
+                debug["error"] = (
+                    f"schema version mismatch: "
+                    f"model={model_schema_version} runtime={V2_RUNTIME_FEATURE_SCHEMA_VERSION}"
+                )
+                print(f"[AI-SCHEMA-BYPASS] {debug['error']}")
+                return None, True, debug
+
         if isinstance(feats, pd.DataFrame):
             if feats.shape[1] == 0:
                 debug["action"] = "empty_features_bypass"
@@ -1860,7 +1892,6 @@ def safe_predict_proba(model, feats: pd.DataFrame) -> Tuple[Optional[np.ndarray]
 
                 return None, True, debug
 
-        # 5) predict_proba 実行
         proba = np.asarray(model.predict_proba(feats), dtype=float)
         if proba.ndim == 1:
             proba = np.vstack([1.0 - proba, proba]).T
@@ -1983,6 +2014,15 @@ TRAIN_V2_SHORT_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_SHORT_MIN_SAMPLE
 TRAIN_V2_LONG_GCS_PREFIX = os.environ.get("TRAIN_V2_LONG_GCS_PREFIX", "side_models/long")
 TRAIN_V2_SHORT_GCS_PREFIX = os.environ.get("TRAIN_V2_SHORT_GCS_PREFIX", "side_models/short")
 
+V2_RUNTIME_FEATURE_SCHEMA_VERSION = os.environ.get("V2_RUNTIME_FEATURE_SCHEMA_VERSION", "v2_serving_9f_v1").strip()
+V2_TRAIN_FEATURE_SCHEMA_VERSION = os.environ.get("V2_TRAIN_FEATURE_SCHEMA_VERSION", "v2_shadow_ai_16f_v1").strip()
+V2_MODEL_SCHEMA_ENFORCE = os.environ.get("V2_MODEL_SCHEMA_ENFORCE", "0").strip() == "1"
+
+V2_RETRAIN_COMPARE_ENABLE = os.environ.get("V2_RETRAIN_COMPARE_ENABLE", "1").strip() == "1"
+V2_RETRAIN_MAX_AUC_DROP = float(os.environ.get("V2_RETRAIN_MAX_AUC_DROP", "0.03"))
+V2_RETRAIN_MIN_TEST_ROWS = int(float(os.environ.get("V2_RETRAIN_MIN_TEST_ROWS", "50")))
+V2_RETRAIN_REQUIRE_SERVING_SCHEMA_MATCH = os.environ.get("V2_RETRAIN_REQUIRE_SERVING_SCHEMA_MATCH", "1").strip() == "1"
+
 def _parse_gs_uri(uri: str) -> Tuple[str, str]:
     # "gs://bucket/path/to.obj" -> ("bucket", "path/to.obj")
     u = ("" if uri is None else str(uri)).strip()
@@ -2032,6 +2072,147 @@ def _build_train_output_uri_for_side(side: str, version: str) -> str:
         return f"gs://{bucket}/{obj}"
 
     return ""
+
+
+def _get_v2_serving_feature_columns() -> List[str]:
+    return [
+        "Sigma",
+        "BandWidth",
+        "BW_Change",
+        "RSI",
+        "Vol_Change",
+        "Rise_Score",
+        "Drop_Score",
+        "BTC_Ret",
+        "BTC_Vol",
+    ]
+
+
+def _feature_columns_hash(cols: List[str]) -> str:
+    norm = [str(c).strip() for c in list(cols or [])]
+    raw = "||".join(norm)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _model_meta_uri_for_uri(uri: str) -> str:
+    u = str(uri or "").strip()
+    if not u.startswith("gs://"):
+        return ""
+    if u.endswith(".pkl"):
+        return u[:-4] + ".meta.json"
+    return u + ".meta.json"
+
+
+def _write_json_file(path: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _load_model_meta_from_uri(uri: str) -> Dict[str, Any]:
+    meta_uri = _model_meta_uri_for_uri(uri)
+    if not meta_uri:
+        return {}
+
+    tmp_meta = _safe_tmp_path_for_uri(meta_uri)
+    ok = _gcs_download_to(meta_uri, tmp_meta)
+    if (not ok) or (not os.path.exists(tmp_meta)):
+        return {}
+
+    try:
+        with open(tmp_meta, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[AI] model meta load failed uri={meta_uri} err={type(e).__name__}: {e}")
+        return {}
+    finally:
+        try:
+            os.remove(tmp_meta)
+        except Exception:
+            pass
+
+
+def _attach_model_meta(model, meta: Dict[str, Any]):
+    try:
+        setattr(model, "_ocho_model_meta", dict(meta or {}))
+    except Exception:
+        pass
+    return model
+
+
+def _extract_model_meta(model) -> Dict[str, Any]:
+    try:
+        meta = getattr(model, "_ocho_model_meta", None)
+        return dict(meta or {}) if isinstance(meta, dict) else {}
+    except Exception:
+        return {}
+
+
+def _evaluate_binary_model(model, X_eval: pd.DataFrame, y_eval: np.ndarray) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "ok": False,
+        "skipped": False,
+        "reason": "",
+        "accuracy": None,
+        "auc": None,
+        "n_rows": int(len(X_eval)) if X_eval is not None else 0,
+        "expected_cols": None,
+        "expected_n_features": None,
+        "schema_version": "",
+        "feature_hash": "",
+    }
+
+    if model is None:
+        result["skipped"] = True
+        result["reason"] = "model_none"
+        return result
+
+    meta = _extract_model_meta(model)
+    result["schema_version"] = str(meta.get("feature_schema_version", "") or "").strip()
+    result["feature_hash"] = str(meta.get("feature_hash", "") or "").strip()
+
+    expected_cols = _extract_feature_names(model)
+    if expected_cols:
+        expected_cols = [str(c) for c in list(expected_cols)]
+        result["expected_cols"] = list(expected_cols)
+        result["expected_n_features"] = int(len(expected_cols))
+        if list(X_eval.columns) != expected_cols:
+            result["skipped"] = True
+            result["reason"] = "schema_mismatch_eval"
+            return result
+    else:
+        expected_n = _infer_expected_n_features(model)
+        result["expected_n_features"] = int(expected_n)
+        if expected_n > 0 and int(X_eval.shape[1]) != int(expected_n):
+            result["skipped"] = True
+            result["reason"] = "feature_count_mismatch_eval"
+            return result
+
+    try:
+        y_pred = model.predict(X_eval)
+        result["accuracy"] = float(accuracy_score(y_eval, y_pred)) if accuracy_score is not None else None
+
+        auc = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X_eval)[:, 1]
+            auc = float(roc_auc_score(y_eval, proba)) if roc_auc_score is not None else None
+        elif hasattr(model, "decision_function"):
+            score = model.decision_function(X_eval)
+            auc = float(roc_auc_score(y_eval, score)) if roc_auc_score is not None else None
+
+        result["auc"] = auc
+        result["ok"] = True
+        return result
+
+    except Exception as e:
+        result["skipped"] = True
+        result["reason"] = f"{type(e).__name__}: {e}"
+        return result
+
 
 def _sheet_rows_as_df(sheet_name: str, lookback_rows: int) -> pd.DataFrame:
     """
@@ -2728,8 +2909,12 @@ def get_ai_model_for_side(side: str, sym_code: str):
 
         if cached and (now_ts - float(cached.get("ts", 0.0)) <= float(MODEL_CACHE_TTL_SEC)):
             model = cached.get("model")
+            meta = dict(cached.get("meta", {}) or {})
+            model = _attach_model_meta(model, meta)
+
             ver = str(cached.get("version", side_ver))
             src = str(cached.get("source", side_uri))
+
             if s == "LONG":
                 ai_model_long = model
                 AI_MODEL_VERSION_RUNTIME_LONG = ver
@@ -2738,6 +2923,7 @@ def get_ai_model_for_side(side: str, sym_code: str):
                 ai_model_short = model
                 AI_MODEL_VERSION_RUNTIME_SHORT = ver
                 AI_MODEL_SOURCE_RUNTIME_SHORT = src
+
             return model, ver, src
 
         tmp_path = _safe_tmp_path_for_uri(side_uri)
@@ -2745,14 +2931,20 @@ def get_ai_model_for_side(side: str, sym_code: str):
         if ok_dl and os.path.exists(tmp_path):
             model = _load_model_from_path(tmp_path)
             if model is not None:
+                meta = _load_model_meta_from_uri(side_uri)
+                model = _attach_model_meta(model, meta)
+
                 src = side_uri
                 ver = side_ver or ""
+
                 _model_cache[side_uri] = {
                     "model": model,
+                    "meta": dict(meta or {}),
                     "ts": now_ts,
                     "version": ver,
                     "source": src,
                 }
+
                 if s == "LONG":
                     ai_model_long = model
                     AI_MODEL_VERSION_RUNTIME_LONG = ver
@@ -2761,6 +2953,7 @@ def get_ai_model_for_side(side: str, sym_code: str):
                     ai_model_short = model
                     AI_MODEL_VERSION_RUNTIME_SHORT = ver
                     AI_MODEL_SOURCE_RUNTIME_SHORT = src
+
                 print(f"[AI] Side-model loaded side={s} uri={side_uri} ver={ver}")
                 try:
                     fn = getattr(model, "feature_names_in_", None)
@@ -2768,6 +2961,17 @@ def get_ai_model_for_side(side: str, sym_code: str):
                         print(f"[AI] model_feature_names_in_({s})={list(fn)}")
                 except Exception:
                     pass
+
+                try:
+                    if meta:
+                        print(
+                            f"[AI] model_meta({s}) "
+                            f"schema_version={meta.get('feature_schema_version', '')} "
+                            f"feature_hash={meta.get('feature_hash', '')}"
+                        )
+                except Exception:
+                    pass
+
                 return model, ver, src
 
     if ENABLE_MULTI_MODEL:
@@ -2783,7 +2987,7 @@ def get_ai_model_for_side(side: str, sym_code: str):
         return model, AI_MODEL_VERSION_RUNTIME, AI_MODEL_SOURCE_RUNTIME
     except Exception as e:
         print(f"[AI] get_ai_model_for_side fallback failed side={s} err={type(e).__name__}: {e}")
-        return None, "", "none"
+        return None, "", "error"
 
 
 
@@ -7061,6 +7265,8 @@ def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tup
             "BTC_Mode_RANGE",
             "BTC_Mode_DOWN",
         ],
+        "feature_schema_version": str(V2_TRAIN_FEATURE_SCHEMA_VERSION),
+        "feature_hash": "",
         "notes": [
             "NO IMPUTATION: rows with blank/non-numeric values in required features are dropped.",
             "NO LEAKAGE: AI_* and post-exit columns are not used as features.",
@@ -7143,6 +7349,7 @@ def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tup
     X = X[~blank_mask_any].copy()
     y = y[~blank_mask_any.to_numpy()]
 
+    info["feature_hash"] = _feature_columns_hash(info["feature_columns"])
     info["rows_used"] = int(len(X))
     return X, y, info
 
@@ -7245,6 +7452,9 @@ def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> 
         uniq, cnt = np.unique(y, return_counts=True)
         meta["class_balance"] = {str(int(k)): int(v) for k, v in zip(uniq, cnt)}
 
+    meta["feature_schema_version"] = str(info.get("feature_schema_version", "") or "")
+    meta["feature_hash"] = str(info.get("feature_hash", "") or "")
+    meta["feature_columns"] = list(info.get("feature_columns", []) or [])
     meta["build_info"] = info
     return X, y, meta
 
@@ -10900,18 +11110,13 @@ def train_process():
 
 
 def _train_v2_side_process(side: str):
-    """
-    v2_shadow_ai から LONG / SHORT 別に学習する。
-    URL例:
-      /train_v2_long?lookback=20000&min_samples=80&hot_reload=1&upload=1
-      /train_v2_short?lookback=20000&min_samples=80&hot_reload=1&upload=1
-    """
     global ai_model_long, ai_model_short
     global AI_MODEL_VERSION_RUNTIME_LONG, AI_MODEL_SOURCE_RUNTIME_LONG
     global AI_MODEL_VERSION_RUNTIME_SHORT, AI_MODEL_SOURCE_RUNTIME_SHORT
 
     side_u = str(side or "").strip().upper()
-    if side_u not in {"LONG", "SHORT"}:
+
+    if side_u not in ("LONG", "SHORT"):
         return jsonify({"ok": False, "error": f"invalid side: {side}", "version": VERSION}), 400
 
     if not TRAIN_ENABLED:
@@ -11048,33 +11253,114 @@ def _train_v2_side_process(side: str):
 
         model.fit(X_tr, y_tr)
 
-        y_pred = model.predict(X_te)
-        acc = float(accuracy_score(y_te, y_pred)) if accuracy_score is not None else None
+        new_eval = _evaluate_binary_model(model, X_te, y_te)
 
-        auc = None
-        try:
-            if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(X_te)[:, 1]
-                auc = float(roc_auc_score(y_te, proba)) if roc_auc_score is not None else None
-            elif hasattr(model, "decision_function"):
-                score = model.decision_function(X_te)
-                auc = float(roc_auc_score(y_te, score)) if roc_auc_score is not None else None
-            else:
-                auc = None
-        except Exception:
-            auc = None
+        train_feature_columns = [str(c) for c in list(X.columns)]
+        train_feature_hash = _feature_columns_hash(train_feature_columns)
+        serving_feature_columns = _get_v2_serving_feature_columns()
+        serving_feature_hash = _feature_columns_hash(serving_feature_columns)
+        serving_schema_match = (train_feature_columns == serving_feature_columns)
+
+        old_model, old_ver, old_src = get_ai_model_for_side(side_u, "")
+        old_eval = {
+            "ok": False,
+            "skipped": True,
+            "reason": "compare_disabled_or_not_enough_test_rows",
+            "accuracy": None,
+            "auc": None,
+            "n_rows": int(len(X_te)),
+            "expected_cols": None,
+            "expected_n_features": None,
+            "schema_version": "",
+            "feature_hash": "",
+        }
+
+        if V2_RETRAIN_COMPARE_ENABLE and int(len(X_te)) >= int(V2_RETRAIN_MIN_TEST_ROWS):
+            old_eval = _evaluate_binary_model(old_model, X_te, y_te)
+
+        acc = new_eval.get("accuracy")
+        auc = new_eval.get("auc")
 
         ts_ver_raw = out_version if out_version else datetime.now(JST).strftime(f"v2_{side_u.lower()}_%Y%m%d_%H%M%S")
         ts_ver = _sanitize_version_tag(ts_ver_raw) or datetime.now(JST).strftime(f"v2_{side_u.lower()}_%Y%m%d_%H%M%S")
 
+        model_meta = {
+            "side": side_u,
+            "model_version": ts_ver,
+            "trainer_name": trainer_name,
+            "trainer_params": trainer_params,
+            "feature_schema_version": str(V2_TRAIN_FEATURE_SCHEMA_VERSION),
+            "feature_columns": list(train_feature_columns),
+            "feature_hash": str(train_feature_hash),
+            "trained_samples": int(n),
+            "n_train": int(n_train),
+            "n_test": int(n_test),
+            "class_balance": dict(info.get("class_balance", {}) or {}),
+            "train_filters": dict(info.get("train_filters", {}) or {}),
+            "build_info": dict(info.get("build_info", {}) or {}),
+            "serving_compatibility": {
+                "runtime_feature_schema_version": str(V2_RUNTIME_FEATURE_SCHEMA_VERSION),
+                "runtime_feature_columns": list(serving_feature_columns),
+                "runtime_feature_hash": str(serving_feature_hash),
+                "serving_schema_match": bool(serving_schema_match),
+            },
+            "created_at_jst": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        decision: Dict[str, Any] = {
+            "promote": True,
+            "reason": "ok",
+            "compare_enabled": bool(V2_RETRAIN_COMPARE_ENABLE),
+            "serving_schema_match": bool(serving_schema_match),
+            "train_feature_schema_version": str(V2_TRAIN_FEATURE_SCHEMA_VERSION),
+            "runtime_feature_schema_version": str(V2_RUNTIME_FEATURE_SCHEMA_VERSION),
+            "train_feature_hash": str(train_feature_hash),
+            "runtime_feature_hash": str(serving_feature_hash),
+            "auc_diff_vs_old": None,
+            "blocked_by_schema": False,
+        }
+
+        if V2_RETRAIN_REQUIRE_SERVING_SCHEMA_MATCH and not serving_schema_match:
+            decision["promote"] = False
+            decision["blocked_by_schema"] = True
+            decision["reason"] = "training_schema_mismatch_with_runtime_serving"
+
+        elif not bool(new_eval.get("ok")):
+            decision["promote"] = False
+            decision["reason"] = f"new_model_eval_failed:{new_eval.get('reason', '')}"
+
+        elif V2_RETRAIN_COMPARE_ENABLE and int(len(X_te)) >= int(V2_RETRAIN_MIN_TEST_ROWS):
+            old_auc = old_eval.get("auc")
+            new_auc = new_eval.get("auc")
+
+            if bool(old_eval.get("ok")) and (old_auc is not None) and (new_auc is not None):
+                auc_diff = float(new_auc) - float(old_auc)
+                decision["auc_diff_vs_old"] = auc_diff
+                if auc_diff < (-1.0 * float(V2_RETRAIN_MAX_AUC_DROP)):
+                    decision["promote"] = False
+                    decision["reason"] = f"auc_regression:{auc_diff:.6f}"
+            elif bool(old_eval.get("skipped")):
+                decision["reason"] = f"compare_skipped:{old_eval.get('reason', '')}"
+
         tmp_local = f"/tmp/{side_u.lower()}_model_{ts_ver}.pkl"
-        try:
-            joblib.dump(model, tmp_local)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"joblib.dump failed: {e}", "version": VERSION}), 500
+        tmp_meta_local = f"/tmp/{side_u.lower()}_model_{ts_ver}.meta.json"
 
         out_uri = ""
-        if upload:
+        meta_uri = ""
+        uploaded = False
+        meta_uploaded = False
+        reloaded = False
+
+        if decision["promote"] and upload:
+            try:
+                joblib.dump(model, tmp_local)
+            except Exception as e:
+                return jsonify({"ok": False, "error": f"joblib.dump failed: {e}", "version": VERSION}), 500
+
+            ok_json, json_msg = _write_json_file(tmp_meta_local, model_meta)
+            if not ok_json:
+                return jsonify({"ok": False, "error": f"meta json write failed: {json_msg}", "version": VERSION}), 500
+
             out_uri = _build_train_output_uri_for_side(side_u, ts_ver)
             if not out_uri:
                 return jsonify({
@@ -11091,27 +11377,58 @@ def _train_v2_side_process(side: str):
                     "version": VERSION,
                 }), 500
 
-        reloaded = False
-        if hot_reload:
+            meta_uri = _model_meta_uri_for_uri(out_uri)
+            ok_meta_up, meta_up_msg = _gcs_upload_from(tmp_meta_local, meta_uri)
+            if not ok_meta_up:
+                return jsonify({
+                    "ok": False,
+                    "error": f"GCS meta upload failed: {meta_uri} ({meta_up_msg})",
+                    "version": VERSION,
+                }), 500
+
+            uploaded = True
+            meta_uploaded = True
+
+        model = _attach_model_meta(model, model_meta)
+
+        if decision["promote"] and hot_reload:
             try:
                 if side_u == "LONG":
                     ai_model_long = model
                     AI_MODEL_VERSION_RUNTIME_LONG = ts_ver
-                    AI_MODEL_SOURCE_RUNTIME_LONG = "trained_v2_long" if upload else "trained_v2_long(no-upload)"
+                    AI_MODEL_SOURCE_RUNTIME_LONG = "trained_v2_long" if uploaded else "trained_v2_long(no-upload)"
                 else:
                     ai_model_short = model
                     AI_MODEL_VERSION_RUNTIME_SHORT = ts_ver
-                    AI_MODEL_SOURCE_RUNTIME_SHORT = "trained_v2_short" if upload else "trained_v2_short(no-upload)"
+                    AI_MODEL_SOURCE_RUNTIME_SHORT = "trained_v2_short" if uploaded else "trained_v2_short(no-upload)"
                 reloaded = True
             except Exception as e:
                 print(f"[TRAIN_V2_{side_u}] hot_reload failed: {e}")
                 reloaded = False
 
         next_env_vars = {}
-        if upload and side_u == "LONG":
+        if decision["promote"] and uploaded and side_u == "LONG":
             next_env_vars = {"LONG_MODEL_VERSION": ts_ver, "LONG_MODEL_GCS_URI": out_uri}
-        elif upload and side_u == "SHORT":
+        elif decision["promote"] and uploaded and side_u == "SHORT":
             next_env_vars = {"SHORT_MODEL_VERSION": ts_ver, "SHORT_MODEL_GCS_URI": out_uri}
+
+        try:
+            msg_lines = [
+                f"[TRAIN_V2_{side_u}] decision={decision['reason']}",
+                f"promote={decision['promote']}",
+                f"serving_schema_match={decision['serving_schema_match']}",
+                f"train_schema={V2_TRAIN_FEATURE_SCHEMA_VERSION}",
+                f"runtime_schema={V2_RUNTIME_FEATURE_SCHEMA_VERSION}",
+                f"new_auc={new_eval.get('auc')}",
+                f"old_auc={old_eval.get('auc')}",
+                f"auc_diff={decision.get('auc_diff_vs_old')}",
+                f"uploaded={uploaded}",
+                f"hot_reloaded={reloaded}",
+                f"version={ts_ver}",
+            ]
+            send_discord_message("\n".join(msg_lines))
+        except Exception as e:
+            print(f"[TRAIN_V2_{side_u}] discord notify failed: {type(e).__name__}: {e}")
 
         return jsonify({
             "ok": True,
@@ -11125,11 +11442,18 @@ def _train_v2_side_process(side: str):
                 "auc": auc,
             },
             "info": info,
+            "old_model_eval": old_eval,
+            "new_model_eval": new_eval,
+            "decision": decision,
             "new_model": {
                 "model_version_suggest": ts_ver,
                 "model_gcs_uri": out_uri,
-                "uploaded": bool(upload),
+                "model_meta_gcs_uri": meta_uri,
+                "uploaded": bool(uploaded),
+                "meta_uploaded": bool(meta_uploaded),
                 "hot_reloaded_in_this_instance": bool(reloaded),
+                "feature_schema_version": str(model_meta.get("feature_schema_version", "")),
+                "feature_hash": str(model_meta.get("feature_hash", "")),
             },
             "next_env_vars": next_env_vars,
         }), 200
