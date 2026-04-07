@@ -2014,7 +2014,7 @@ TRAIN_V2_SHORT_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_SHORT_MIN_SAMPLE
 TRAIN_V2_LONG_GCS_PREFIX = os.environ.get("TRAIN_V2_LONG_GCS_PREFIX", "side_models/long")
 TRAIN_V2_SHORT_GCS_PREFIX = os.environ.get("TRAIN_V2_SHORT_GCS_PREFIX", "side_models/short")
 
-V2_RUNTIME_FEATURE_SCHEMA_VERSION = os.environ.get("V2_RUNTIME_FEATURE_SCHEMA_VERSION", "v2_serving_9f_v1").strip()
+V2_RUNTIME_FEATURE_SCHEMA_VERSION = os.environ.get("V2_RUNTIME_FEATURE_SCHEMA_VERSION", "v2_serving_16f_v1").strip()
 V2_TRAIN_FEATURE_SCHEMA_VERSION = os.environ.get("V2_TRAIN_FEATURE_SCHEMA_VERSION", "v2_shadow_ai_16f_v1").strip()
 V2_MODEL_SCHEMA_ENFORCE = os.environ.get("V2_MODEL_SCHEMA_ENFORCE", "0").strip() == "1"
 
@@ -2076,15 +2076,22 @@ def _build_train_output_uri_for_side(side: str, version: str) -> str:
 
 def _get_v2_serving_feature_columns() -> List[str]:
     return [
-        "Sigma",
-        "BandWidth",
-        "BW_Change",
+        "TotalScore",
+        "P1_TrendScore",
+        "P2_FundingScore",
+        "P3_VolumeScore",
+        "SymHTF_Strength",
+        "BTC_HTF_Strength",
+        "VolRatio",
+        "ATR",
         "RSI",
-        "Vol_Change",
-        "Rise_Score",
-        "Drop_Score",
-        "BTC_Ret",
-        "BTC_Vol",
+        "Hour_JST",
+        "LTF_Aligned",
+        "FR_Available",
+        "VolConfirmed",
+        "BTC_Mode_UP",
+        "BTC_Mode_RANGE",
+        "BTC_Mode_DOWN",
     ]
 
 
@@ -5416,40 +5423,95 @@ def _v2_compact_dbg(dbg: Any) -> str:
 
 def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
-    本番の V2 LONG/SHORT AI 推論用特徴量を、現行 serving model が期待する旧9列で作る。
+    本番の V2 LONG/SHORT AI 推論用特徴量を、train 側と同じ16列で作る。
 
     期待列:
-      Sigma, BandWidth, BW_Change, RSI, Vol_Change,
-      Rise_Score, Drop_Score, BTC_Ret, BTC_Vol
+      TotalScore
+      P1_TrendScore
+      P2_FundingScore
+      P3_VolumeScore
+      SymHTF_Strength
+      BTC_HTF_Strength
+      VolRatio
+      ATR
+      RSI
+      Hour_JST
+      LTF_Aligned
+      FR_Available
+      VolConfirmed
+      BTC_Mode_UP
+      BTC_Mode_RANGE
+      BTC_Mode_DOWN
 
     重要:
-      - ここでは固定値埋めをしない
+      - 固定値埋めはしない
       - 欠損があれば None を返し、上位で bypass させる
-      - side に応じて Rise_Score / Drop_Score の片側だけにスコアを載せる
+      - train 側 _build_training_matrix_from_v2_shadow_ai() と同じ列順にそろえる
     """
-    side_u = str(sig.get("side", "") or "").strip().upper()
-    is_long = 1.0 if side_u == "LONG" else 0.0
-    is_short = 1.0 - is_long
 
-    score_val = _safe_float_or_nan(sig.get("score"))
-    sigma_val = _safe_float_or_nan(sig.get("sigma"))
-    bw_val = _safe_float_or_nan(sig.get("BandWidth"))
-    bw_chg_val = _safe_float_or_nan(sig.get("BW_Change"))
-    rsi_val = _safe_float_or_nan(sig.get("rsi"))
-    vol_chg_val = _safe_float_or_nan(sig.get("Vol_Change"))
-    btc_ret_val = _safe_float_or_nan(sig.get("btc_ret"))
-    btc_vol_val = _safe_float_or_nan(sig.get("btc_vol"))
+    total_score_val = _safe_float_or_nan(
+        sig.get("total_score", sig.get("score"))
+    )
+    p1_score_val = _safe_float_or_nan(
+        sig.get("p1_score", sig.get("P1_TrendScore"))
+    )
+    p2_score_val = _safe_float_or_nan(
+        sig.get("p2_score", sig.get("P2_FundingScore"))
+    )
+    p3_score_val = _safe_float_or_nan(
+        sig.get("p3_score", sig.get("P3_VolumeScore"))
+    )
+
+    sym_htf_strength_val = _safe_float_or_nan(
+        sig.get("sym_htf_strength", sig.get("SymHTF_Strength"))
+    )
+    btc_htf_strength_val = _safe_float_or_nan(
+        sig.get("btc_htf_strength", sig.get("BTC_HTF_Strength"))
+    )
+
+    vol_ratio_val = _safe_float_or_nan(
+        sig.get("vol_ratio", sig.get("VolRatio"))
+    )
+    atr_val = _safe_float_or_nan(
+        sig.get("atr", sig.get("ATR"))
+    )
+    rsi_val = _safe_float_or_nan(
+        sig.get("rsi", sig.get("RSI"))
+    )
+    hour_val = _safe_float_or_nan(
+        sig.get("hour", sig.get("Hour_JST"))
+    )
+
+    ltf_aligned_val = _v2_bool01(
+        sig.get("ltf_aligned", sig.get("LTF_Aligned"))
+    )
+    fr_available_val = _v2_bool01(
+        sig.get("fr_available", sig.get("FR_Available"))
+    )
+    vol_confirmed_val = _v2_bool01(
+        sig.get("vol_confirmed", sig.get("VolConfirmed"))
+    )
+
+    btc_mode_raw = sig.get("btc_mode_compat", sig.get("BTC_Mode_Compat"))
+    btc_mode_up, btc_mode_range, btc_mode_down = _v2_mode_onehot(btc_mode_raw)
 
     feats = pd.DataFrame([{
-        "Sigma": sigma_val,
-        "BandWidth": bw_val,
-        "BW_Change": bw_chg_val,
+        "TotalScore": total_score_val,
+        "P1_TrendScore": p1_score_val,
+        "P2_FundingScore": p2_score_val,
+        "P3_VolumeScore": p3_score_val,
+        "SymHTF_Strength": sym_htf_strength_val,
+        "BTC_HTF_Strength": btc_htf_strength_val,
+        "VolRatio": vol_ratio_val,
+        "ATR": atr_val,
         "RSI": rsi_val,
-        "Vol_Change": vol_chg_val,
-        "Rise_Score": score_val * is_long,
-        "Drop_Score": score_val * is_short,
-        "BTC_Ret": btc_ret_val,
-        "BTC_Vol": btc_vol_val,
+        "Hour_JST": hour_val,
+        "LTF_Aligned": ltf_aligned_val,
+        "FR_Available": fr_available_val,
+        "VolConfirmed": vol_confirmed_val,
+        "BTC_Mode_UP": btc_mode_up,
+        "BTC_Mode_RANGE": btc_mode_range,
+        "BTC_Mode_DOWN": btc_mode_down,
     }]).replace([np.inf, -np.inf], np.nan)
 
     mask = feats.isna()
@@ -5458,15 +5520,22 @@ def _build_v2_ai_feature_frame(sig: Dict[str, Any]) -> Optional[pd.DataFrame]:
         try:
             print(
                 f"[V2-AI-FEAT-SKIP] sym={sig.get('symbol', '')} "
-                f"side={side_u} bad_cols={bad_cols} "
-                f"score={sig.get('score', '')} "
-                f"sigma={sig.get('sigma', '')} "
-                f"bw={sig.get('BandWidth', '')} "
-                f"bw_chg={sig.get('BW_Change', '')} "
-                f"rsi={sig.get('rsi', '')} "
-                f"vol_chg={sig.get('Vol_Change', '')} "
-                f"btc_ret={sig.get('btc_ret', '')} "
-                f"btc_vol={sig.get('btc_vol', '')}"
+                f"side={str(sig.get('side', '') or '').strip().upper()} "
+                f"bad_cols={bad_cols} "
+                f"total_score={sig.get('total_score', sig.get('score', ''))} "
+                f"p1={sig.get('p1_score', sig.get('P1_TrendScore', ''))} "
+                f"p2={sig.get('p2_score', sig.get('P2_FundingScore', ''))} "
+                f"p3={sig.get('p3_score', sig.get('P3_VolumeScore', ''))} "
+                f"sym_htf_strength={sig.get('sym_htf_strength', sig.get('SymHTF_Strength', ''))} "
+                f"btc_htf_strength={sig.get('btc_htf_strength', sig.get('BTC_HTF_Strength', ''))} "
+                f"vol_ratio={sig.get('vol_ratio', sig.get('VolRatio', ''))} "
+                f"atr={sig.get('atr', sig.get('ATR', ''))} "
+                f"rsi={sig.get('rsi', sig.get('RSI', ''))} "
+                f"hour={sig.get('hour', sig.get('Hour_JST', ''))} "
+                f"ltf_aligned={sig.get('ltf_aligned', sig.get('LTF_Aligned', ''))} "
+                f"fr_available={sig.get('fr_available', sig.get('FR_Available', ''))} "
+                f"vol_confirmed={sig.get('vol_confirmed', sig.get('VolConfirmed', ''))} "
+                f"btc_mode_compat={sig.get('btc_mode_compat', sig.get('BTC_Mode_Compat', ''))}"
             )
         except Exception:
             pass
