@@ -8320,24 +8320,34 @@ def analyze_v2_performance() -> str:
             note_col = c
             break
 
+    ai_pass_series = pd.Series([False] * len(df_24h), index=df_24h.index)
+    if "AI_Pass" in df_24h.columns:
+        ai_pass_text = df_24h["AI_Pass"].astype(str).str.strip().str.lower()
+        ai_pass_series = ai_pass_text.isin(["1", "true", "yes", "on"])
+
     if note_col:
         note = df_24h[note_col].astype(str)
 
-        # 旧: notify_pass=1（採用判定）
-        df_24h["_notify_1"] = note.str.contains("notify_pass=1", na=False)
+        has_notify_sent_tag = note.str.contains("notify_sent=", na=False)
+        has_notify_pass_tag = note.str.contains("notify_pass=1", na=False)
 
-        # 新: notify_sent=1（実際にDiscord送信済み）
-        # 旧データとの互換のため、notify_sent= がまだ無い行は notify_pass=1 を仮採用
+        # 採用判定:
+        # AI_Note の notify_pass=1 を基本にしつつ、Excel互換で AI_Pass=1 も含める
+        df_24h["_notify_1"] = has_notify_pass_tag | ai_pass_series
+
+        # 実送信:
+        # 1) notify_sent=1 があれば最優先
+        # 2) notify_sent タグが無い旧データは、AI_Pass=1 を実送信扱いにする
+        # 3) さらに後方互換として notify_pass=1 も残す
         df_24h["_notify_sent_1"] = (
-            note.str.contains("notify_sent=1", na=False) |
-            (
-                ~note.str.contains("notify_sent=", na=False) &
-                note.str.contains("notify_pass=1", na=False)
-            )
+            note.str.contains("notify_sent=1", na=False)
+            | (~has_notify_sent_tag & ai_pass_series)
+            | (~has_notify_sent_tag & has_notify_pass_tag)
         )
     else:
-        df_24h["_notify_1"] = False
-        df_24h["_notify_sent_1"] = False
+        # AI_Note が無い場合も、Excel上の AI_Pass=1 を基準に集計する
+        df_24h["_notify_1"] = ai_pass_series
+        df_24h["_notify_sent_1"] = ai_pass_series
 
     if "AI_Band" in df_24h.columns:
         df_24h["AI_Band"] = df_24h["AI_Band"].astype(str).str.strip().str.upper()
