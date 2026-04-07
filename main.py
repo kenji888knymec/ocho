@@ -563,11 +563,12 @@ def send_discord_message(text: str):
 def send_daily_discord_message(text: str):
     """
     日次レポート専用Webhookに送る。
-    DAILY_DISCORD_WEBHOOK_URL が未設定なら通常Webhookへフォールバックする。
+    DAILY_DISCORD_WEBHOOK_URL が未設定なら送らない。
+    通常Webhookへは絶対にフォールバックしない。
     """
-    webhook = daily_discord_webhook_url or discord_webhook_url
+    webhook = daily_discord_webhook_url
     if (not webhook) or ("ここに" in webhook):
-        print("[DBG] daily discord webhook url empty or placeholder")
+        print("[WARN] DAILY_DISCORD_WEBHOOK_URL empty -> skip daily report send")
         return
 
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
@@ -8069,12 +8070,13 @@ def _build_symbol_ranking_lines(
     title: str,
     top_n: int = 5,
     sort_bad: bool = False,
-    min_n: int = 3,
+    min_n: int = 1,
 ) -> list:
     """
     銘柄別ランキングを daily 用に出す。
     sort_bad=False: 良い順
     sort_bad=True : 悪い順
+    min_n=1 なので、1件でも表示する。
     """
     lines = [f"【{title}】"]
 
@@ -8105,7 +8107,7 @@ def _build_symbol_ranking_lines(
         })
 
     if not rows:
-        lines.append("・対象なし（3件以上の銘柄なし）")
+        lines.append("・対象なし")
         return lines
 
     rank_df = pd.DataFrame(rows)
@@ -8127,6 +8129,80 @@ def _build_symbol_ranking_lines(
         medal = medals[i - 1] if i - 1 < len(medals) else f"{i}."
         lines.append(
             f"{medal} {row.symbol}: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+        )
+
+    return lines
+
+
+def _build_hour_ranking_lines(
+    df: pd.DataFrame,
+    title: str,
+    top_n: int = 8,
+    min_n: int = 1,
+) -> list:
+    """
+    時間帯別ランキングを daily 用に出す。
+    Datetime_JST または _dt から JST の hour を作る。
+    """
+    lines = [f"【{title}】"]
+
+    if df is None or df.empty:
+        lines.append("・データなし")
+        return lines
+
+    work = df.copy()
+
+    if "_dt" in work.columns:
+        dt = pd.to_datetime(work["_dt"], errors="coerce")
+        work["_hour"] = dt.dt.hour
+    elif "Datetime_JST" in work.columns:
+        dt = pd.to_datetime(work["Datetime_JST"].astype(str).str.strip(), errors="coerce")
+        work["_hour"] = dt.dt.hour
+    elif "Hour_JST" in work.columns:
+        work["_hour"] = pd.to_numeric(work["Hour_JST"], errors="coerce")
+    elif "hour" in work.columns:
+        work["_hour"] = pd.to_numeric(work["hour"], errors="coerce")
+    else:
+        lines.append("・データなし")
+        return lines
+
+    work = work[work["_hour"].notna()].copy()
+    if work.empty:
+        lines.append("・データなし")
+        return lines
+
+    work["_hour"] = work["_hour"].astype(int)
+
+    rows = []
+    for hour, sub in work.groupby("_hour"):
+        n = len(sub)
+        if n < int(min_n):
+            continue
+
+        w = int(sub["_win"].sum()) if "_win" in sub.columns else 0
+        lo = int(sub["_lose"].sum()) if "_lose" in sub.columns else 0
+        wr = (w / (w + lo) * 100.0) if (w + lo) > 0 else float("nan")
+        avg_pnl = sub["_pnl"].mean() if "_pnl" in sub.columns else float("nan")
+
+        rows.append({
+            "hour": int(hour),
+            "n": n,
+            "wr": wr,
+            "avg_pnl": avg_pnl,
+        })
+
+    if not rows:
+        lines.append("・対象なし")
+        return lines
+
+    rank_df = pd.DataFrame(rows).sort_values(
+        ["avg_pnl", "wr", "n"],
+        ascending=[False, False, False],
+    ).head(int(top_n))
+
+    for row in rank_df.itertuples(index=False):
+        lines.append(
+            f"・{int(row.hour):02d}時: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
         )
 
     return lines
@@ -8232,18 +8308,33 @@ def analyze_v2_performance() -> str:
     rank_reject_df = df_24h[df_24h["AI_Band"] == "RANK_REJECT"].copy()
     rejected_df = df_24h[df_24h["AI_Band"] == "REJECTED"].copy()
 
-    long_n = 0
-    short_n = 0
+    done_long_n = 0
+    done_short_n = 0
     if "Direction" in df_24h.columns:
-        dir_col = df_24h["Direction"].astype(str).str.strip().str.upper()
-        long_n = int((dir_col == "LONG").sum())
-        short_n = int((dir_col == "SHORT").sum())
+        dir_done = df_24h["Direction"].astype(str).str.strip().str.upper()
+        done_long_n = int((dir_done == "LONG").sum())
+        done_short_n = int((dir_done == "SHORT").sum())
+
+    notify_long_n = 0
+    notify_short_n = 0
+    if "Direction" in notify_df.columns:
+        dir_notify = notify_df["Direction"].astype(str).str.strip().str.upper()
+        notify_long_n = int((dir_notify == "LONG").sum())
+        notify_short_n = int((dir_notify == "SHORT").sum())
+
+    notify_long_df = pd.DataFrame()
+    notify_short_df = pd.DataFrame()
+    if "Direction" in notify_df.columns:
+        dir_notify = notify_df["Direction"].astype(str).str.strip().str.upper()
+        notify_long_df = notify_df[dir_notify == "LONG"].copy()
+        notify_short_df = notify_df[dir_notify == "SHORT"].copy()
 
     lines = [
         "📘【V2 デイリーレポート】",
         f"🕒 {now_str}",
         f"📦 直近24h DONE {len(df_24h)}件 / OPEN {n_open}件",
-        f"🟢 LONG {long_n}件 / 🔴 SHORT {short_n}件",
+        f"📊 DONE内訳: 🟢 LONG {done_long_n}件 / 🔴 SHORT {done_short_n}件",
+        f"📣 採用内訳: 🟢 LONG {notify_long_n}件 / 🔴 SHORT {notify_short_n}件",
         "",
         _summarize_simple(notify_df, "採用", "✅"),
         _summarize_simple(rank_reject_df, "惜しくも落選", "🟡"),
@@ -8256,7 +8347,7 @@ def analyze_v2_performance() -> str:
         "良い銘柄ランキング",
         top_n=5,
         sort_bad=False,
-        min_n=3,
+        min_n=1,
     )
     lines += [""]
     lines += _build_symbol_ranking_lines(
@@ -8264,7 +8355,7 @@ def analyze_v2_performance() -> str:
         "悪い銘柄ランキング",
         top_n=5,
         sort_bad=True,
-        min_n=3,
+        min_n=1,
     )
     lines += [""]
     lines += _build_symbol_ranking_lines(
@@ -8272,7 +8363,21 @@ def analyze_v2_performance() -> str:
         "惜しくも落選ランキング",
         top_n=5,
         sort_bad=False,
-        min_n=3,
+        min_n=1,
+    )
+    lines += [""]
+    lines += _build_hour_ranking_lines(
+        notify_long_df,
+        "採用時間帯ランキング（LONG）",
+        top_n=8,
+        min_n=1,
+    )
+    lines += [""]
+    lines += _build_hour_ranking_lines(
+        notify_short_df,
+        "採用時間帯ランキング（SHORT）",
+        top_n=8,
+        min_n=1,
     )
 
     msg = "\n".join([x for x in lines if x is not None])
