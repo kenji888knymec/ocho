@@ -455,6 +455,75 @@ V2_LONG_REPEAT_PENALTY_VALUE = _env_float(
     "V2_LONG_REPEAT_PENALTY_VALUE", 0.12
 )
 
+# --- 事故パターン対策（2026-04 incident pass 1） ---
+V2_LONG_REVERSAL_HARD_REJECT_ENABLE = str(
+    os.environ.get("V2_LONG_REVERSAL_HARD_REJECT_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_LONG_REVERSAL_BTC_RET_MAX = _env_float(
+    "V2_LONG_REVERSAL_BTC_RET_MAX", -0.0080
+)
+V2_LONG_REVERSAL_BTC_1H_MIN = _env_float(
+    "V2_LONG_REVERSAL_BTC_1H_MIN", 0.0020
+)
+
+V2_LONG_SURGE_PENALTY_ENABLE = str(
+    os.environ.get("V2_LONG_SURGE_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_SURGE_PENALTY_VALUE = _env_float(
+    "V2_LONG_SURGE_PENALTY_VALUE", 0.12
+)
+
+V2_LONG_VOL_SHOCK_PENALTY_ENABLE = str(
+    os.environ.get("V2_LONG_VOL_SHOCK_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+V2_LONG_VOL_SHOCK_PENALTY_VALUE = _env_float(
+    "V2_LONG_VOL_SHOCK_PENALTY_VALUE", 0.10
+)
+
+V2_SHORT_DUMP_PENALTY_ENABLE = str(
+    os.environ.get("V2_SHORT_DUMP_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_DUMP_PENALTY_VALUE = _env_float(
+    "V2_SHORT_DUMP_PENALTY_VALUE", 0.10
+)
+
+V2_SHORT_VOL_SHOCK_PENALTY_ENABLE = str(
+    os.environ.get("V2_SHORT_VOL_SHOCK_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_VOL_SHOCK_PENALTY_VALUE = _env_float(
+    "V2_SHORT_VOL_SHOCK_PENALTY_VALUE", 0.08
+)
+
+V2_SHORT_REPEAT_PENALTY_ENABLE = str(
+    os.environ.get("V2_SHORT_REPEAT_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_REPEAT_WINDOW_MINUTES = int(float(
+    os.environ.get("V2_SHORT_REPEAT_WINDOW_MINUTES", "90")
+))
+V2_SHORT_REPEAT_PENALTY_MIN_COUNT = int(float(
+    os.environ.get("V2_SHORT_REPEAT_PENALTY_MIN_COUNT", "5")
+))
+V2_SHORT_REPEAT_PENALTY_VALUE = _env_float(
+    "V2_SHORT_REPEAT_PENALTY_VALUE", 0.08
+)
+
+V2_INCIDENT_VOLRATIO_SHOCK_MIN = _env_float(
+    "V2_INCIDENT_VOLRATIO_SHOCK_MIN", 1.80
+)
+V2_INCIDENT_BTC_1H_SURGE_MIN = _env_float(
+    "V2_INCIDENT_BTC_1H_SURGE_MIN", 0.0120
+)
+V2_INCIDENT_BTC_1H_DUMP_MAX = _env_float(
+    "V2_INCIDENT_BTC_1H_DUMP_MAX", -0.0120
+)
+V2_INCIDENT_BTC_15M_SURGE_MIN = _env_float(
+    "V2_INCIDENT_BTC_15M_SURGE_MIN", 0.0035
+)
+V2_INCIDENT_BTC_15M_DUMP_MAX = _env_float(
+    "V2_INCIDENT_BTC_15M_DUMP_MAX", -0.0035
+)
+
 # --- 当日LONG緊急ブレーキ ---
 # 直近DONE済み通知LONGが lookback_n 件たまっていて、
 # 勝率 <= stop_winrate かつ avg_pnl < stop_avgpnl なら LONG を止める
@@ -1589,6 +1658,221 @@ def _get_v2_long_recent_notified_window_state(now_jst: datetime) -> Dict[str, An
     _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
     _v2_long_repeat_cache["state"] = dict(out)
     return out
+
+
+def _incident_sig_float(sig: Dict[str, Any], *keys: str) -> float:
+    for k in keys:
+        v = _safe_float_or_nan(sig.get(k))
+        if np.isfinite(v):
+            return float(v)
+    return float("nan")
+
+
+def _incident_sig_bool(sig: Dict[str, Any], *keys: str) -> bool:
+    for k in keys:
+        raw = sig.get(k, None)
+        s = ("" if raw is None else str(raw)).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return False
+
+
+def _is_btc_surge_after_long(sig: Dict[str, Any]) -> bool:
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    btc_1h_change = _incident_sig_float(sig, "btc_1h_change", "BTC_1h_Change")
+    btc_ret = _incident_sig_float(sig, "btc_ret", "BTC_Ret")
+    pause_active = bool(_btc_long_pause_ctx.get("active", False))
+
+    if pause_active:
+        return True
+
+    if btc_mode != "UP":
+        return False
+
+    if np.isfinite(btc_1h_change) and btc_1h_change >= float(V2_INCIDENT_BTC_1H_SURGE_MIN):
+        return True
+
+    if np.isfinite(btc_ret) and btc_ret >= float(V2_INCIDENT_BTC_15M_SURGE_MIN):
+        return True
+
+    return False
+
+
+def _is_btc_dump_after_short(sig: Dict[str, Any]) -> bool:
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    btc_1h_change = _incident_sig_float(sig, "btc_1h_change", "BTC_1h_Change")
+    btc_ret = _incident_sig_float(sig, "btc_ret", "BTC_Ret")
+
+    if btc_mode not in {"DOWN", "RANGE"}:
+        return False
+
+    if np.isfinite(btc_1h_change) and btc_1h_change <= float(V2_INCIDENT_BTC_1H_DUMP_MAX):
+        return True
+
+    if np.isfinite(btc_ret) and btc_ret <= float(V2_INCIDENT_BTC_15M_DUMP_MAX):
+        return True
+
+    return False
+
+
+def _is_long_reversal_accident(sig: Dict[str, Any]) -> bool:
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    btc_1h_change = _incident_sig_float(sig, "btc_1h_change", "BTC_1h_Change")
+    btc_ret = _incident_sig_float(sig, "btc_ret", "BTC_Ret")
+
+    if btc_mode != "UP":
+        return False
+
+    if not np.isfinite(btc_1h_change):
+        return False
+    if not np.isfinite(btc_ret):
+        return False
+
+    return (
+        btc_1h_change >= float(V2_LONG_REVERSAL_BTC_1H_MIN)
+        and btc_ret <= float(V2_LONG_REVERSAL_BTC_RET_MAX)
+    )
+
+
+def _is_vol_shock_context(sig: Dict[str, Any]) -> bool:
+    vol_ratio = _incident_sig_float(sig, "vol_ratio", "VolRatio")
+    btc_calm = _incident_sig_bool(sig, "btc_calm", "BTC_Calm")
+    market_tag = str(sig.get("market_tag", "") or "").strip().upper()
+
+    if np.isfinite(vol_ratio) and vol_ratio >= float(V2_INCIDENT_VOLRATIO_SHOCK_MIN):
+        return True
+
+    if market_tag == "STORM":
+        return True
+
+    if str(sig.get("btc_calm", "")).strip() != "" and (not btc_calm):
+        return True
+
+    return False
+
+
+def _long_incident_surge_penalty(sig: Dict[str, Any]) -> float:
+    if not V2_LONG_SURGE_PENALTY_ENABLE:
+        return 0.0
+    return float(V2_LONG_SURGE_PENALTY_VALUE) if _is_btc_surge_after_long(sig) else 0.0
+
+
+def _long_incident_vol_shock_penalty(sig: Dict[str, Any]) -> float:
+    if not V2_LONG_VOL_SHOCK_PENALTY_ENABLE:
+        return 0.0
+    return float(V2_LONG_VOL_SHOCK_PENALTY_VALUE) if _is_vol_shock_context(sig) else 0.0
+
+
+def _short_incident_dump_penalty(sig: Dict[str, Any]) -> float:
+    if not V2_SHORT_DUMP_PENALTY_ENABLE:
+        return 0.0
+    return float(V2_SHORT_DUMP_PENALTY_VALUE) if _is_btc_dump_after_short(sig) else 0.0
+
+
+def _short_incident_vol_shock_penalty(sig: Dict[str, Any]) -> float:
+    if not V2_SHORT_VOL_SHOCK_PENALTY_ENABLE:
+        return 0.0
+    return float(V2_SHORT_VOL_SHOCK_PENALTY_VALUE) if _is_vol_shock_context(sig) else 0.0
+
+
+def _get_v2_short_recent_notified_window_state(now_jst: datetime) -> Dict[str, Any]:
+    """
+    直近 window 分の「通知済みSHORT」を銘柄別に集計する。
+    LONG側の repeat penalty と同じ考え方で SHORT 側も扱う。
+    """
+    now_ts = time.time()
+    out: Dict[str, Any] = {
+        "counts": {},
+        "last_dt": {},
+        "reason": "ok",
+    }
+
+    if not V2_SHORT_REPEAT_PENALTY_ENABLE:
+        return out
+
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            out["reason"] = "empty"
+            return out
+
+        work = df.copy()
+
+        required_cols = {"Datetime_JST", "Symbol", "Direction"}
+        if not required_cols.issubset(set(work.columns)):
+            out["reason"] = f"missing_cols:{sorted(required_cols - set(work.columns))}"
+            return out
+
+        work["Datetime_JST"] = pd.to_datetime(
+            work["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        work = work[work["Datetime_JST"].notna()].copy()
+
+        work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+        work = work[work["Direction"] == "SHORT"].copy()
+
+        notify_mask = pd.Series([False] * len(work), index=work.index)
+        if "AI_Note" in work.columns:
+            note_col = work["AI_Note"].astype(str).str.lower()
+            notify_mask = notify_mask | note_col.str.contains("notify_pass=1", na=False)
+        if "AI_Pass" in work.columns:
+            ai_pass_col = work["AI_Pass"].astype(str).str.strip().str.lower()
+            notify_mask = notify_mask | ai_pass_col.isin(["1", "true", "yes"])
+
+        work = work[notify_mask].copy()
+
+        cutoff = now_jst - timedelta(minutes=int(V2_SHORT_REPEAT_WINDOW_MINUTES))
+        work = work[work["Datetime_JST"] >= cutoff].copy()
+
+        if work.empty:
+            out["reason"] = "no_recent_notified_shorts"
+            return out
+
+        counts = work.groupby("Symbol").size().to_dict()
+        last_dt = work.groupby("Symbol")["Datetime_JST"].max().to_dict()
+
+        out["counts"] = {
+            str(k).strip().upper(): int(v)
+            for k, v in counts.items()
+        }
+        out["last_dt"] = {
+            str(k).strip().upper(): v.strftime("%Y-%m-%d %H:%M:%S")
+            for k, v in last_dt.items()
+        }
+
+    except Exception as e:
+        out["reason"] = f"short_repeat_window_error:{type(e).__name__}:{e}"
+
+    return out
+
+
+def _short_repeat_rank_penalty(sig: Dict[str, Any]) -> Tuple[float, int, str]:
+    """
+    同一銘柄SHORT連打を rank penalty で扱う。
+    """
+    if not V2_SHORT_REPEAT_PENALTY_ENABLE:
+        return 0.0, 0, ""
+
+    try:
+        sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+        if not sym:
+            return 0.0, 0, ""
+
+        repeat_state = _get_v2_short_recent_notified_window_state(datetime.now(JST))
+        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+
+        if recent_n > int(V2_SHORT_REPEAT_PENALTY_MIN_COUNT):
+            return float(V2_SHORT_REPEAT_PENALTY_VALUE), recent_n, last_dt
+
+        return 0.0, recent_n, last_dt
+
+    except Exception:
+        return 0.0, 0, ""
 
 
 def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
@@ -5347,6 +5631,7 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
       - P1>=2.0 を減点する
       - P3が0〜0.5の帯を少し優遇する
       - total と p1 の二重効きを抑える
+      - 急落直後 / ボラ急拡大は penalty で扱う
     """
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
@@ -5379,6 +5664,12 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     p1_high_penalty = V2_SHORT_QS_W_P1_GE2 if p1 >= 2.0 else 0.0
     p3_flat_bonus = V2_SHORT_QS_W_P3_FLAT if (0.0 <= p3 <= 0.5) else 0.0
 
+    dump_penalty = _short_incident_dump_penalty(sig)
+    vol_shock_penalty = _short_incident_vol_shock_penalty(sig)
+
+    sig["short_dump_penalty"] = float(dump_penalty)
+    sig["short_vol_shock_penalty"] = float(vol_shock_penalty)
+
     qs = (
         (p1 * 0.20) +
         (other_score * 0.30) +
@@ -5389,7 +5680,9 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
         (p3_flat_bonus) +
         (p2_neg_penalty) +
         (p1_high_penalty) +
-        (btc_over_penalty)
+        (btc_over_penalty) -
+        (dump_penalty) -
+        (vol_shock_penalty)
     )
     return float(qs)
 
@@ -5401,6 +5694,7 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     - SHORT AI が入っていれば ai_prob_win は AI確率
     - bypass/fallback のときは RULE fallback の値
     - SHORT brake は従来通り適用
+    - SHORT repeat は hard block ではなく rank penalty で扱う
     """
     if not short_signals:
         return []
@@ -5408,11 +5702,21 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     for sig in short_signals:
         sig["rule_qs"] = calc_quality_score(sig)
 
+    def _short_rank_score(sig: Dict[str, Any]) -> float:
+        repeat_penalty, repeat_recent_n, repeat_last_dt = _short_repeat_rank_penalty(sig)
+
+        sig["short_repeat_recent_n"] = int(repeat_recent_n)
+        sig["short_repeat_last_dt"] = str(repeat_last_dt or "")
+        sig["short_repeat_penalty"] = float(repeat_penalty)
+
+        base_rule_qs = float(sig.get("rule_qs", 0.0) or 0.0)
+        return float(base_rule_qs - repeat_penalty)
+
     ranked = sorted(
         short_signals,
         key=lambda x: (
             float(x.get("ai_prob_win", 0.0) or 0.0),
-            float(x.get("rule_qs", 0.0) or 0.0),
+            _short_rank_score(x),
         ),
         reverse=True,
     )
@@ -5431,7 +5735,10 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             current_note = str(sig.get("ai_note", "") or "")
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n=ALL;selected=true;rank_disabled=true;brake_mode={brake_mode}"
+                f"top_n=ALL;selected=true;rank_disabled=true;brake_mode={brake_mode};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
             )
         return ranked
 
@@ -5439,6 +5746,7 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     for rank_idx, sig in enumerate(ranked, start=1):
         current_note = str(sig.get("ai_note", "") or "")
+        rank_score = _short_rank_score(sig)
 
         if brake_mode == "STOP":
             sig["ai_pass"] = "0"
@@ -5446,13 +5754,21 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_band"] = "BRAKE_STOP_OBSERVE"
                 sig["ai_note"] = (
                     f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=true"
+                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=true;"
+                    f"rank_score={rank_score:.6f};"
+                    f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                    f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                    f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
                 )
             else:
                 sig["ai_band"] = "BRAKE_STOP_DROP"
                 sig["ai_note"] = (
                     f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=false"
+                    f"top_n={probe_top_n};selected=false;brake_mode=STOP;observe_only=false;"
+                    f"rank_score={rank_score:.6f};"
+                    f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                    f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                    f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
                 )
             continue
 
@@ -5461,14 +5777,22 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             sig["ai_band"] = _v2_rank_selected_band(sig)
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=true;brake_mode={brake_mode}"
+                f"top_n={effective_top_n};selected=true;brake_mode={brake_mode};"
+                f"rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
             )
         else:
             sig["ai_pass"] = "0"
             sig["ai_band"] = _v2_rank_reject_band(sig)
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
-                f"top_n={effective_top_n};selected=false;reason=rank_exceeded;brake_mode={brake_mode}"
+                f"top_n={effective_top_n};selected=false;reason=rank_exceeded;brake_mode={brake_mode};"
+                f"rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
             )
 
     return ranked
@@ -5653,6 +5977,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     追加方針:
       - LONGは当面厳しめ継続
       - VolConfirmed を必須化できるようにする
+      - 急反転事故だけは hard reject にする
     """
     direction = str(sig.get("direction", "")).strip().upper()
     if direction != "LONG":
@@ -5711,6 +6036,18 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
                 f"hit_p1={int(hit_p1)} "
                 f"reason={btc_surge_pause_reason}"
             )
+
+    # 事故分析で最も悪かった LONG 急反転は hard reject
+    if V2_LONG_REVERSAL_HARD_REJECT_ENABLE and _is_long_reversal_accident(sig):
+        btc_1h_change = _incident_sig_float(sig, "btc_1h_change", "BTC_1h_Change")
+        btc_ret = _incident_sig_float(sig, "btc_ret", "BTC_Ret")
+        return False, (
+            f"long_reversal_hard_reject "
+            f"btc_mode={btc_mode_compat} "
+            f"sym={sym} "
+            f"btc_1h_change={'' if not np.isfinite(btc_1h_change) else format(float(btc_1h_change), '.6f')} "
+            f"btc_ret={'' if not np.isfinite(btc_ret) else format(float(btc_ret), '.6f')}"
+        )
 
     # まず LONG_STRONG を最優先で通す
     strong_ok, strong_reason = _check_long_strong_bucket(sig)
@@ -5943,6 +6280,10 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
     将来LONG-AIに差し替える場所。
     LONGは gate で P1 と RSI を見ているので、
     ここでは補助情報（P3 / BTC強度 / BTCモード / other_score / bad_symbol）を中心に順位づけする。
+    追加方針:
+      - BTC急騰直後は penalty
+      - ボラ急拡大は penalty
+      - LONG repeat は既存 rank penalty を使う
     """
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     total = _safe_float_or_nan(sig.get("total_score"))
@@ -5964,6 +6305,12 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
 
     bad_symbol_flag = _calc_long_bad_symbol_flag(sig.get("symbol", ""))
 
+    surge_penalty = _long_incident_surge_penalty(sig)
+    vol_shock_penalty = _long_incident_vol_shock_penalty(sig)
+
+    sig["long_surge_penalty"] = float(surge_penalty)
+    sig["long_vol_shock_penalty"] = float(vol_shock_penalty)
+
     qs = (
         (p1 * V2_LONG_QS_W_P1) +
         (rsi_bonus * V2_LONG_QS_W_RSI) +
@@ -5971,7 +6318,9 @@ def calc_long_quality_score(sig: Dict[str, Any]) -> float:
         (btc_bonus * V2_LONG_QS_W_BTC) +
         (mode_bonus * V2_LONG_QS_W_MODE) +
         (other_score * V2_LONG_QS_W_OTHER) +
-        (bad_symbol_flag * V2_LONG_QS_W_BAD_SYMBOL)
+        (bad_symbol_flag * V2_LONG_QS_W_BAD_SYMBOL) -
+        (surge_penalty) -
+        (vol_shock_penalty)
     )
     return float(qs)
 
