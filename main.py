@@ -465,6 +465,11 @@ V2_LONG_FAST_BRAKE_STOP_AVGPNL = _env_float(
     "V2_LONG_FAST_BRAKE_STOP_AVGPNL", 0.0
 )
 
+# ブレーキ発動後は最低この時間だけ止める
+V2_LONG_FAST_BRAKE_HOLD_MINUTES = int(float(
+    os.environ.get("V2_LONG_FAST_BRAKE_HOLD_MINUTES", "180")
+))
+
 
 # ==========================================
 # 期待ヘッダー
@@ -574,6 +579,13 @@ _v2_long_repeat_cache: Dict[str, Any] = {
 _v2_long_fast_brake_cache: Dict[str, Any] = {
     "ts": 0.0,
     "state": {},
+}
+
+_v2_long_fast_brake_runtime: Dict[str, Any] = {
+    "active": False,
+    "until_ts": 0.0,
+    "last_trigger_latest_done_dt": "",
+    "reason": "",
 }
 
 # ==========================================
@@ -1588,6 +1600,7 @@ def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
         "avg_pnl": np.nan,
         "reason": "ok",
         "reason_text": "",
+        "latest_done_dt": "",
     }
 
     if not V2_LONG_FAST_BRAKE_ENABLE:
@@ -1643,6 +1656,10 @@ def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
             _v2_long_fast_brake_cache["state"] = dict(out)
             return out
 
+        latest_done_dt = work["Datetime_JST"].max()
+        if pd.notna(latest_done_dt):
+            out["latest_done_dt"] = latest_done_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         work["PnL_Pct"] = pd.to_numeric(work["PnL_Pct"], errors="coerce")
         work = work.head(int(V2_LONG_FAST_BRAKE_LOOKBACK_N)).copy()
 
@@ -1673,7 +1690,8 @@ def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
             f"wins={wins} "
             f"wr={'' if not np.isfinite(wr_pct) else format(float(wr_pct), '.1f')} "
             f"avg_pnl={'' if not np.isfinite(avg_pnl) else format(float(avg_pnl), '.4f')} "
-            f"lookback_n={int(V2_LONG_FAST_BRAKE_LOOKBACK_N)}"
+            f"lookback_n={int(V2_LONG_FAST_BRAKE_LOOKBACK_N)} "
+            f"latest_done_dt={out['latest_done_dt']}"
         )
 
     except Exception as e:
@@ -1683,6 +1701,88 @@ def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
 
     _v2_long_fast_brake_cache["ts"] = now_ts
     _v2_long_fast_brake_cache["state"] = dict(out)
+    return out
+
+
+def _resolve_v2_long_fast_brake_runtime(now_jst: datetime) -> Dict[str, Any]:
+    """
+    long_fast_brake の実効状態を解決する。
+
+    方針:
+    - 発動条件を満たしたら、最低 hold 分は止める
+    - hold 終了後は一度解除する
+    - ただし、前回ブレーキ発動時に見ていた latest_done_dt と同じ間は再発動しない
+    - 新しい DONE済み通知LONG が増えたときだけ、再度ブレーキ判定する
+    """
+    global _v2_long_fast_brake_runtime
+
+    raw_state = get_v2_long_fast_brake_state(now_jst)
+    now_ts = time.time()
+
+    hold_sec = max(0, int(V2_LONG_FAST_BRAKE_HOLD_MINUTES)) * 60
+
+    runtime_active = bool(_v2_long_fast_brake_runtime.get("active", False))
+    until_ts = float(_v2_long_fast_brake_runtime.get("until_ts", 0.0) or 0.0)
+    last_trigger_latest_done_dt = str(
+        _v2_long_fast_brake_runtime.get("last_trigger_latest_done_dt", "") or ""
+    )
+
+    raw_active = bool(raw_state.get("active", False))
+    raw_latest_done_dt = str(raw_state.get("latest_done_dt", "") or "")
+    raw_reason_text = str(raw_state.get("reason_text", "") or "")
+
+    # すでに保持中なら、期限まではそのまま止める
+    if runtime_active and until_ts > now_ts:
+        remain_sec = int(max(0, until_ts - now_ts))
+        out = dict(raw_state)
+        out["active"] = True
+        out["reason"] = "holding"
+        out["reason_text"] = (
+            f"holding remain_sec={remain_sec} "
+            f"hold_min={int(V2_LONG_FAST_BRAKE_HOLD_MINUTES)} "
+            f"last_trigger_latest_done_dt={last_trigger_latest_done_dt} "
+            f"{raw_reason_text}"
+        )
+        return out
+
+    # 保持が終わったら一度解除
+    if runtime_active and until_ts <= now_ts:
+        _v2_long_fast_brake_runtime["active"] = False
+        _v2_long_fast_brake_runtime["until_ts"] = 0.0
+        _v2_long_fast_brake_runtime["reason"] = ""
+
+    # 新しい DONE済み通知LONG が増えていない限り、同じ材料では再発動させない
+    can_rearm = bool(
+        raw_active
+        and raw_latest_done_dt
+        and (raw_latest_done_dt != last_trigger_latest_done_dt)
+    )
+
+    if can_rearm:
+        new_until_ts = now_ts + hold_sec
+        _v2_long_fast_brake_runtime["active"] = True
+        _v2_long_fast_brake_runtime["until_ts"] = float(new_until_ts)
+        _v2_long_fast_brake_runtime["last_trigger_latest_done_dt"] = raw_latest_done_dt
+        _v2_long_fast_brake_runtime["reason"] = str(raw_reason_text or "")
+
+        out = dict(raw_state)
+        out["active"] = True
+        out["reason"] = "active"
+        out["reason_text"] = (
+            f"active hold_min={int(V2_LONG_FAST_BRAKE_HOLD_MINUTES)} "
+            f"{raw_reason_text}"
+        )
+        return out
+
+    out = dict(raw_state)
+    out["active"] = False
+    out["reason"] = "released"
+    out["reason_text"] = (
+        f"released hold_min={int(V2_LONG_FAST_BRAKE_HOLD_MINUTES)} "
+        f"latest_done_dt={raw_latest_done_dt} "
+        f"last_trigger_latest_done_dt={last_trigger_latest_done_dt} "
+        f"{raw_reason_text}"
+    )
     return out
 
 
@@ -5553,7 +5653,7 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
 
     # 当日LONG緊急ブレーキ
-    fast_brake_state = get_v2_long_fast_brake_state(datetime.now(JST))
+    fast_brake_state = _resolve_v2_long_fast_brake_runtime(datetime.now(JST))
     if bool(fast_brake_state.get("active", False)):
         return False, (
             f"long_fast_brake "
