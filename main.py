@@ -403,6 +403,12 @@ BTC_SURGE_LONG_PAUSE_NOTIFY = str(
     os.environ.get("BTC_SURGE_LONG_PAUSE_NOTIFY", "1")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# 急騰検知後、何分間 LONG 抑制を維持するか
+# 「急騰直後の反落」までカバーしたいので 90分を初期値にする
+BTC_SURGE_LONG_COOLDOWN_MINUTES = int(float(
+    os.environ.get("BTC_SURGE_LONG_COOLDOWN_MINUTES", "90")
+))
+
 # 「レンジの少し上振れ」で誤発火しないよう、かなり厳しめの初期値にする
 BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN = _env_float(
     "BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN", 0.90
@@ -414,7 +420,7 @@ BTC_SURGE_LONG_PAUSE_15M_MIN = _env_float(
     "BTC_SURGE_LONG_PAUSE_15M_MIN", 0.0035
 )  # +0.35%
 
-# 急騰中でも全部のLONGを止めず、追いかけ気味だけ止める
+# 急騰中 / 冷却時間中でも全部のLONGを止めず、追いかけ気味だけ止める
 BTC_SURGE_LONG_PAUSE_RSI_MIN = _env_float(
     "BTC_SURGE_LONG_PAUSE_RSI_MIN", 58.0
 )
@@ -511,8 +517,10 @@ _exchange_cache: Dict[str, Any] = {"ex": None, "ts": 0.0}
 _symbol_resolve_cache: Dict[str, str] = {}
 
 _btc_long_pause_runtime_state: Dict[str, Any] = {
-    "active": None,
+    "raw_active": False,
+    "effective_active": None,
     "reason": "",
+    "cooldown_until_ts": 0.0,
     "last_sent_ts": 0.0,
 }
 _btc_long_pause_ctx: Dict[str, Any] = {
@@ -674,6 +682,57 @@ def _detect_btc_surge_long_pause(
         return False, f"detect_error:{type(e).__name__}:{e}"
 
 
+def _resolve_btc_surge_long_pause_runtime(
+    raw_active: bool,
+    raw_reason: str,
+) -> Tuple[bool, str]:
+    """
+    急騰検知そのもの(raw_active)と、
+    急騰後の冷却時間を含めた実効判定(effective_active)を分ける。
+    cooldown は「厳しい急騰条件が一度ONになった後だけ」始まる。
+    そのため、レンジ内の小動きでは cooldown は発火しない。
+    """
+    global _btc_long_pause_runtime_state
+
+    now_ts = time.time()
+    prev_raw_active = bool(_btc_long_pause_runtime_state.get("raw_active", False))
+    cooldown_until_ts = float(_btc_long_pause_runtime_state.get("cooldown_until_ts", 0.0) or 0.0)
+
+    cooldown_sec = max(0, int(BTC_SURGE_LONG_COOLDOWN_MINUTES)) * 60
+
+    if raw_active:
+        cooldown_until_ts = now_ts + cooldown_sec
+        effective_active = True
+        effective_reason = (
+            f"surge_live cooldown_min={BTC_SURGE_LONG_COOLDOWN_MINUTES} "
+            f"{raw_reason}"
+        )
+    else:
+        # 直前まで急騰ONだったら、ここから冷却時間へ移行
+        if prev_raw_active and cooldown_sec > 0:
+            cooldown_until_ts = now_ts + cooldown_sec
+
+        if cooldown_until_ts > now_ts:
+            remain_sec = int(max(0, cooldown_until_ts - now_ts))
+            effective_active = True
+            effective_reason = (
+                f"cooldown_after_surge "
+                f"remain_sec={remain_sec} "
+                f"cooldown_min={BTC_SURGE_LONG_COOLDOWN_MINUTES} "
+                f"last_raw=({raw_reason})"
+            )
+        else:
+            effective_active = False
+            effective_reason = str(raw_reason or "")
+
+    _btc_long_pause_runtime_state["raw_active"] = bool(raw_active)
+    _btc_long_pause_runtime_state["effective_active"] = bool(effective_active)
+    _btc_long_pause_runtime_state["reason"] = str(effective_reason or "")
+    _btc_long_pause_runtime_state["cooldown_until_ts"] = float(cooldown_until_ts)
+
+    return bool(effective_active), str(effective_reason or "")
+
+
 def _notify_btc_surge_long_pause_if_changed(active: bool, reason: str):
     """
     Discord通知は状態変化時だけ送る。
@@ -683,15 +742,15 @@ def _notify_btc_surge_long_pause_if_changed(active: bool, reason: str):
     global _btc_long_pause_runtime_state
 
     if not BTC_SURGE_LONG_PAUSE_NOTIFY:
-        _btc_long_pause_runtime_state["active"] = bool(active)
+        _btc_long_pause_runtime_state["effective_active"] = bool(active)
         _btc_long_pause_runtime_state["reason"] = str(reason or "")
         _btc_long_pause_runtime_state["last_sent_ts"] = time.time()
         return
 
-    prev_active = _btc_long_pause_runtime_state.get("active", None)
+    prev_active = _btc_long_pause_runtime_state.get("effective_active", None)
     prev_reason = str(_btc_long_pause_runtime_state.get("reason", "") or "")
 
-    _btc_long_pause_runtime_state["active"] = bool(active)
+    _btc_long_pause_runtime_state["effective_active"] = bool(active)
     _btc_long_pause_runtime_state["reason"] = str(reason or "")
     _btc_long_pause_runtime_state["last_sent_ts"] = time.time()
 
@@ -701,7 +760,7 @@ def _notify_btc_surge_long_pause_if_changed(active: bool, reason: str):
             send_discord_message(
                 "⚠️ BTC急騰を検知したため、LONG通知を一時抑制中です\n"
                 "・対象: LONGのみ\n"
-                "・理由: BTC主導の急上昇局面では追いかけLONGの精度が低下しやすいため\n"
+                "・理由: BTC主導の急上昇直後は反落しやすいため、急騰中または冷却時間中の追いかけLONGを抑制します\n"
                 "・SHORT: 通常運転\n"
                 "・状態: 相場監視中。条件が落ち着けば自動で解除します\n"
                 f"・詳細: {reason}"
@@ -716,7 +775,7 @@ def _notify_btc_surge_long_pause_if_changed(active: bool, reason: str):
         send_discord_message(
             "⚠️ BTC急騰を検知したため、LONG通知を一時抑制中です\n"
             "・対象: LONGのみ\n"
-            "・理由: BTC主導の急上昇局面では追いかけLONGの精度が低下しやすいため\n"
+            "・理由: BTC主導の急上昇直後は反落しやすいため、急騰中または冷却時間中の追いかけLONGを抑制します\n"
             "・SHORT: 通常運転\n"
             "・状態: 相場監視中。条件が落ち着けば自動で解除します\n"
             f"・詳細: {reason}"
@@ -9017,11 +9076,16 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         f"regime_spread={spread_str}"
     )
 
-    btc_surge_long_pause_active, btc_surge_long_pause_reason = _detect_btc_surge_long_pause(
+    btc_surge_raw_active, btc_surge_raw_reason = _detect_btc_surge_long_pause(
         btc_htf_dir=btc_htf.get("direction", ""),
         btc_htf_strength=btc_htf.get("strength", np.nan),
         btc_1h_change=btc_1h_change_v2,
         btc_ret_15m=btc_ret,
+    )
+
+    btc_surge_long_pause_active, btc_surge_long_pause_reason = _resolve_btc_surge_long_pause_runtime(
+        raw_active=btc_surge_raw_active,
+        raw_reason=btc_surge_raw_reason,
     )
 
     _btc_long_pause_ctx["active"] = bool(btc_surge_long_pause_active)
@@ -9029,7 +9093,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     print(
         f"[V2-BTC-SURGE-LONG-PAUSE] "
-        f"active={int(bool(btc_surge_long_pause_active))} "
+        f"raw_active={int(bool(btc_surge_raw_active))} "
+        f"effective_active={int(bool(btc_surge_long_pause_active))} "
         f"reason={btc_surge_long_pause_reason}"
     )
 
