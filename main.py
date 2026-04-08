@@ -425,7 +425,44 @@ BTC_SURGE_LONG_PAUSE_RSI_MIN = _env_float(
     "BTC_SURGE_LONG_PAUSE_RSI_MIN", 58.0
 )
 BTC_SURGE_LONG_PAUSE_P1_MIN = _env_float(
-    "BTC_SURGE_LONG_PAUSE_P1_MIN", 2.2
+    "BTC_SURGE_LONG_PAUSE_P1_MIN", 2.0
+)
+
+# --- 同一銘柄LONG連打ブロック ---
+# 直近 window 分に同一銘柄LONG通知が max_notifies 回以上あれば止める
+V2_LONG_REPEAT_BLOCK_ENABLE = str(
+    os.environ.get("V2_LONG_REPEAT_BLOCK_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_LONG_REPEAT_WINDOW_MINUTES = int(float(
+    os.environ.get("V2_LONG_REPEAT_WINDOW_MINUTES", "90")
+))
+
+V2_LONG_REPEAT_MAX_NOTIFIES = int(float(
+    os.environ.get("V2_LONG_REPEAT_MAX_NOTIFIES", "2")
+))
+
+# --- 当日LONG緊急ブレーキ ---
+# 直近DONE済み通知LONGが lookback_n 件たまっていて、
+# 勝率 <= stop_winrate かつ avg_pnl < stop_avgpnl なら LONG を止める
+V2_LONG_FAST_BRAKE_ENABLE = str(
+    os.environ.get("V2_LONG_FAST_BRAKE_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_LONG_FAST_BRAKE_MIN_DONE = int(float(
+    os.environ.get("V2_LONG_FAST_BRAKE_MIN_DONE", "4")
+))
+
+V2_LONG_FAST_BRAKE_LOOKBACK_N = int(float(
+    os.environ.get("V2_LONG_FAST_BRAKE_LOOKBACK_N", "4")
+))
+
+V2_LONG_FAST_BRAKE_STOP_WINRATE = _env_float(
+    "V2_LONG_FAST_BRAKE_STOP_WINRATE", 25.0
+)
+
+V2_LONG_FAST_BRAKE_STOP_AVGPNL = _env_float(
+    "V2_LONG_FAST_BRAKE_STOP_AVGPNL", 0.0
 )
 
 
@@ -526,6 +563,17 @@ _btc_long_pause_runtime_state: Dict[str, Any] = {
 _btc_long_pause_ctx: Dict[str, Any] = {
     "active": False,
     "reason": "",
+}
+
+_v2_long_repeat_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "window_min": 0,
+    "state": {},
+}
+
+_v2_long_fast_brake_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "state": {},
 }
 
 # ==========================================
@@ -685,50 +733,122 @@ def _detect_btc_surge_long_pause(
 def _resolve_btc_surge_long_pause_runtime(
     raw_active: bool,
     raw_reason: str,
+    btc_htf_dir: str,
+    btc_htf_strength: Any,
+    btc_15m_df: Optional[pd.DataFrame],
 ) -> Tuple[bool, str]:
     """
-    急騰検知そのもの(raw_active)と、
-    急騰後の冷却時間を含めた実効判定(effective_active)を分ける。
-    cooldown は「厳しい急騰条件が一度ONになった後だけ」始まる。
-    そのため、レンジ内の小動きでは cooldown は発火しない。
+    現在の急騰判定(raw_active)に加えて、
+    直近の確定15分足をさかのぼって「急騰イベントが直近 cooldown 分にあったか」を毎回再計算する。
+    これにより、
+      - デプロイ直後
+      - instance切替直後
+      - 急騰直後の反落局面
+    でも、冷却時間を見失わない。
     """
     global _btc_long_pause_runtime_state
 
-    now_ts = time.time()
-    prev_raw_active = bool(_btc_long_pause_runtime_state.get("raw_active", False))
-    cooldown_until_ts = float(_btc_long_pause_runtime_state.get("cooldown_until_ts", 0.0) or 0.0)
+    recent_event_active = False
+    recent_event_reason = "no_recent_event"
 
-    cooldown_sec = max(0, int(BTC_SURGE_LONG_COOLDOWN_MINUTES)) * 60
+    try:
+        dir_u = str(btc_htf_dir or "").strip().upper()
+        strength = float(btc_htf_strength)
+
+        dir_ok = dir_u in ("LONG", "UP", "BULL")
+        strength_ok = np.isfinite(strength) and (
+            strength >= float(BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN)
+        )
+
+        if (
+            BTC_SURGE_LONG_PAUSE_ENABLE
+            and dir_ok
+            and strength_ok
+            and isinstance(btc_15m_df, pd.DataFrame)
+            and (not btc_15m_df.empty)
+        ):
+            work = btc_15m_df.copy()
+            work["Close"] = pd.to_numeric(work["Close"], errors="coerce")
+            work["Time"] = pd.to_numeric(work["Time"], errors="coerce")
+
+            # 形成中の最後の1本は除外し、確定足だけを見る
+            confirmed = work.iloc[:-1].copy() if len(work) >= 2 else work.copy()
+
+            if len(confirmed) >= 5:
+                bars_lookback = max(
+                    1,
+                    int(np.ceil(float(BTC_SURGE_LONG_COOLDOWN_MINUTES) / 15.0))
+                )
+                start_i = max(4, len(confirmed) - bars_lookback)
+
+                for i in range(len(confirmed) - 1, start_i - 1, -1):
+                    cur = float(confirmed["Close"].iloc[i])
+                    prev_15m = float(confirmed["Close"].iloc[i - 1])
+                    prev_1h = float(confirmed["Close"].iloc[i - 4])
+
+                    if (
+                        (not np.isfinite(cur))
+                        or (not np.isfinite(prev_15m))
+                        or (not np.isfinite(prev_1h))
+                        or abs(prev_15m) <= 1e-12
+                        or abs(prev_1h) <= 1e-12
+                    ):
+                        continue
+
+                    chg_15m = (cur - prev_15m) / prev_15m
+                    chg_1h = (cur - prev_1h) / prev_1h
+
+                    if (
+                        chg_1h >= float(BTC_SURGE_LONG_PAUSE_1H_MIN)
+                        and chg_15m >= float(BTC_SURGE_LONG_PAUSE_15M_MIN)
+                    ):
+                        event_dt_text = ""
+                        event_ms = confirmed["Time"].iloc[i]
+                        try:
+                            if np.isfinite(float(event_ms)):
+                                event_dt = datetime.fromtimestamp(
+                                    float(event_ms) / 1000.0,
+                                    tz=timezone.utc,
+                                ).astimezone(JST)
+                                event_dt_text = event_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            event_dt_text = ""
+
+                        recent_event_active = True
+                        recent_event_reason = (
+                            f"cooldown_after_recent_event "
+                            f"event_jst={event_dt_text} "
+                            f"cooldown_min={int(BTC_SURGE_LONG_COOLDOWN_MINUTES)} "
+                            f"btc_1h_change={chg_1h:.6f} "
+                            f"btc_15m_change={chg_15m:.6f}"
+                        )
+                        break
+            else:
+                recent_event_reason = f"insufficient_confirmed_bars n={len(confirmed)}"
+        else:
+            recent_event_reason = (
+                f"dir={dir_u} "
+                f"htf_strength={'' if not np.isfinite(strength) else format(float(strength), '.4f')} "
+                f"dir_ok={int(dir_ok)} "
+                f"strength_ok={int(strength_ok)}"
+            )
+
+    except Exception as e:
+        recent_event_reason = f"recent_event_error:{type(e).__name__}:{e}"
+
+    effective_active = bool(raw_active or recent_event_active)
 
     if raw_active:
-        cooldown_until_ts = now_ts + cooldown_sec
-        effective_active = True
-        effective_reason = (
-            f"surge_live cooldown_min={BTC_SURGE_LONG_COOLDOWN_MINUTES} "
-            f"{raw_reason}"
-        )
+        effective_reason = f"surge_live {raw_reason}"
+    elif recent_event_active:
+        effective_reason = recent_event_reason
     else:
-        # 直前まで急騰ONだったら、ここから冷却時間へ移行
-        if prev_raw_active and cooldown_sec > 0:
-            cooldown_until_ts = now_ts + cooldown_sec
-
-        if cooldown_until_ts > now_ts:
-            remain_sec = int(max(0, cooldown_until_ts - now_ts))
-            effective_active = True
-            effective_reason = (
-                f"cooldown_after_surge "
-                f"remain_sec={remain_sec} "
-                f"cooldown_min={BTC_SURGE_LONG_COOLDOWN_MINUTES} "
-                f"last_raw=({raw_reason})"
-            )
-        else:
-            effective_active = False
-            effective_reason = str(raw_reason or "")
+        effective_reason = str(raw_reason or recent_event_reason or "")
 
     _btc_long_pause_runtime_state["raw_active"] = bool(raw_active)
     _btc_long_pause_runtime_state["effective_active"] = bool(effective_active)
     _btc_long_pause_runtime_state["reason"] = str(effective_reason or "")
-    _btc_long_pause_runtime_state["cooldown_until_ts"] = float(cooldown_until_ts)
+    _btc_long_pause_runtime_state["cooldown_until_ts"] = 0.0
 
     return bool(effective_active), str(effective_reason or "")
 
@@ -1342,6 +1462,228 @@ def _get_v2_global_recent_stats(direction: str, lookback_n: int = 20) -> Dict[st
 
     except Exception:
         return {"n": 0, "wins": 0, "wr": np.nan}
+
+
+def _get_v2_long_recent_notified_window_state(now_jst: datetime) -> Dict[str, Any]:
+    """
+    直近 window 分の「通知済みLONG」を銘柄別に集計する。
+    目的:
+      - 同一銘柄LONGの連打を止める
+    """
+    global _v2_long_repeat_cache
+
+    now_ts = time.time()
+    cached_state = _v2_long_repeat_cache.get("state", {}) or {}
+    cached_ts = float(_v2_long_repeat_cache.get("ts", 0.0) or 0.0)
+    cached_window = int(_v2_long_repeat_cache.get("window_min", 0) or 0)
+
+    if (
+        cached_state
+        and (now_ts - cached_ts) <= 60
+        and cached_window == int(V2_LONG_REPEAT_WINDOW_MINUTES)
+    ):
+        return dict(cached_state)
+
+    out: Dict[str, Any] = {
+        "counts": {},
+        "last_dt": {},
+        "reason": "ok",
+    }
+
+    if not V2_LONG_REPEAT_BLOCK_ENABLE:
+        _v2_long_repeat_cache["ts"] = now_ts
+        _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
+        _v2_long_repeat_cache["state"] = dict(out)
+        return out
+
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            out["reason"] = "empty"
+            _v2_long_repeat_cache["ts"] = now_ts
+            _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
+            _v2_long_repeat_cache["state"] = dict(out)
+            return out
+
+        work = df.copy()
+
+        required_cols = {"Datetime_JST", "Symbol", "Direction"}
+        if not required_cols.issubset(set(work.columns)):
+            out["reason"] = f"missing_cols:{sorted(required_cols - set(work.columns))}"
+            _v2_long_repeat_cache["ts"] = now_ts
+            _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
+            _v2_long_repeat_cache["state"] = dict(out)
+            return out
+
+        work["Datetime_JST"] = pd.to_datetime(
+            work["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        work = work[work["Datetime_JST"].notna()].copy()
+
+        work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+        work = work[work["Direction"] == "LONG"].copy()
+
+        notify_mask = pd.Series([False] * len(work), index=work.index)
+        if "AI_Note" in work.columns:
+            note_col = work["AI_Note"].astype(str).str.lower()
+            notify_mask = notify_mask | note_col.str.contains("notify_pass=1", na=False)
+        if "AI_Pass" in work.columns:
+            ai_pass_col = work["AI_Pass"].astype(str).str.strip().str.lower()
+            notify_mask = notify_mask | ai_pass_col.isin(["1", "true", "yes"])
+
+        work = work[notify_mask].copy()
+
+        cutoff = now_jst - timedelta(minutes=int(V2_LONG_REPEAT_WINDOW_MINUTES))
+        work = work[work["Datetime_JST"] >= cutoff].copy()
+
+        if work.empty:
+            out["reason"] = "no_recent_notified_longs"
+            _v2_long_repeat_cache["ts"] = now_ts
+            _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
+            _v2_long_repeat_cache["state"] = dict(out)
+            return out
+
+        counts = work.groupby("Symbol").size().to_dict()
+        last_dt = work.groupby("Symbol")["Datetime_JST"].max().to_dict()
+
+        out["counts"] = {
+            str(k).strip().upper(): int(v)
+            for k, v in counts.items()
+        }
+        out["last_dt"] = {
+            str(k).strip().upper(): v.strftime("%Y-%m-%d %H:%M:%S")
+            for k, v in last_dt.items()
+        }
+
+    except Exception as e:
+        out["reason"] = f"repeat_window_error:{type(e).__name__}:{e}"
+
+    _v2_long_repeat_cache["ts"] = now_ts
+    _v2_long_repeat_cache["window_min"] = int(V2_LONG_REPEAT_WINDOW_MINUTES)
+    _v2_long_repeat_cache["state"] = dict(out)
+    return out
+
+
+def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
+    """
+    直近DONE済み通知LONGの成績だけを見て、当日LONGを即停止するための高速ブレーキ。
+    既存guardrailより少ない母数で動かす。
+    """
+    global _v2_long_fast_brake_cache
+
+    now_ts = time.time()
+    cached_state = _v2_long_fast_brake_cache.get("state", {}) or {}
+    cached_ts = float(_v2_long_fast_brake_cache.get("ts", 0.0) or 0.0)
+
+    if cached_state and (now_ts - cached_ts) <= 60:
+        return dict(cached_state)
+
+    out: Dict[str, Any] = {
+        "active": False,
+        "n": 0,
+        "wins": 0,
+        "wr": np.nan,
+        "avg_pnl": np.nan,
+        "reason": "ok",
+        "reason_text": "",
+    }
+
+    if not V2_LONG_FAST_BRAKE_ENABLE:
+        out["reason"] = "feature_off"
+        _v2_long_fast_brake_cache["ts"] = now_ts
+        _v2_long_fast_brake_cache["state"] = dict(out)
+        return out
+
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty:
+            out["reason"] = "empty"
+            _v2_long_fast_brake_cache["ts"] = now_ts
+            _v2_long_fast_brake_cache["state"] = dict(out)
+            return out
+
+        work = df.copy()
+
+        required_cols = {"Datetime_JST", "Direction", "WinLose", "PnL_Pct"}
+        if not required_cols.issubset(set(work.columns)):
+            out["reason"] = f"missing_cols:{sorted(required_cols - set(work.columns))}"
+            _v2_long_fast_brake_cache["ts"] = now_ts
+            _v2_long_fast_brake_cache["state"] = dict(out)
+            return out
+
+        work["Datetime_JST"] = pd.to_datetime(
+            work["Datetime_JST"].astype(str).str.strip(),
+            errors="coerce",
+        )
+        work = work[work["Datetime_JST"].notna()].copy()
+        work = work.sort_values("Datetime_JST", ascending=False)
+
+        work["Direction"] = work["Direction"].astype(str).str.strip().str.upper()
+        work = work[work["Direction"] == "LONG"].copy()
+
+        if "EvalStatus" in work.columns:
+            work["EvalStatus"] = work["EvalStatus"].astype(str).str.strip().str.upper()
+            work = work[work["EvalStatus"] == "DONE"].copy()
+
+        notify_mask = pd.Series([False] * len(work), index=work.index)
+        if "AI_Note" in work.columns:
+            note_col = work["AI_Note"].astype(str).str.lower()
+            notify_mask = notify_mask | note_col.str.contains("notify_pass=1", na=False)
+        if "AI_Pass" in work.columns:
+            ai_pass_col = work["AI_Pass"].astype(str).str.strip().str.lower()
+            notify_mask = notify_mask | ai_pass_col.isin(["1", "true", "yes"])
+
+        work = work[notify_mask].copy()
+
+        if work.empty:
+            out["reason"] = "no_done_notified_longs"
+            _v2_long_fast_brake_cache["ts"] = now_ts
+            _v2_long_fast_brake_cache["state"] = dict(out)
+            return out
+
+        work["PnL_Pct"] = pd.to_numeric(work["PnL_Pct"], errors="coerce")
+        work = work.head(int(V2_LONG_FAST_BRAKE_LOOKBACK_N)).copy()
+
+        n = int(len(work))
+        wins = int(
+            work["WinLose"].astype(str).str.strip().str.lower().isin(["win", "w", "1", "true"]).sum()
+        )
+        wr_pct = float((wins / n) * 100.0) if n > 0 else np.nan
+        avg_pnl = float(work["PnL_Pct"].mean()) if n > 0 else np.nan
+
+        out["n"] = n
+        out["wins"] = wins
+        out["wr"] = wr_pct
+        out["avg_pnl"] = avg_pnl
+
+        active = (
+            n >= int(V2_LONG_FAST_BRAKE_MIN_DONE)
+            and np.isfinite(wr_pct)
+            and np.isfinite(avg_pnl)
+            and float(wr_pct) <= float(V2_LONG_FAST_BRAKE_STOP_WINRATE)
+            and float(avg_pnl) < float(V2_LONG_FAST_BRAKE_STOP_AVGPNL)
+        )
+
+        out["active"] = bool(active)
+        out["reason"] = "active" if active else "ok"
+        out["reason_text"] = (
+            f"n={n} "
+            f"wins={wins} "
+            f"wr={'' if not np.isfinite(wr_pct) else format(float(wr_pct), '.1f')} "
+            f"avg_pnl={'' if not np.isfinite(avg_pnl) else format(float(avg_pnl), '.4f')} "
+            f"lookback_n={int(V2_LONG_FAST_BRAKE_LOOKBACK_N)}"
+        )
+
+    except Exception as e:
+        out["active"] = False
+        out["reason"] = "error"
+        out["reason_text"] = f"long_fast_brake_error:{type(e).__name__}:{e}"
+
+    _v2_long_fast_brake_cache["ts"] = now_ts
+    _v2_long_fast_brake_cache["state"] = dict(out)
+    return out
 
 
 def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
@@ -5208,26 +5550,61 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+    sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
 
-    # BTC急騰直後の追いかけLONGだけ止める
-    if BTC_SURGE_LONG_PAUSE_ENABLE:
-        btc_surge_pause_active = bool(_btc_long_pause_ctx.get("active", False))
-        btc_surge_pause_reason = str(_btc_long_pause_ctx.get("reason", "") or "")
-        if btc_surge_pause_active and btc_mode_compat == "UP":
-            pause_rsi = _safe_float_or_nan(sig.get("rsi"))
-            pause_p1 = _safe_float_or_nan(sig.get("p1_score"))
-            hit_rsi = bool(np.isfinite(pause_rsi) and float(pause_rsi) >= float(BTC_SURGE_LONG_PAUSE_RSI_MIN))
-            hit_p1 = bool(np.isfinite(pause_p1) and float(pause_p1) >= float(BTC_SURGE_LONG_PAUSE_P1_MIN))
-            if hit_rsi or hit_p1:
-                return False, (
-                    f"btc_surge_long_pause "
-                    f"btc_mode={btc_mode_compat} "
-                    f"rsi={_fmt_sig_num_or_blank(sig, 'rsi')} "
-                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')} "
-                    f"hit_rsi={int(hit_rsi)} "
-                    f"hit_p1={int(hit_p1)} "
-                    f"reason={btc_surge_pause_reason}"
-                )
+    # 当日LONG緊急ブレーキ
+    fast_brake_state = get_v2_long_fast_brake_state(datetime.now(JST))
+    if bool(fast_brake_state.get("active", False)):
+        return False, (
+            f"long_fast_brake "
+            f"{str(fast_brake_state.get('reason_text', '') or '')}"
+        )
+
+    # 同一銘柄LONGの連打ブロック
+    if V2_LONG_REPEAT_BLOCK_ENABLE and sym:
+        repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
+        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+
+        if recent_n >= int(V2_LONG_REPEAT_MAX_NOTIFIES):
+            return False, (
+                f"long_repeat_block "
+                f"sym={sym} "
+                f"recent_n={recent_n} "
+                f"window_min={int(V2_LONG_REPEAT_WINDOW_MINUTES)} "
+                f"max_notifies={int(V2_LONG_REPEAT_MAX_NOTIFIES)} "
+                f"last_dt={last_dt}"
+            )
+
+    # BTC急騰中 / 急騰直後の追いかけLONGだけ止める
+    # ここでは RANGE では発火させない。UP のときだけ見る。
+    btc_surge_pause_active = bool(_btc_long_pause_ctx.get("active", False))
+    btc_surge_pause_reason = str(_btc_long_pause_ctx.get("reason", "") or "")
+
+    if btc_surge_pause_active and btc_mode_compat == "UP":
+        pause_rsi = _safe_float_or_nan(sig.get("rsi"))
+        pause_p1 = _safe_float_or_nan(sig.get("p1_score"))
+
+        hit_rsi = bool(
+            np.isfinite(pause_rsi) and
+            float(pause_rsi) >= float(BTC_SURGE_LONG_PAUSE_RSI_MIN)
+        )
+        hit_p1 = bool(
+            np.isfinite(pause_p1) and
+            float(pause_p1) >= float(BTC_SURGE_LONG_PAUSE_P1_MIN)
+        )
+
+        if hit_rsi or hit_p1:
+            return False, (
+                f"btc_surge_long_pause "
+                f"btc_mode={btc_mode_compat} "
+                f"sym={sym} "
+                f"rsi={_fmt_sig_num_or_blank(sig, 'rsi')} "
+                f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')} "
+                f"hit_rsi={int(hit_rsi)} "
+                f"hit_p1={int(hit_p1)} "
+                f"reason={btc_surge_pause_reason}"
+            )
 
     # まず LONG_STRONG を最優先で通す
     strong_ok, strong_reason = _check_long_strong_bucket(sig)
@@ -9015,6 +9392,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_ret = np.nan
     btc_vol = np.nan
     btc_1h_change_v2 = np.nan
+    btc_15m_df = None
     try:
         btc_15m_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
         if btc_15m_ohlcv and len(btc_15m_ohlcv) >= 6:
@@ -9086,6 +9464,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_surge_long_pause_active, btc_surge_long_pause_reason = _resolve_btc_surge_long_pause_runtime(
         raw_active=btc_surge_raw_active,
         raw_reason=btc_surge_raw_reason,
+        btc_htf_dir=btc_htf.get("direction", ""),
+        btc_htf_strength=btc_htf.get("strength", np.nan),
+        btc_15m_df=btc_15m_df,
     )
 
     _btc_long_pause_ctx["active"] = bool(btc_surge_long_pause_active)
