@@ -394,6 +394,34 @@ V2_SHORT_AI_MIN = float(os.environ.get("V2_SHORT_AI_MIN", str(SHORT_AI_TH)))
 V2_AI_FAIL_OPEN = (os.environ.get("V2_AI_FAIL_OPEN", "0").strip() == "1")
 V2_AI_NOTE_DBG_MAXLEN = int(float(os.environ.get("V2_AI_NOTE_DBG_MAXLEN", "220")))
 
+# --- BTC急騰直後の追いかけLONG停止 ---
+BTC_SURGE_LONG_PAUSE_ENABLE = str(
+    os.environ.get("BTC_SURGE_LONG_PAUSE_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+BTC_SURGE_LONG_PAUSE_NOTIFY = str(
+    os.environ.get("BTC_SURGE_LONG_PAUSE_NOTIFY", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+# 「レンジの少し上振れ」で誤発火しないよう、かなり厳しめの初期値にする
+BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN = _env_float(
+    "BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN", 0.90
+)
+BTC_SURGE_LONG_PAUSE_1H_MIN = _env_float(
+    "BTC_SURGE_LONG_PAUSE_1H_MIN", 0.0120
+)  # +1.20%
+BTC_SURGE_LONG_PAUSE_15M_MIN = _env_float(
+    "BTC_SURGE_LONG_PAUSE_15M_MIN", 0.0035
+)  # +0.35%
+
+# 急騰中でも全部のLONGを止めず、追いかけ気味だけ止める
+BTC_SURGE_LONG_PAUSE_RSI_MIN = _env_float(
+    "BTC_SURGE_LONG_PAUSE_RSI_MIN", 58.0
+)
+BTC_SURGE_LONG_PAUSE_P1_MIN = _env_float(
+    "BTC_SURGE_LONG_PAUSE_P1_MIN", 2.2
+)
+
 
 # ==========================================
 # 期待ヘッダー
@@ -481,6 +509,16 @@ _run_lock = threading.Lock()
 
 _exchange_cache: Dict[str, Any] = {"ex": None, "ts": 0.0}
 _symbol_resolve_cache: Dict[str, str] = {}
+
+_btc_long_pause_runtime_state: Dict[str, Any] = {
+    "active": None,
+    "reason": "",
+    "last_sent_ts": 0.0,
+}
+_btc_long_pause_ctx: Dict[str, Any] = {
+    "active": False,
+    "reason": "",
+}
 
 # ==========================================
 # 日時の正規化
@@ -580,6 +618,118 @@ def send_daily_discord_message(text: str):
                 print(f"[DBG] daily discord body={r.text[:200]}")
         except Exception as e:
             print(f"[ERR] daily discord webhook post: {e}")
+
+
+def _detect_btc_surge_long_pause(
+    btc_htf_dir: str,
+    btc_htf_strength: Any,
+    btc_1h_change: Any,
+    btc_ret_15m: Any,
+) -> Tuple[bool, str]:
+    """
+    BTC急騰直後の「追いかけLONG停止」判定。
+    レンジ内の誤発火を避けるため、かなり厳しめに
+      1) HTF方向
+      2) HTF強度
+      3) 1時間上昇率
+      4) 直近15分上昇率
+    の全部を要求する。
+    """
+    if not BTC_SURGE_LONG_PAUSE_ENABLE:
+        return False, "feature_off"
+
+    try:
+        dir_u = str(btc_htf_dir or "").strip().upper()
+        strength = float(btc_htf_strength)
+        chg_1h = float(btc_1h_change)
+        chg_15m = float(btc_ret_15m)
+
+        if not np.isfinite(strength):
+            return False, "missing_htf_strength"
+        if not np.isfinite(chg_1h):
+            return False, "missing_btc_1h_change"
+        if not np.isfinite(chg_15m):
+            return False, "missing_btc_15m_change"
+
+        dir_ok = dir_u in ("LONG", "UP", "BULL")
+        strength_ok = strength >= float(BTC_SURGE_LONG_PAUSE_HTF_STRENGTH_MIN)
+        chg_1h_ok = chg_1h >= float(BTC_SURGE_LONG_PAUSE_1H_MIN)
+        chg_15m_ok = chg_15m >= float(BTC_SURGE_LONG_PAUSE_15M_MIN)
+
+        active = bool(dir_ok and strength_ok and chg_1h_ok and chg_15m_ok)
+
+        reason = (
+            f"dir={dir_u} "
+            f"htf_strength={strength:.4f} "
+            f"btc_1h_change={chg_1h:.6f} "
+            f"btc_15m_change={chg_15m:.6f} "
+            f"dir_ok={int(dir_ok)} "
+            f"strength_ok={int(strength_ok)} "
+            f"chg_1h_ok={int(chg_1h_ok)} "
+            f"chg_15m_ok={int(chg_15m_ok)}"
+        )
+        return active, reason
+
+    except Exception as e:
+        return False, f"detect_error:{type(e).__name__}:{e}"
+
+
+def _notify_btc_surge_long_pause_if_changed(active: bool, reason: str):
+    """
+    Discord通知は状態変化時だけ送る。
+    - OFF -> ON: 抑制開始通知
+    - ON  -> OFF: 解除通知
+    """
+    global _btc_long_pause_runtime_state
+
+    if not BTC_SURGE_LONG_PAUSE_NOTIFY:
+        _btc_long_pause_runtime_state["active"] = bool(active)
+        _btc_long_pause_runtime_state["reason"] = str(reason or "")
+        _btc_long_pause_runtime_state["last_sent_ts"] = time.time()
+        return
+
+    prev_active = _btc_long_pause_runtime_state.get("active", None)
+    prev_reason = str(_btc_long_pause_runtime_state.get("reason", "") or "")
+
+    _btc_long_pause_runtime_state["active"] = bool(active)
+    _btc_long_pause_runtime_state["reason"] = str(reason or "")
+    _btc_long_pause_runtime_state["last_sent_ts"] = time.time()
+
+    # 初回は、active=True のときだけ通知する
+    if prev_active is None:
+        if active:
+            send_discord_message(
+                "⚠️ BTC急騰を検知したため、LONG通知を一時抑制中です\n"
+                "・対象: LONGのみ\n"
+                "・理由: BTC主導の急上昇局面では追いかけLONGの精度が低下しやすいため\n"
+                "・SHORT: 通常運転\n"
+                "・状態: 相場監視中。条件が落ち着けば自動で解除します\n"
+                f"・詳細: {reason}"
+            )
+        return
+
+    # 同じ状態なら送らない
+    if bool(prev_active) == bool(active):
+        return
+
+    if active:
+        send_discord_message(
+            "⚠️ BTC急騰を検知したため、LONG通知を一時抑制中です\n"
+            "・対象: LONGのみ\n"
+            "・理由: BTC主導の急上昇局面では追いかけLONGの精度が低下しやすいため\n"
+            "・SHORT: 通常運転\n"
+            "・状態: 相場監視中。条件が落ち着けば自動で解除します\n"
+            f"・詳細: {reason}"
+        )
+    else:
+        send_discord_message(
+            "✅ BTC急騰局面のLONG抑制を解除しました\n"
+            "・対象: LONG通知を通常運転に戻しました\n"
+            "・SHORT: 通常運転\n"
+            "・状態: 通常モードへ復帰\n"
+            f"・前回理由: {prev_reason}"
+        )
+
 
 def get_sheet_service():
     now = time.time()
@@ -5000,6 +5150,26 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
 
+    # BTC急騰直後の追いかけLONGだけ止める
+    if BTC_SURGE_LONG_PAUSE_ENABLE:
+        btc_surge_pause_active = bool(_btc_long_pause_ctx.get("active", False))
+        btc_surge_pause_reason = str(_btc_long_pause_ctx.get("reason", "") or "")
+        if btc_surge_pause_active and btc_mode_compat == "UP":
+            pause_rsi = _safe_float_or_nan(sig.get("rsi"))
+            pause_p1 = _safe_float_or_nan(sig.get("p1_score"))
+            hit_rsi = bool(np.isfinite(pause_rsi) and float(pause_rsi) >= float(BTC_SURGE_LONG_PAUSE_RSI_MIN))
+            hit_p1 = bool(np.isfinite(pause_p1) and float(pause_p1) >= float(BTC_SURGE_LONG_PAUSE_P1_MIN))
+            if hit_rsi or hit_p1:
+                return False, (
+                    f"btc_surge_long_pause "
+                    f"btc_mode={btc_mode_compat} "
+                    f"rsi={_fmt_sig_num_or_blank(sig, 'rsi')} "
+                    f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')} "
+                    f"hit_rsi={int(hit_rsi)} "
+                    f"hit_p1={int(hit_p1)} "
+                    f"reason={btc_surge_pause_reason}"
+                )
+
     # まず LONG_STRONG を最優先で通す
     strong_ok, strong_reason = _check_long_strong_bucket(sig)
     if strong_ok:
@@ -8785,13 +8955,26 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     # BTC 15m Pct_Change / Vol (AI 特徴量用)
     btc_ret = np.nan
     btc_vol = np.nan
+    btc_1h_change_v2 = np.nan
     try:
         btc_15m_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
-        if btc_15m_ohlcv and len(btc_15m_ohlcv) >= 3:
-            btc_15m_df = pd.DataFrame(btc_15m_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-            btc_15m_df["Pct_Change"] = pd.to_numeric(btc_15m_df["Close"], errors="coerce").pct_change(fill_method=None)
+        if btc_15m_ohlcv and len(btc_15m_ohlcv) >= 6:
+            btc_15m_df = pd.DataFrame(
+                btc_15m_ohlcv,
+                columns=["Time", "Open", "High", "Low", "Close", "Volume"]
+            )
+            btc_15m_df["Pct_Change"] = pd.to_numeric(
+                btc_15m_df["Close"], errors="coerce"
+            ).pct_change(fill_method=None)
+
             btc_ret = float(btc_15m_df["Pct_Change"].iloc[-2])
             btc_vol = abs(btc_ret)
+
+            btc_current_15m = float(btc_15m_df["Close"].iloc[-2])
+            btc_1h_ago_15m = float(btc_15m_df["Close"].iloc[-6])
+            if abs(btc_1h_ago_15m) > 1e-12:
+                btc_1h_change_v2 = (btc_current_15m - btc_1h_ago_15m) / btc_1h_ago_15m
+
     except Exception as e:
         print(f"[V2-WARN] BTC 15m fetch for AI feats failed: {e}")
 
@@ -8817,6 +9000,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         )
     else:
         print(f"[V2-REGIME] no conflict: {regime['reason']}")
+
     print(
         f"[V2] BTC HTF: {btc_htf['direction']} "
         f"str={btc_htf['strength']:.3f} "
@@ -8831,6 +9015,27 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         f"long_conflict={long_conflict} "
         f"long_conflict_soft={long_conflict_soft} "
         f"regime_spread={spread_str}"
+    )
+
+    btc_surge_long_pause_active, btc_surge_long_pause_reason = _detect_btc_surge_long_pause(
+        btc_htf_dir=btc_htf.get("direction", ""),
+        btc_htf_strength=btc_htf.get("strength", np.nan),
+        btc_1h_change=btc_1h_change_v2,
+        btc_ret_15m=btc_ret,
+    )
+
+    _btc_long_pause_ctx["active"] = bool(btc_surge_long_pause_active)
+    _btc_long_pause_ctx["reason"] = str(btc_surge_long_pause_reason or "")
+
+    print(
+        f"[V2-BTC-SURGE-LONG-PAUSE] "
+        f"active={int(bool(btc_surge_long_pause_active))} "
+        f"reason={btc_surge_long_pause_reason}"
+    )
+
+    _notify_btc_surge_long_pause_if_changed(
+        active=btc_surge_long_pause_active,
+        reason=btc_surge_long_pause_reason,
     )
 
     symbols = [
