@@ -442,6 +442,19 @@ V2_LONG_REPEAT_MAX_NOTIFIES = int(float(
     os.environ.get("V2_LONG_REPEAT_MAX_NOTIFIES", "2")
 ))
 
+# --- 同一銘柄LONG連打は hard block ではなく rank penalty で扱う ---
+V2_LONG_REPEAT_PENALTY_ENABLE = str(
+    os.environ.get("V2_LONG_REPEAT_PENALTY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_LONG_REPEAT_PENALTY_MIN_COUNT = int(float(
+    os.environ.get("V2_LONG_REPEAT_PENALTY_MIN_COUNT", "5")
+))
+
+V2_LONG_REPEAT_PENALTY_VALUE = _env_float(
+    "V2_LONG_REPEAT_PENALTY_VALUE", 0.12
+)
+
 # --- 当日LONG緊急ブレーキ ---
 # 直近DONE済み通知LONGが lookback_n 件たまっていて、
 # 勝率 <= stop_winrate かつ avg_pnl < stop_avgpnl なら LONG を止める
@@ -5660,21 +5673,14 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
             f"{str(fast_brake_state.get('reason_text', '') or '')}"
         )
 
-    # 同一銘柄LONGの連打ブロック
+    # 同一銘柄LONGの連打は、ここでは reject せず rank penalty 側で扱う
     if V2_LONG_REPEAT_BLOCK_ENABLE and sym:
         repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
         recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
         last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
 
-        if recent_n >= int(V2_LONG_REPEAT_MAX_NOTIFIES):
-            return False, (
-                f"long_repeat_block "
-                f"sym={sym} "
-                f"recent_n={recent_n} "
-                f"window_min={int(V2_LONG_REPEAT_WINDOW_MINUTES)} "
-                f"max_notifies={int(V2_LONG_REPEAT_MAX_NOTIFIES)} "
-                f"last_dt={last_dt}"
-            )
+        sig["long_repeat_recent_n"] = recent_n
+        sig["long_repeat_last_dt"] = last_dt
 
     # BTC急騰中 / 急騰直後の追いかけLONGだけ止める
     # ここでは RANGE では発火させない。UP のときだけ見る。
@@ -6638,6 +6644,32 @@ def _long_rank_raw_rescue_penalty(sig: Dict[str, Any]) -> float:
     return float(V2_LONG_RANK_RAW_RESCUE_PENALTY) if s in {"1", "true", "yes", "on"} else 0.0
 
 
+def _long_repeat_rank_penalty(sig: Dict[str, Any]) -> Tuple[float, int, str]:
+    """
+    同一銘柄LONG連打を hard block ではなく rank penalty で扱う。
+    直近通知済みLONG件数を見て、閾値超過なら penalty を返す。
+    """
+    if not V2_LONG_REPEAT_PENALTY_ENABLE:
+        return 0.0, 0, ""
+
+    try:
+        sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+        if not sym:
+            return 0.0, 0, ""
+
+        repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
+        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+
+        if recent_n > int(V2_LONG_REPEAT_PENALTY_MIN_COUNT):
+            return float(V2_LONG_REPEAT_PENALTY_VALUE), recent_n, last_dt
+
+        return 0.0, recent_n, last_dt
+
+    except Exception:
+        return 0.0, 0, ""
+
+
 def _long_rank_blend_score(sig: Dict[str, Any]) -> float:
     score = 0.0
 
@@ -6690,6 +6722,13 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
                 penalty += float(V2_LONG_RANK_P3_WEAK_PENALTY)
             elif str(t).startswith("bad_hour:"):
                 penalty += float(V2_LONG_RANK_BAD_HOUR_PENALTY)
+
+        repeat_penalty, repeat_recent_n, repeat_last_dt = _long_repeat_rank_penalty(sig)
+        penalty += float(repeat_penalty)
+
+        sig["long_repeat_recent_n"] = int(repeat_recent_n)
+        sig["long_repeat_last_dt"] = str(repeat_last_dt or "")
+        sig["long_repeat_penalty"] = float(repeat_penalty)
 
         if not V2_LONG_RANK_BLEND_ENABLE:
             return float(base_ai - penalty)
@@ -6779,6 +6818,9 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
                 f"top_n={effective_top_n};selected=true;rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('long_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('long_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('long_repeat_last_dt', '') or '')};"
                 f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
                 f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
                 f"brake_reason={brake.get('reason', '')}"
@@ -6794,6 +6836,9 @@ def rank_and_select_long(long_signals: List[Dict[str, Any]]) -> List[Dict[str, A
             sig["ai_note"] = (
                 f"{current_note};rank={rank_idx};slot_total={slot_total};"
                 f"top_n={effective_top_n};selected=false;rank_score={rank_score:.6f};reason={reject_reason};"
+                f"repeat_recent_n={int(sig.get('long_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('long_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('long_repeat_last_dt', '') or '')};"
                 f"brake_mode={brake_mode};brake_wr={wr_str};brake_pnl={pnl_str};"
                 f"brake_n={int(brake.get('n', 0) or 0)};brake_slots={slot_list};"
                 f"brake_reason={brake.get('reason', '')}"
