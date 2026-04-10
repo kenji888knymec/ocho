@@ -732,10 +732,10 @@ def _invalidate_sheet_caches(sheet_name: str):
 # ==========================================
 # 便利関数
 # ==========================================
-def send_discord_message(text: str):
+def send_discord_message(text: str) -> Tuple[bool, str]:
     if (not discord_webhook_url) or ("ここに" in discord_webhook_url):
         print("[DBG] discord webhook url empty or placeholder")
-        return
+        return False, "webhook_empty"
 
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
     for chunk in chunks:
@@ -744,8 +744,12 @@ def send_discord_message(text: str):
             print(f"[DBG] discord status={r.status_code}")
             if r.status_code >= 300:
                 print(f"[DBG] discord body={r.text[:200]}")
+                return False, f"http_{r.status_code}"
         except Exception as e:
             print(f"[ERR] discord webhook post: {e}")
+            return False, f"exception:{type(e).__name__}"
+
+    return True, "ok"
 
 
 def send_daily_discord_message(text: str):
@@ -2243,8 +2247,9 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
             )
             continue
 
-        try:
-            send_discord_message(msg)
+        ok, send_reason = send_discord_message(msg)
+
+        if ok:
             last_alert_records[key] = now_ts
             sent += 1
 
@@ -2252,7 +2257,7 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
             sig["_notified_at_jst"] = now_jst_str
 
             cur_note = str(sig.get("ai_note", "") or "")
-            add_note = f"notify_sent=1;notified_at_jst={now_jst_str}"
+            add_note = f"notify_sent=1;notified_at_jst={now_jst_str};notify_send_reason=ok"
             sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
 
             print(
@@ -2261,11 +2266,18 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
                 f"direction={sig.get('direction', '')} "
                 f"key={key}"
             )
-        except Exception as e:
+        else:
             cur_note = str(sig.get("ai_note", "") or "")
-            add_note = f"notify_sent=0;notify_send_reason=send_error:{type(e).__name__}"
+            add_note = f"notify_sent=0;notify_send_reason={send_reason}"
             sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-            print(f"[WARN] send_v2_live_discord_alerts failed: {type(e).__name__}: {e}")
+
+            print(
+                f"[WARN] send_v2_live_discord_alerts not sent "
+                f"symbol={sig.get('symbol', '')} "
+                f"direction={sig.get('direction', '')} "
+                f"key={key} "
+                f"reason={send_reason}"
+            )
 
     return sent, runtime_dedup_skipped
 
@@ -4350,7 +4362,7 @@ V2_REGIME_POLICY_ENABLE         = str(os.environ.get("V2_REGIME_POLICY_ENABLE", 
 V2_REGIME_SHORT_MODE            = str(os.environ.get("V2_REGIME_SHORT_MODE", "DOWN")).strip().upper()
 V2_REGIME_LONG_MODE             = str(os.environ.get("V2_REGIME_LONG_MODE", "UP")).strip().upper()
 V2_REGIME_LOOKBACK_HOURS        = int(float(os.environ.get("V2_REGIME_LOOKBACK_HOURS", "72")))
-V2_REGIME_MIN_DONE              = int(float(os.environ.get("V2_REGIME_MIN_DONE", "20")))
+V2_REGIME_MIN_DONE              = int(float(os.environ.get("V2_REGIME_MIN_DONE", "10")))
 V2_REGIME_MIN_UPLIFT_WINRATE    = _env_float("V2_REGIME_MIN_UPLIFT_WINRATE", 0.03)
 V2_REGIME_MIN_UPLIFT_PNL        = _env_float("V2_REGIME_MIN_UPLIFT_PNL", 0.0)
 
