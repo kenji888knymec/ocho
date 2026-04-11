@@ -4113,6 +4113,12 @@ V2_SHORT_PUSH_ALLOWED_HOURS = {
     if str(x).strip()
 }
 
+V2_SHORT_NOTIFY_BLOCK_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_SHORT_NOTIFY_BLOCK_HOURS", "")).split(",")
+    if str(x).strip()
+}
+
 V2_SHORT_BUCKET_BTC_MODES = {
     s.strip().upper()
     for s in str(os.environ.get("V2_SHORT_BUCKET_BTC_MODES", "DOWN,RANGE")).split(",")
@@ -4151,6 +4157,13 @@ V2_LONG_ALLOWED_HOURS = {
     for x in str(os.environ.get("V2_LONG_ALLOWED_HOURS", "11,12,13,14,19,20")).split(",")
     if str(x).strip()
 }
+
+V2_LONG_NOTIFY_BLOCK_HOURS = {
+    int(float(x.strip()))
+    for x in str(os.environ.get("V2_LONG_NOTIFY_BLOCK_HOURS", "")).split(",")
+    if str(x).strip()
+}
+
 V2_LONG_BUCKET_P1_MIN  = _env_float("V2_LONG_BUCKET_P1_MIN", 2.0)
 V2_LONG_BUCKET_P1_MAX  = _env_float("V2_LONG_BUCKET_P1_MAX", 2.5)
 V2_LONG_BUCKET_RSI_MIN = _env_float("V2_LONG_BUCKET_RSI_MIN", 40.0)
@@ -6421,10 +6434,14 @@ def _long_notify_gate(sig: Dict[str, Any]) -> Tuple[bool, str]:
     rsi = _safe_float_or_nan(sig.get("rsi"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     p3 = _safe_float_or_nan(sig.get("p3_score"))
+    research_tags = set(_get_long_research_tags(sig))
 
     block_syms = {s.strip().upper() for s in V2_LONG_NOTIFY_GATE_BLOCK_SYMBOLS if str(s).strip()}
     if sym in block_syms:
         return False, f"notify_gate_symbol_block sym={sym}"
+
+    if "LONG_DANGER_RSI70" in research_tags or "LONG_DANGER_RANGE" in research_tags:
+        return False, f"notify_gate_danger_tag tags={sorted(research_tags)}"
 
     if mode == "RANGE" and V2_LONG_NOTIFY_GATE_RANGE_ENABLE:
         thin_allow_syms_gate = {s.strip().upper() for s in V2_LONG_RANGE_RESCUE_THIN_ALLOW_SYMBOLS if str(s).strip()}
@@ -8373,6 +8390,8 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
         side = str(sig.get("direction", "")).strip().upper()
         mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
         ai_pass = str(sig.get("ai_pass", "")).strip()
+        sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+        hour = _sig_hour_jst(sig)
 
         notify_pass = "0"
         notify_reason = "init"
@@ -8380,63 +8399,83 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
         if ai_pass != "1":
             notify_pass = "0"
             notify_reason = "ai_pass_0"
-        elif not V2_REGIME_POLICY_ENABLE:
-            notify_pass = "1"
-            notify_reason = "regime_policy_disabled"
         elif side not in {"SHORT", "LONG"}:
             notify_pass = "0"
             notify_reason = "unsupported_side"
         else:
-            side_policy = snapshot.get(side, {}) or {}
-            target_mode = str(side_policy.get("target_mode", "") or "").strip().upper()
-            enabled = bool(side_policy.get("enabled", False))
-            reason = str(side_policy.get("reason", "") or "")
-
-            long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
-            short_raw_rescue = str(sig.get("short_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
-            long_rank_pos = int(float(sig.get("_long_rank_pos", 9999) or 9999))
-
-            if mode != target_mode:
-                if side == "LONG" and long_raw_rescue and str(mode).upper() in {"DOWN", "RANGE"}:
-                    hour = _get_long_sig_hour(sig)
-                    blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
-
-                    if guard_state.get("mode") == "STOP":
-                        notify_pass = "0"
-                        notify_reason = f"guardrail_stop:{guard_state.get('reason', '')}"
-                    elif hour is not None and hour in blocked_hours:
-                        notify_pass = "0"
-                        notify_reason = f"long_rescue_blocked_bad_hour:{hour}"
-                    else:
-                        eff_top_n = int(guard_state.get("effective_down_top_n", V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N))
-                        if eff_top_n <= 0:
-                            notify_pass = "0"
-                            notify_reason = f"guardrail_top_n_zero:{guard_state.get('reason', '')}"
-                        elif long_rank_pos > eff_top_n:
-                            notify_pass = "0"
-                            notify_reason = (
-                                f"long_rescue_rank_cut:rank={long_rank_pos}>{eff_top_n};"
-                                f"guard={guard_state.get('mode', 'NORMAL')}"
-                            )
-                        else:
-                            notify_pass = "1"
-                            notify_reason = (
-                                f"notify_enabled_by_long_rescue:{mode}!={target_mode};"
-                                f"rank={long_rank_pos};"
-                                f"guard={guard_state.get('mode', 'NORMAL')}"
-                            )
-                elif side == "SHORT" and short_raw_rescue and str(mode).upper() in {"UP", "RANGE"}:
-                    notify_pass = "1"
-                    notify_reason = f"notify_enabled_by_short_rescue:{mode}!={target_mode}"
-                else:
-                    notify_pass = "0"
-                    notify_reason = f"mode_mismatch:{mode}!={target_mode}"
-            elif not enabled:
+            if side == "LONG" and hour is not None and hour in V2_LONG_NOTIFY_BLOCK_HOURS:
                 notify_pass = "0"
-                notify_reason = f"regime_off:{reason}"
-            else:
+                notify_reason = f"long_notify_block_hour:{hour}"
+            elif side == "SHORT" and hour is not None and hour in V2_SHORT_NOTIFY_BLOCK_HOURS:
+                notify_pass = "0"
+                notify_reason = f"short_notify_block_hour:{hour}"
+            elif side == "LONG" and V2_LONG_REPEAT_BLOCK_ENABLE and sym:
+                repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
+                recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+                if recent_n >= int(V2_LONG_REPEAT_MAX_NOTIFIES):
+                    notify_pass = "0"
+                    notify_reason = (
+                        f"long_repeat_hard_block:sym={sym};"
+                        f"recent_n={recent_n};"
+                        f"window_min={int(V2_LONG_REPEAT_WINDOW_MINUTES)}"
+                    )
+
+            if notify_reason != "init":
+                pass
+            elif not V2_REGIME_POLICY_ENABLE:
                 notify_pass = "1"
-                notify_reason = "notify_enabled"
+                notify_reason = "regime_policy_disabled"
+            else:
+                side_policy = snapshot.get(side, {}) or {}
+                target_mode = str(side_policy.get("target_mode", "") or "").strip().upper()
+                enabled = bool(side_policy.get("enabled", False))
+                reason = str(side_policy.get("reason", "") or "")
+
+                long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+                short_raw_rescue = str(sig.get("short_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
+                long_rank_pos = int(float(sig.get("_long_rank_pos", 9999) or 9999))
+
+                if mode != target_mode:
+                    if side == "LONG" and long_raw_rescue and str(mode).upper() in {"DOWN", "RANGE"}:
+                        rescue_hour = _get_long_sig_hour(sig)
+                        blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
+
+                        if guard_state.get("mode") == "STOP":
+                            notify_pass = "0"
+                            notify_reason = f"guardrail_stop:{guard_state.get('reason', '')}"
+                        elif rescue_hour is not None and rescue_hour in blocked_hours:
+                            notify_pass = "0"
+                            notify_reason = f"long_rescue_blocked_bad_hour:{rescue_hour}"
+                        else:
+                            eff_top_n = int(guard_state.get("effective_down_top_n", V2_LONG_RESCUE_NOTIFY_DOWN_TOP_N))
+                            if eff_top_n <= 0:
+                                notify_pass = "0"
+                                notify_reason = f"guardrail_top_n_zero:{guard_state.get('reason', '')}"
+                            elif long_rank_pos > eff_top_n:
+                                notify_pass = "0"
+                                notify_reason = (
+                                    f"long_rescue_rank_cut:rank={long_rank_pos}>{eff_top_n};"
+                                    f"guard={guard_state.get('mode', 'NORMAL')}"
+                                )
+                            else:
+                                notify_pass = "1"
+                                notify_reason = (
+                                    f"notify_enabled_by_long_rescue:{mode}!={target_mode};"
+                                    f"rank={long_rank_pos};"
+                                    f"guard={guard_state.get('mode', 'NORMAL')}"
+                                )
+                    elif side == "SHORT" and short_raw_rescue and str(mode).upper() in {"UP", "RANGE"}:
+                        notify_pass = "1"
+                        notify_reason = f"notify_enabled_by_short_rescue:{mode}!={target_mode}"
+                    else:
+                        notify_pass = "0"
+                        notify_reason = f"mode_mismatch:{mode}!={target_mode}"
+                elif not enabled:
+                    notify_pass = "0"
+                    notify_reason = f"regime_off:{reason}"
+                else:
+                    notify_pass = "1"
+                    notify_reason = "notify_enabled"
 
         sig["_notify_pass"] = notify_pass
         sig["_notify_reason"] = notify_reason
