@@ -4130,9 +4130,10 @@ V2_SHORT_BUCKET_RSI_MIN      = _env_float("V2_SHORT_BUCKET_RSI_MIN", 30.0)
 V2_SHORT_BUCKET_RSI_MAX      = _env_float("V2_SHORT_BUCKET_RSI_MAX", 50.0)
 V2_SHORT_BUCKET_P2_MIN       = _env_float("V2_SHORT_BUCKET_P2_MIN", -0.30)
 V2_SHORT_STRONG_P2_MIN       = _env_float("V2_SHORT_STRONG_P2_MIN", 0.0)
-V2_SHORT_STRONG_VOLRATIO_MIN = _env_float("V2_SHORT_STRONG_VOLRATIO_MIN", 1.2)
-V2_SHORT_GOOD_HOUR_AI_TH     = _env_float("V2_SHORT_GOOD_HOUR_AI_TH", 0.15)
-V2_SHORT_STRONG_AI_TH        = _env_float("V2_SHORT_STRONG_AI_TH", 0.10)
+V2_SHORT_STRONG_VOLRATIO_MIN = _env_float("V2_SHORT_STRONG_VOLRATIO_MIN", 1.0)
+V2_SHORT_STRONG_VOLRATIO_MAX = _env_float("V2_SHORT_STRONG_VOLRATIO_MAX", 1.5)
+V2_SHORT_GOOD_HOUR_AI_TH     = _env_float("V2_SHORT_GOOD_HOUR_AI_TH", 0.25)
+V2_SHORT_STRONG_AI_TH        = _env_float("V2_SHORT_STRONG_AI_TH", 0.25)
 
 # --- V2 SHORT Training Filters ---
 V2_SHORT_TRAIN_REQUIRE_VOLCONF     = str(os.environ.get("V2_SHORT_TRAIN_REQUIRE_VOLCONF", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -5322,6 +5323,31 @@ def _sig_hour_jst(sig: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _get_short_ai_score(sig: Dict[str, Any]) -> float:
+    """sig から SHORT AI スコアを取得する。見つからなければ nan を返す。"""
+    cand_keys = ["ai_score", "ai_proba_used", "ai_proba", "proba_used",
+                 "market_ai_score", "short_ai_score", "score_used"]
+    for key in cand_keys:
+        try:
+            v = sig.get(key, np.nan)
+            fv = float(v)
+            if np.isfinite(fv):
+                return float(fv)
+        except Exception:
+            pass
+    dbg = sig.get("ai_debug", None)
+    if isinstance(dbg, dict):
+        for key in ("short_ai_score", "proba_used", "score_used", "chosen_score"):
+            try:
+                v = dbg.get(key, np.nan)
+                fv = float(v)
+                if np.isfinite(fv):
+                    return float(fv)
+            except Exception:
+                pass
+    return float("nan")
+
+
 def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
@@ -5341,9 +5367,14 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
         return False
     if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
         return False
-    if not (float(V2_SHORT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_SHORT_BUCKET_RSI_MAX)):
+    # RSI sweet band (広帯を外し、勝率の高い 40-55 帯のみ通す)
+    if not (float(V2_SHORT_RSI_SWEET_MIN) <= float(rsi) < float(V2_SHORT_RSI_SWEET_MAX)):
         return False
-    if float(p2) < float(V2_SHORT_BUCKET_P2_MIN):
+    if float(p2) < max(0.0, float(V2_SHORT_BUCKET_P2_MIN)):
+        return False
+    # AI スコア hard gate (値がない場合は通す)
+    ai_score = _get_short_ai_score(sig)
+    if np.isfinite(ai_score) and float(ai_score) < float(SHORT_AI_TH):
         return False
     return True
 
@@ -5378,14 +5409,25 @@ def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
     if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
         return False
 
-    if not (float(V2_SHORT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_SHORT_BUCKET_RSI_MAX)):
+    # RSI sweet band (広帯を外し、勝率の高い 40-55 帯のみ通す)
+    if not (float(V2_SHORT_RSI_SWEET_MIN) <= float(rsi) < float(V2_SHORT_RSI_SWEET_MAX)):
         return False
 
     if float(p2) < float(V2_SHORT_STRONG_P2_MIN):
         return False
 
+    # volratio: 下限 + 上限 (過熱ゾーンも弾く)
     if float(volratio) < float(V2_SHORT_STRONG_VOLRATIO_MIN):
         return False
+    if float(volratio) > float(V2_SHORT_STRONG_VOLRATIO_MAX):
+        return False
+
+    # AI スコア hard gate: max(SHORT_AI_TH, V2_SHORT_STRONG_AI_TH) (値がない場合は通す)
+    ai_score = _get_short_ai_score(sig)
+    if np.isfinite(ai_score):
+        ai_th = max(float(SHORT_AI_TH), float(V2_SHORT_STRONG_AI_TH))
+        if float(ai_score) < ai_th:
+            return False
 
     return True
 
