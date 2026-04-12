@@ -2442,6 +2442,75 @@ def _watch_hours_csv(hours: Set[int]) -> str:
     return ",".join(str(int(x)) for x in sorted(hours))
 
 
+def _watch_mode_label(mode: str) -> str:
+    mode = str(mode or "").strip().upper()
+    if mode == "UP":
+        return "上向き"
+    if mode == "DOWN":
+        return "下向き"
+    if mode == "RANGE":
+        return "横ばい"
+    return "不明"
+
+
+def _watch_side_label(side: str) -> str:
+    side = str(side or "").strip().upper()
+    if side == "LONG":
+        return "買い方向"
+    if side == "SHORT":
+        return "売り方向"
+    return "方向不明"
+
+
+def _watch_hours_human(hours_csv: str) -> str:
+    text = str(hours_csv or "").strip()
+    if not text:
+        return ""
+    parts = [x.strip() for x in text.split(",") if x.strip()]
+    if not parts:
+        return ""
+    return " / ".join(f"{p}時台" for p in parts)
+
+
+def _watch_warning_label(w: str) -> str:
+    s = str(w or "").strip()
+    if s == "vol_shock":
+        return "出来高が急増"
+    if s == "reversal":
+        return "反転の危険"
+    if s == "急騰直後":
+        return "急騰の直後"
+    if s == "急落直後":
+        return "急落の直後"
+    if s.startswith("RSI帯外("):
+        return s.replace("RSI帯外", "RSIが基準外")
+    if s.startswith("VolR高すぎ("):
+        return s.replace("VolR高すぎ", "出来高比が高すぎ")
+    if s.startswith("通知block("):
+        return "通知しない時間帯"
+    if s == "直近重複":
+        return "直近に同じ通知あり"
+    return s
+
+
+def _watch_scenario_text(side: str, btc_mode: str) -> str:
+    side = str(side or "").strip().upper()
+    btc_mode = str(btc_mode or "").strip().upper()
+
+    if side == "LONG":
+        if btc_mode == "UP":
+            return "このまま上がる流れなら、買いシグナル候補"
+        if btc_mode == "RANGE":
+            return "上に抜けたら、買いシグナル候補"
+        return "下げ中なので、買いはまだ様子見"
+    else:
+        if btc_mode == "DOWN":
+            return "このまま下がる流れなら、売りシグナル候補"
+        if btc_mode == "RANGE":
+            return "横ばいが続くなら、売りシグナル候補"
+        return "上げ中なので、売りはまだ様子見"
+
+
 def _build_v2_watch_message(sig: Dict[str, Any]) -> Tuple[str, str, int]:
     """
     エントリー通知とは別に送る、情報通知専用メッセージ。
@@ -2477,25 +2546,13 @@ def _build_v2_watch_message(sig: Dict[str, Any]) -> Tuple[str, str, int]:
         if _is_long_reversal_accident(sig):
             risk_tags.append("reversal")
         allowed_hours = _watch_hours_csv(V2_LONG_ALLOWED_HOURS)
-
-        if btc_mode == "UP":
-            scenario = "UP継続ならLONG監視"
-        elif btc_mode == "RANGE":
-            scenario = "RANGE上抜けでLONG再評価"
-        else:
-            scenario = "DOWN中はLONG見送り寄り"
+        scenario = _watch_scenario_text(side, btc_mode)
 
     else:
         if _is_btc_dump_after_short(sig):
             risk_tags.append("急落直後")
         allowed_hours = _watch_hours_csv(V2_SHORT_ALLOWED_HOURS)
-
-        if btc_mode == "RANGE":
-            scenario = "RANGE維持ならSHORT監視"
-        elif btc_mode == "DOWN":
-            scenario = "DOWN継続ならSHORT監視"
-        else:
-            scenario = "UP中はSHORT見送り寄り"
+        scenario = _watch_scenario_text(side, btc_mode)
 
     if _is_vol_shock_context(sig):
         risk_tags.append("vol_shock")
@@ -2537,18 +2594,25 @@ def _build_v2_watch_message(sig: Dict[str, Any]) -> Tuple[str, str, int]:
 
     score_disp = "" if not np.isfinite(score) else f"{score:.2f}"
     ai_disp = "" if not np.isfinite(ai_prob) else f"{ai_prob:.1%}"
-    warning_disp = "なし" if not warnings else " / ".join(warnings)
+
+    warning_disp = "なし"
+    if warnings:
+        warning_disp = " / ".join(_watch_warning_label(x) for x in warnings)
+
+    mode_disp = _watch_mode_label(btc_mode)
+    side_disp = _watch_side_label(side)
+    allowed_hours_disp = _watch_hours_human(allowed_hours)
 
     lines = [
         title,
-        f"💎 {symbol} ({side})" if symbol else "",
+        f"💎 {symbol}（{side_disp}）" if symbol else "",
         f"🕒 {dt_str}" if dt_str else "",
-        f"🟦 BTC mode: {btc_mode or 'N/A'}",
-        f"📈 Score: {score_disp}" if score_disp else "",
-        f"🤖 AI: {ai_disp}" if ai_disp else "",
-        f"📍 許可時間: {allowed_hours}" if allowed_hours else "",
-        f"🧭 シナリオ: {scenario}",
-        f"⛔ 見送りサイン: {warning_disp}",
+        f"🟦 BTCの流れ: {mode_disp}",
+        f"📈 総合点: {score_disp}" if score_disp else "",
+        f"🤖 AIの目安: {ai_disp}" if ai_disp else "",
+        f"📍 通常シグナル時間: {allowed_hours_disp}" if allowed_hours_disp else "",
+        f"🧭 想定: {scenario}",
+        f"⛔ 今は見送り候補: {warning_disp}",
     ]
     return "\n".join([x for x in lines if x]), kind, priority
 
@@ -9787,6 +9851,26 @@ def _summarize_simple(sub: pd.DataFrame, label: str, emoji: str = "📌") -> str
     return f"{emoji} {label}: {n}件 / 勝率 {wr_str} / 平均 {pnl_str}"
 
 
+def _fmt_report_wr(v: Any) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "N/A"
+        return f"{x:.1f}%"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_report_avg_pnl(v: Any) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "N/A"
+        return f"{x:+.2f}%"
+    except Exception:
+        return "N/A"
+
+
 def _build_symbol_ranking_lines(
     df: pd.DataFrame,
     title: str,
@@ -9834,15 +9918,23 @@ def _build_symbol_ranking_lines(
 
     rank_df = pd.DataFrame(rows)
 
+    wr_has_value = bool(np.isfinite(rank_df["wr"]).any()) if "wr" in rank_df.columns else False
+    pnl_has_value = bool(np.isfinite(rank_df["avg_pnl"]).any()) if "avg_pnl" in rank_df.columns else False
+    if (not wr_has_value) and (not pnl_has_value):
+        lines.append("・まだ判定未了のため集計保留")
+        return lines
+
     if sort_bad:
         rank_df = rank_df.sort_values(
             ["avg_pnl", "wr", "n"],
             ascending=[True, True, False],
+            na_position="last",
         ).head(int(top_n))
     else:
         rank_df = rank_df.sort_values(
             ["avg_pnl", "wr", "n"],
             ascending=[False, False, False],
+            na_position="last",
         ).head(int(top_n))
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -9850,7 +9942,7 @@ def _build_symbol_ranking_lines(
     for i, row in enumerate(rank_df.itertuples(index=False), start=1):
         medal = medals[i - 1] if i - 1 < len(medals) else f"{i}."
         lines.append(
-            f"{medal} {row.symbol}: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+            f"{medal} {row.symbol}: {row.n}件 / 勝率 {_fmt_report_wr(row.wr)} / 平均 {_fmt_report_avg_pnl(row.avg_pnl)}"
         )
 
     return lines
@@ -9958,14 +10050,23 @@ def _build_hour_ranking_lines(
         lines.append("・対象なし")
         return lines
 
-    rank_df = pd.DataFrame(rows).sort_values(
+    rank_df = pd.DataFrame(rows)
+
+    wr_has_value = bool(np.isfinite(rank_df["wr"]).any()) if "wr" in rank_df.columns else False
+    pnl_has_value = bool(np.isfinite(rank_df["avg_pnl"]).any()) if "avg_pnl" in rank_df.columns else False
+    if (not wr_has_value) and (not pnl_has_value):
+        lines.append("・まだ判定未了のため集計保留")
+        return lines
+
+    rank_df = rank_df.sort_values(
         ["avg_pnl", "wr", "n"],
         ascending=[False, False, False],
+        na_position="last",
     ).head(int(top_n))
 
     for row in rank_df.itertuples(index=False):
         lines.append(
-            f"・{int(row.hour):02d}時: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+            f"・{int(row.hour):02d}時: {row.n}件 / 勝率 {_fmt_report_wr(row.wr)} / 平均 {_fmt_report_avg_pnl(row.avg_pnl)}"
         )
 
     return lines
