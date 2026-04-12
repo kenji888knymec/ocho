@@ -5724,9 +5724,22 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not fr_ok:
         return False, "fr_unavailable"
 
-    bucket_ok, bucket_reason = _check_short_win_bucket(sig)
-    if not bucket_ok:
-        return False, bucket_reason
+    short_core_ok = _is_short_win_bucket(sig)
+    short_push_ok = _is_short_strong_hour_bucket(sig)
+
+    if not short_core_ok:
+        if V2_SHORT_PAUSE_ALLOW_STRONG_BUCKET and short_push_ok:
+            pass
+        else:
+            return False, (
+                f"short_bucket_miss "
+                f"p1={p1:.4f} "
+                f"p2={p2:.4f} "
+                f"rsi={rsi:.4f} "
+                f"hour={hour} "
+                f"btc_mode={btc_mode_compat} "
+                f"fr_ok={fr_ok}"
+            )
 
     return True, "pass"
 
