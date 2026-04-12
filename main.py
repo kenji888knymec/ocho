@@ -9851,6 +9851,26 @@ def _summarize_simple(sub: pd.DataFrame, label: str, emoji: str = "📌") -> str
     return f"{emoji} {label}: {n}件 / 勝率 {wr_str} / 平均 {pnl_str}"
 
 
+def _fmt_report_wr(v: Any) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "N/A"
+        return f"{x:.1f}%"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_report_avg_pnl(v: Any) -> str:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return "N/A"
+        return f"{x:+.2f}%"
+    except Exception:
+        return "N/A"
+
+
 def _build_symbol_ranking_lines(
     df: pd.DataFrame,
     title: str,
@@ -9898,15 +9918,23 @@ def _build_symbol_ranking_lines(
 
     rank_df = pd.DataFrame(rows)
 
+    wr_has_value = bool(np.isfinite(rank_df["wr"]).any()) if "wr" in rank_df.columns else False
+    pnl_has_value = bool(np.isfinite(rank_df["avg_pnl"]).any()) if "avg_pnl" in rank_df.columns else False
+    if (not wr_has_value) and (not pnl_has_value):
+        lines.append("・まだ判定未了のため集計保留")
+        return lines
+
     if sort_bad:
         rank_df = rank_df.sort_values(
             ["avg_pnl", "wr", "n"],
             ascending=[True, True, False],
+            na_position="last",
         ).head(int(top_n))
     else:
         rank_df = rank_df.sort_values(
             ["avg_pnl", "wr", "n"],
             ascending=[False, False, False],
+            na_position="last",
         ).head(int(top_n))
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -9914,7 +9942,7 @@ def _build_symbol_ranking_lines(
     for i, row in enumerate(rank_df.itertuples(index=False), start=1):
         medal = medals[i - 1] if i - 1 < len(medals) else f"{i}."
         lines.append(
-            f"{medal} {row.symbol}: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+            f"{medal} {row.symbol}: {row.n}件 / 勝率 {_fmt_report_wr(row.wr)} / 平均 {_fmt_report_avg_pnl(row.avg_pnl)}"
         )
 
     return lines
@@ -10022,14 +10050,23 @@ def _build_hour_ranking_lines(
         lines.append("・対象なし")
         return lines
 
-    rank_df = pd.DataFrame(rows).sort_values(
+    rank_df = pd.DataFrame(rows)
+
+    wr_has_value = bool(np.isfinite(rank_df["wr"]).any()) if "wr" in rank_df.columns else False
+    pnl_has_value = bool(np.isfinite(rank_df["avg_pnl"]).any()) if "avg_pnl" in rank_df.columns else False
+    if (not wr_has_value) and (not pnl_has_value):
+        lines.append("・まだ判定未了のため集計保留")
+        return lines
+
+    rank_df = rank_df.sort_values(
         ["avg_pnl", "wr", "n"],
         ascending=[False, False, False],
+        na_position="last",
     ).head(int(top_n))
 
     for row in rank_df.itertuples(index=False):
         lines.append(
-            f"・{int(row.hour):02d}時: {row.n}件 / 勝率 {row.wr:.1f}% / 平均 {row.avg_pnl:+.2f}%"
+            f"・{int(row.hour):02d}時: {row.n}件 / 勝率 {_fmt_report_wr(row.wr)} / 平均 {_fmt_report_avg_pnl(row.avg_pnl)}"
         )
 
     return lines
