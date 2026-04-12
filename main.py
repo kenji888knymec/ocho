@@ -2188,6 +2188,105 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     return "\n".join([x for x in lines if x])
 
 
+def _audit_float(v: Any) -> float:
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _audit_ok_text(ok: bool) -> str:
+    return "OK" if ok else "注意"
+
+
+def _build_signal_audit_block(item: Dict[str, Any]) -> str:
+    is_long = bool(item.get("is_buy", False))
+    side = "LONG" if is_long else "SHORT"
+
+    btc_mode = str(item.get("btc_mode", "") or "").strip().upper()
+    ai_score = _audit_float(item.get("ai_score"))
+    ai_th = float(LONG_AI_TH if is_long else SHORT_AI_TH)
+
+    rsi = _audit_float(item.get("rsi"))
+    vol_ratio = _audit_float(item.get("vol_ratio"))
+    btc_1h = _audit_float(item.get("btc_1h_change"))
+    btc_15m = _audit_float(item.get("btc_ret"))
+    p1 = _audit_float(item.get("p1_score"))
+
+    if is_long:
+        btc_mode_ok = (btc_mode == "UP")
+    else:
+        btc_mode_ok = btc_mode in ("RANGE", "DOWN")
+
+    ai_ok = (not np.isfinite(ai_score)) or (ai_score >= ai_th)
+
+    risk_tags: List[str] = []
+
+    if is_long:
+        if np.isfinite(btc_1h) and np.isfinite(rsi) and np.isfinite(p1):
+            if (
+                btc_1h >= float(BTC_SURGE_LONG_PAUSE_1H_MIN)
+                and rsi >= float(BTC_SURGE_LONG_PAUSE_RSI_MIN)
+                and p1 >= float(BTC_SURGE_LONG_PAUSE_P1_MIN)
+            ):
+                risk_tags.append("急騰直後")
+
+        if np.isfinite(btc_15m) and np.isfinite(btc_1h):
+            if (
+                btc_15m <= float(V2_LONG_REVERSAL_BTC_RET_MAX)
+                and btc_1h >= float(V2_LONG_REVERSAL_BTC_1H_MIN)
+            ):
+                risk_tags.append("reversal")
+    else:
+        if np.isfinite(btc_1h) and btc_1h <= float(V2_INCIDENT_BTC_1H_DUMP_MAX):
+            risk_tags.append("急落直後")
+        if np.isfinite(btc_15m) and btc_15m <= float(V2_INCIDENT_BTC_15M_DUMP_MAX):
+            risk_tags.append("急落直後")
+
+    if np.isfinite(vol_ratio) and vol_ratio >= float(V2_INCIDENT_VOLRATIO_SHOCK_MIN):
+        risk_tags.append("vol_shock")
+
+    risk_tags = list(dict.fromkeys(risk_tags))
+    risk_ok = (len(risk_tags) == 0)
+
+    extreme_parts: List[str] = []
+    extreme_ok = True
+
+    if is_long:
+        if np.isfinite(rsi) and rsi > float(V2_LONG_DEF_RSI_HARD_MAX):
+            extreme_ok = False
+            extreme_parts.append(f"RSI={rsi:.1f}")
+        if np.isfinite(vol_ratio) and vol_ratio >= float(V2_INCIDENT_VOLRATIO_SHOCK_MIN):
+            extreme_ok = False
+            extreme_parts.append(f"VolR={vol_ratio:.2f}")
+    else:
+        if np.isfinite(rsi) and not (
+            float(V2_SHORT_RSI_SWEET_MIN) <= rsi < float(V2_SHORT_RSI_SWEET_MAX)
+        ):
+            extreme_ok = False
+            extreme_parts.append(f"RSI={rsi:.1f}")
+        if np.isfinite(vol_ratio) and vol_ratio > float(V2_SHORT_STRONG_VOLRATIO_MAX):
+            extreme_ok = False
+            extreme_parts.append(f"VolR={vol_ratio:.2f}")
+
+    ai_disp = "N/A" if not np.isfinite(ai_score) else f"{ai_score:.1%}"
+    risk_disp = "なし" if risk_ok else ",".join(risk_tags)
+    extreme_disp = "なし" if extreme_ok else ", ".join(extreme_parts)
+
+    review_needed = not (btc_mode_ok and ai_ok and risk_ok and extreme_ok)
+    final_disp = "人間確認推奨" if review_needed else "自動候補OK"
+
+    return (
+        "🔎 監査\n"
+        f"・BTC mode: {_audit_ok_text(btc_mode_ok)} ({btc_mode or 'N/A'})\n"
+        f"・AI: {_audit_ok_text(ai_ok)} ({ai_disp} / TH {ai_th:.1%})\n"
+        f"・危険タグ: {_audit_ok_text(risk_ok)} ({risk_disp})\n"
+        f"・極端値: {_audit_ok_text(extreme_ok)} ({extreme_disp})\n"
+        f"・判定: {final_disp}"
+    )
+
+
 def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tuple[int, int]:
     """
     V2 の notify_pass=1 候補を Discord に送る。
@@ -12041,6 +12140,8 @@ def logic_main(force: bool = False):
             btc_1h_disp = "N/A"
         btc_calm_disp = bool(item.get("btc_calm", BTC_CALM))
 
+        audit_block = _build_signal_audit_block(item)
+
         msg = (
             f"{icon} **{d_str}** {icon}\n"
             f"{VERSION} [{RULE_VERSION_TAG}]\n"
@@ -12050,7 +12151,9 @@ def logic_main(force: bool = False):
             f"🟦 BTC:{btc_mode_disp} 1h:{btc_1h_disp}  Calm:{btc_calm_disp}  BTC_OK:{btc_ok}\n"
             f"💰 {cp:.4f}\n"
             f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%) HL:{hl_tp_pct:.1f}%\n"
-            f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%"
+            f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%\n"
+            f"\n"
+            f"{audit_block}"
         )
 
         send_discord_message(msg)
