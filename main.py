@@ -4176,6 +4176,11 @@ V2_LONG_ALT_ALLOWED_HOURS = {
     for x in str(os.environ.get("V2_LONG_ALT_ALLOWED_HOURS", "11,12,13,14")).split(",")
     if str(x).strip()
 }
+V2_LONG_ALT_BUCKET_BTC_MODES = {
+    s.strip().upper()
+    for s in str(os.environ.get("V2_LONG_ALT_BUCKET_BTC_MODES", "UP")).split(",")
+    if s.strip()
+}
 V2_LONG_ALT_BUCKET_P1_MIN  = _env_float("V2_LONG_ALT_BUCKET_P1_MIN", 1.3)
 V2_LONG_ALT_BUCKET_P1_MAX  = _env_float("V2_LONG_ALT_BUCKET_P1_MAX", 3.0)
 V2_LONG_ALT_BUCKET_RSI_MIN = _env_float("V2_LONG_ALT_BUCKET_RSI_MIN", 40.0)
@@ -5476,6 +5481,20 @@ def _is_long_alt_win_bucket(sig: Dict[str, Any]) -> bool:
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
     hour = _sig_hour_jst(sig)
+    btc_mode_compat = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+
+    ai_score = np.nan
+    for key in ("long_ai_score", "ai_proba_used", "ai_proba", "proba_used", "score_used"):
+        try:
+            v = sig.get(key, np.nan)
+            fv = float(v)
+            if np.isfinite(fv):
+                ai_score = float(fv)
+                break
+        except Exception:
+            pass
+
+    sig["long_alt_shadow_candidate"] = False
 
     if not V2_LONG_ALT_ENABLE:
         return False
@@ -5499,6 +5518,18 @@ def _is_long_alt_win_bucket(sig: Dict[str, Any]) -> bool:
         return False
 
     if float(p2) < float(V2_LONG_ALT_BUCKET_P2_MIN):
+        return False
+
+    if np.isfinite(ai_score) and float(ai_score) < float(V2_LONG_ALT_AI_TH):
+        return False
+
+    # RANGE はまだ live で通さない。
+    # 条件に合うものだけ shadow 候補として印を付ける。
+    if btc_mode_compat == "RANGE":
+        sig["long_alt_shadow_candidate"] = True
+        return False
+
+    if btc_mode_compat not in V2_LONG_ALT_BUCKET_BTC_MODES:
         return False
 
     return True
@@ -6422,6 +6453,12 @@ def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
             tags.append("LONG_WARN_RSI60")
     if btc_mode_compat == "RANGE":
         tags.append("LONG_DANGER_RANGE")
+
+    shadow_flag = sig.get("long_alt_shadow_candidate", False)
+    shadow_on = bool(shadow_flag) or str(shadow_flag).strip().lower() in ("1", "true", "yes", "on")
+    if shadow_on:
+        tags.append("LONG_ALT_SHADOW_RANGE")
+
     return tags
 
 
