@@ -2087,6 +2087,128 @@ def _resolve_v2_long_fast_brake_runtime(now_jst: datetime) -> Dict[str, Any]:
     return out
 
 
+def _ai_strength_label_from_pct_text(ai_pct_text: str) -> str:
+    """
+    _safe_pct_str() で作った "72.1" のような文字列を受けて、
+    強 / 中 / 弱 を返す。
+    """
+    try:
+        v = float(str(ai_pct_text).replace("%", "").strip())
+    except Exception:
+        return ""
+
+    if v >= 70.0:
+        return "強"
+    if v >= 55.0:
+        return "中"
+    return "弱"
+
+
+def _v2_signal_strength_label(sig: Dict[str, Any]) -> str:
+    total_score = _safe_float_or_nan(sig.get("total_score", sig.get("score", "")))
+    ai_prob = _safe_float_or_nan(sig.get("ai_prob_win", sig.get("ai_proba_used", "")))
+
+    points = 0
+
+    if np.isfinite(total_score):
+        if total_score >= 2.2:
+            points += 2
+        elif total_score >= 1.5:
+            points += 1
+
+    if np.isfinite(ai_prob):
+        if ai_prob >= 0.75:
+            points += 2
+        elif ai_prob >= 0.60:
+            points += 1
+
+    if points >= 3:
+        return "大"
+    if points >= 1:
+        return "中"
+    return "小"
+
+
+def _v2_root_cause_lines(sig: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+
+    p1 = _safe_float_or_nan(sig.get("p1_score", ""))
+    p2 = _safe_float_or_nan(sig.get("p2_score", ""))
+    p3 = _safe_float_or_nan(sig.get("p3_score", ""))
+    rsi = _safe_float_or_nan(sig.get("rsi", ""))
+    vol_ratio = _safe_float_or_nan(sig.get("vol_ratio", ""))
+
+    if direction == "LONG":
+        if np.isfinite(p1) and p1 >= 2.0:
+            lines.append("・15分足の押し目買い形")
+        elif np.isfinite(p1) and p1 >= 1.2:
+            lines.append("・15分足で上方向の形")
+        else:
+            lines.append("・15分足で反発監視の形")
+    elif direction == "SHORT":
+        if np.isfinite(p1) and p1 >= 2.0:
+            lines.append("・15分足の戻り売り形")
+        elif np.isfinite(p1) and p1 >= 1.2:
+            lines.append("・15分足で下方向の形")
+        else:
+            lines.append("・15分足で失速監視の形")
+
+    if direction == "LONG":
+        if btc_mode == "UP":
+            lines.append("・BTC強含み")
+        elif btc_mode == "RANGE":
+            lines.append("・BTCはレンジ内")
+        elif btc_mode == "DOWN":
+            lines.append("・BTC弱含みの中で反発監視")
+    elif direction == "SHORT":
+        if btc_mode == "DOWN":
+            lines.append("・BTC弱含み")
+        elif btc_mode == "RANGE":
+            lines.append("・BTCはレンジ内で上値重い")
+        elif btc_mode == "UP":
+            lines.append("・BTC強含みで逆風あり")
+
+    extra = ""
+
+    if np.isfinite(p3):
+        if p3 > 0:
+            extra = "・出来高増で勢いあり"
+        elif p3 < 0:
+            extra = "・出来高減で上値重い" if direction == "SHORT" else "・出来高減で勢いは弱め"
+
+    if (not extra) and np.isfinite(p2):
+        if p2 > 0:
+            extra = "・資金の追い風あり"
+        elif p2 < 0:
+            extra = "・資金面はやや逆風"
+
+    if (not extra) and np.isfinite(rsi):
+        if direction == "LONG":
+            if rsi < 45:
+                extra = "・RSI低めで戻し余地あり"
+            else:
+                extra = "・RSIは中立〜やや強め"
+        else:
+            if rsi > 55:
+                extra = "・RSI高めで反落警戒"
+            else:
+                extra = "・RSIは中立〜やや弱め"
+
+    if extra:
+        lines.append(extra)
+
+    if np.isfinite(vol_ratio):
+        if vol_ratio >= 1.8:
+            lines.append(f"・出来高比が高い（VolR {vol_ratio:.2f}）")
+        elif vol_ratio <= 0.8:
+            lines.append(f"・出来高比は低め（VolR {vol_ratio:.2f}）")
+
+    return lines[:4]
+
+
 def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     """
     V2 の実運用向けDiscord通知。
@@ -2140,6 +2262,10 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
             sl_lev_pct = ""
 
     ai_prob = _safe_pct_str(sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")), digits=1)
+    ai_strength = _ai_strength_label_from_pct_text(ai_prob) if ai_prob else ""
+    strength = _v2_signal_strength_label(sig)
+    rationale_lines = _v2_root_cause_lines(sig)
+
     recent_symbol = _get_v2_symbol_recent_stats(symbol, direction, lookback_n=20)
     recent_global = _get_v2_global_recent_stats(direction, lookback_n=20)
 
@@ -2174,16 +2300,25 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
 
     lines = [
         f"{side_emoji}【{symbol} {direction}】",
+        f"🏷️ 強さ：{strength}",
         f"💰 Entry: {entry}" if entry else "",
         f"{tp_emoji} TP: {tp_price}" if tp_price else "",
         f"{sl_emoji} SL: {sl_price}" if sl_price else "",
         f"📌 TP入力: {tp_pct}%（x{display_lev}で {tp_lev_pct}%）" if tp_pct else "",
         f"📌 SL入力: {sl_pct}%（x{display_lev}で {sl_lev_pct}%）" if sl_pct else "",
-        f"🤖 AI判定: {ai_prob}%" if ai_prob else "",
-        recent_symbol_line,
-        recent_global_line,
-        f"🕒 {dt_str}" if dt_str else "",
+        f"🤖 AI判定: {ai_prob}%（{ai_strength}）" if ai_prob else "",
     ]
+
+    if rationale_lines:
+        lines.append("📌 根拠")
+        lines.extend(rationale_lines)
+
+    if recent_symbol_line:
+        lines.append(recent_symbol_line)
+    if recent_global_line:
+        lines.append(recent_global_line)
+    if dt_str:
+        lines.append(f"🕒 {dt_str}")
 
     return "\n".join([x for x in lines if x])
 
@@ -2285,6 +2420,186 @@ def _build_signal_audit_block(item: Dict[str, Any]) -> str:
         f"・極端値: {_audit_ok_text(extreme_ok)} ({extreme_disp})\n"
         f"・判定: {final_disp}"
     )
+
+
+def _watch_num(v: Any) -> float:
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _watch_dt_str(sig: Dict[str, Any]) -> str:
+    dt_raw = sig.get("time", "") or sig.get("Datetime_JST", "") or sig.get("dt", "") or ""
+    if hasattr(dt_raw, "strftime"):
+        return dt_raw.strftime("%Y-%m-%d %H:%M:%S")
+    dt_str = str(dt_raw).strip()
+    return normalize_dt_str(dt_str) if dt_str else ""
+
+
+def _watch_hours_csv(hours: Set[int]) -> str:
+    return ",".join(str(int(x)) for x in sorted(hours))
+
+
+def _build_v2_watch_message(sig: Dict[str, Any]) -> Tuple[str, str, int]:
+    """
+    エントリー通知とは別に送る、情報通知専用メッセージ。
+    戻り値:
+      (message, kind, priority)
+
+    kind:
+      abnormal / warning / scenario
+    priority:
+      小さいほど優先送信
+    """
+    if str(sig.get("_notify_pass", "0")) == "1":
+        return "", "", 99
+
+    symbol = str(sig.get("symbol", "") or "").strip().upper()
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    side = direction if direction in {"LONG", "SHORT"} else "UNKNOWN"
+
+    dt_str = _watch_dt_str(sig)
+    score = _watch_num(sig.get("total_score", sig.get("score", "")))
+    ai_prob = _watch_num(sig.get("ai_prob_win", sig.get("ai_proba_used", "")))
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    rsi = _watch_num(sig.get("rsi", ""))
+    vol_ratio = _watch_num(sig.get("vol_ratio", ""))
+    notify_reason = str(sig.get("_notify_reason", "") or "")
+    ai_note = str(sig.get("ai_note", "") or "")
+
+    risk_tags: List[str] = []
+
+    if side == "LONG":
+        if _is_btc_surge_after_long(sig):
+            risk_tags.append("急騰直後")
+        if _is_long_reversal_accident(sig):
+            risk_tags.append("reversal")
+        allowed_hours = _watch_hours_csv(V2_LONG_ALLOWED_HOURS)
+
+        if btc_mode == "UP":
+            scenario = "UP継続ならLONG監視"
+        elif btc_mode == "RANGE":
+            scenario = "RANGE上抜けでLONG再評価"
+        else:
+            scenario = "DOWN中はLONG見送り寄り"
+
+    else:
+        if _is_btc_dump_after_short(sig):
+            risk_tags.append("急落直後")
+        allowed_hours = _watch_hours_csv(V2_SHORT_ALLOWED_HOURS)
+
+        if btc_mode == "RANGE":
+            scenario = "RANGE維持ならSHORT監視"
+        elif btc_mode == "DOWN":
+            scenario = "DOWN継続ならSHORT監視"
+        else:
+            scenario = "UP中はSHORT見送り寄り"
+
+    if _is_vol_shock_context(sig):
+        risk_tags.append("vol_shock")
+
+    risk_tags = list(dict.fromkeys(risk_tags))
+
+    warnings: List[str] = []
+    if risk_tags:
+        warnings.extend(risk_tags)
+
+    if side == "LONG":
+        if np.isfinite(rsi) and rsi > float(V2_LONG_DEF_RSI_HARD_MAX):
+            warnings.append(f"RSI高すぎ({rsi:.1f})")
+    else:
+        if np.isfinite(rsi) and not (float(V2_SHORT_RSI_SWEET_MIN) <= rsi < float(V2_SHORT_RSI_SWEET_MAX)):
+            warnings.append(f"RSI帯外({rsi:.1f})")
+        if np.isfinite(vol_ratio) and vol_ratio > float(V2_SHORT_STRONG_VOLRATIO_MAX):
+            warnings.append(f"VolR高すぎ({vol_ratio:.2f})")
+
+    if "block_hour" in notify_reason:
+        warnings.append(f"通知block({notify_reason})")
+    if "runtime_dedup" in ai_note:
+        warnings.append("直近重複")
+
+    if risk_tags:
+        title = "🚨 監視銘柄の異常検知"
+        kind = "abnormal"
+        priority = 0
+    elif warnings:
+        title = "⛔ 今は触らない方がいい"
+        kind = "warning"
+        priority = 1
+    elif (str(sig.get("ai_pass", "0")) == "1") or (np.isfinite(score) and score >= 1.20):
+        title = "🧭 売買シナリオの提案"
+        kind = "scenario"
+        priority = 2
+    else:
+        return "", "", 99
+
+    score_disp = "" if not np.isfinite(score) else f"{score:.2f}"
+    ai_disp = "" if not np.isfinite(ai_prob) else f"{ai_prob:.1%}"
+    warning_disp = "なし" if not warnings else " / ".join(warnings)
+
+    lines = [
+        title,
+        f"💎 {symbol} ({side})" if symbol else "",
+        f"🕒 {dt_str}" if dt_str else "",
+        f"🟦 BTC mode: {btc_mode or 'N/A'}",
+        f"📈 Score: {score_disp}" if score_disp else "",
+        f"🤖 AI: {ai_disp}" if ai_disp else "",
+        f"📍 許可時間: {allowed_hours}" if allowed_hours else "",
+        f"🧭 シナリオ: {scenario}",
+        f"⛔ 見送りサイン: {warning_disp}",
+    ]
+    return "\n".join([x for x in lines if x]), kind, priority
+
+
+def send_v2_watch_discord_alerts(final_signals: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """
+    エントリー通知とは別に、非エントリー時の情報通知を送る。
+    - 異常検知
+    - 売買シナリオ提案
+    - 今は触らない方がいい警告
+
+    1 run あたり最大2件まで送る。
+    戻り値:
+      (sent_n, runtime_dedup_skipped_n)
+    """
+    global last_alert_records
+
+    sent = 0
+    runtime_dedup_skipped = 0
+    now_ts = int(time.time())
+    max_per_run = 2
+
+    candidates: List[Tuple[int, float, Dict[str, Any], str, str]] = []
+
+    for sig in final_signals:
+        msg, kind, priority = _build_v2_watch_message(sig)
+        if not msg:
+            continue
+
+        score = _watch_num(sig.get("total_score", sig.get("score", "")))
+        sort_score = -float(score) if np.isfinite(score) else 9999.0
+        candidates.append((priority, sort_score, sig, kind, msg))
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+
+    for _, _, sig, kind, msg in candidates:
+        if sent >= max_per_run:
+            break
+
+        key = f"WATCH|{kind}|{_v2_notify_key(sig)}"
+
+        if (not V2_NOTIFY_IGNORE_RUNTIME_DEDUP) and key in last_alert_records:
+            runtime_dedup_skipped += 1
+            continue
+
+        ok, _ = send_discord_message(msg)
+        if ok:
+            last_alert_records[key] = now_ts
+            sent += 1
+
+    return sent, runtime_dedup_skipped
 
 
 def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tuple[int, int]:
@@ -10370,16 +10685,20 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         ]
 
         sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
+        watch_sent_n, watch_runtime_dedup_skipped_n = send_v2_watch_discord_alerts(final_signals)
 
         print(
             f"[V2] engine_mode=v2_live "
             f"notify_candidates={len(notify_candidates)} "
             f"discord_sent={sent_n} "
             f"discord_runtime_dedup_skipped={runtime_dedup_skipped_n} "
+            f"watch_discord_sent={watch_sent_n} "
+            f"watch_runtime_dedup_skipped={watch_runtime_dedup_skipped_n} "
             f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)}"
         )
     else:
         sent_n, runtime_dedup_skipped_n = 0, 0
+        watch_sent_n, watch_runtime_dedup_skipped_n = 0, 0
         for sig in final_signals:
             sig["_notify_sent"] = "0"
             sig["_notified_at_jst"] = ""
