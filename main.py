@@ -5366,7 +5366,7 @@ def _get_short_ai_score(sig: Dict[str, Any]) -> float:
     return float("nan")
 
 
-def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
+def _check_short_win_bucket(sig: Dict[str, Any]) -> Tuple[bool, str]:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
     rsi = _safe_float_or_nan(sig.get("rsi"))
@@ -5374,27 +5374,72 @@ def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
     hour = _sig_hour_jst(sig)
 
     if not _is_fr_available_flag(sig):
-        return False
+        return False, "short_bucket_fr_unavailable"
+
     if hour is None:
-        return False
+        return False, "short_bucket_hour_missing"
+
     if hour not in V2_SHORT_ALLOWED_HOURS:
-        return False
+        return False, (
+            f"short_bucket_hour_miss "
+            f"hour={hour} "
+            f"allowed={sorted(list(V2_SHORT_ALLOWED_HOURS))}"
+        )
+
     if btc_mode_compat not in V2_SHORT_BUCKET_BTC_MODES:
-        return False
-    if not np.isfinite(p1) or not np.isfinite(p2) or not np.isfinite(rsi):
-        return False
+        return False, (
+            f"short_bucket_btc_mode_miss "
+            f"btc_mode={btc_mode_compat} "
+            f"allowed={sorted(list(V2_SHORT_BUCKET_BTC_MODES))}"
+        )
+
+    if not np.isfinite(p1):
+        return False, "short_bucket_missing_p1"
+
+    if not np.isfinite(p2):
+        return False, "short_bucket_missing_p2"
+
+    if not np.isfinite(rsi):
+        return False, "short_bucket_missing_rsi"
+
     if not (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX)):
-        return False
-    # RSI sweet band (広帯を外し、勝率の高い 40-55 帯のみ通す)
+        return False, (
+            f"short_bucket_p1_out_of_range "
+            f"p1={float(p1):.4f} "
+            f"min={float(V2_SHORT_BUCKET_P1_MIN):.4f} "
+            f"max={float(V2_SHORT_BUCKET_P1_MAX):.4f}"
+        )
+
     if not (float(V2_SHORT_RSI_SWEET_MIN) <= float(rsi) < float(V2_SHORT_RSI_SWEET_MAX)):
-        return False
-    if float(p2) < max(0.0, float(V2_SHORT_BUCKET_P2_MIN)):
-        return False
-    # AI スコア hard gate (値がない場合は通す)
+        return False, (
+            f"short_bucket_rsi_out_of_range "
+            f"rsi={float(rsi):.4f} "
+            f"min={float(V2_SHORT_RSI_SWEET_MIN):.4f} "
+            f"max={float(V2_SHORT_RSI_SWEET_MAX):.4f}"
+        )
+
+    p2_min_eff = max(0.0, float(V2_SHORT_BUCKET_P2_MIN))
+    if float(p2) < p2_min_eff:
+        return False, (
+            f"short_bucket_p2_below_min "
+            f"p2={float(p2):.4f} "
+            f"min={float(p2_min_eff):.4f}"
+        )
+
     ai_score = _get_short_ai_score(sig)
     if np.isfinite(ai_score) and float(ai_score) < float(SHORT_AI_TH):
-        return False
-    return True
+        return False, (
+            f"short_bucket_ai_below_min "
+            f"ai={float(ai_score):.6f} "
+            f"min={float(SHORT_AI_TH):.6f}"
+        )
+
+    return True, "short_bucket_pass"
+
+
+def _is_short_win_bucket(sig: Dict[str, Any]) -> bool:
+    ok, _ = _check_short_win_bucket(sig)
+    return ok
 
 
 def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
@@ -5679,16 +5724,9 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     if not fr_ok:
         return False, "fr_unavailable"
 
-    if not _is_short_win_bucket(sig):
-        return False, (
-            f"short_bucket_miss "
-            f"p1={p1:.4f} "
-            f"p2={p2:.4f} "
-            f"rsi={rsi:.4f} "
-            f"hour={hour} "
-            f"btc_mode={btc_mode_compat} "
-            f"fr_ok={fr_ok}"
-        )
+    bucket_ok, bucket_reason = _check_short_win_bucket(sig)
+    if not bucket_ok:
+        return False, bucket_reason
 
     return True, "pass"
 
