@@ -22,4 +22,6 @@ steps:
       - '--image'
       - 'gcr.io/crypto-alert-479023/github.com/kenji888knymec/ocho:${BUILD_ID}'
       - '--labels=commit-sha=${COMMIT_SHA},gcb-build-id=${BUILD_ID},gcb-trigger-id=448e2ab0-06bf-4441-9e99-688367b3d27d,deploy-trigger=crypto-alert-deploy-main'
+      - '--update-env-vars'
+      - 'DEPLOY_SHA=${COMMIT_SHA}'
       - '--quiet'
