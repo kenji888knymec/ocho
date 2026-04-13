@@ -732,12 +732,35 @@ def _invalidate_sheet_caches(sheet_name: str):
 # ==========================================
 # 便利関数
 # ==========================================
+def _ensure_discord_message_frame(text: str) -> str:
+    """
+    通常Webhook通知を見やすくするための共通ラッパー。
+    - 既に上下区切り線がある本文はそのまま送る
+    - 無い本文だけ、自動で上下に区切り線を付ける
+    """
+    s = "" if text is None else str(text).strip()
+    if s == "":
+        return s
+
+    line = "━━━━━━━━━━━━━━━━━━━━"
+
+    has_top = s.startswith(line)
+    has_bottom = s.endswith(line)
+
+    if has_top and has_bottom:
+        return s
+
+    return f"{line}\n{s}\n{line}"
+
+
 def send_discord_message(text: str) -> Tuple[bool, str]:
     if (not discord_webhook_url) or ("ここに" in discord_webhook_url):
         print("[DBG] discord webhook url empty or placeholder")
         return False, "webhook_empty"
 
-    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] or [text]
+    framed_text = _ensure_discord_message_frame(text)
+
+    chunks = [framed_text[i:i+1900] for i in range(0, len(framed_text), 1900)] or [framed_text]
     for chunk in chunks:
         try:
             r = http.post(discord_webhook_url, json={"content": chunk}, timeout=10)
