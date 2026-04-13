@@ -2332,7 +2332,7 @@ def _audit_float(v: Any) -> float:
 
 
 def _audit_ok_text(ok: bool) -> str:
-    return "OK" if ok else "注意"
+    return "OK" if ok else "NG"
 
 
 def _build_signal_audit_block(item: Dict[str, Any]) -> str:
@@ -2351,10 +2351,28 @@ def _build_signal_audit_block(item: Dict[str, Any]) -> str:
 
     if is_long:
         btc_mode_ok = (btc_mode == "UP")
+        if btc_mode_ok:
+            btc_mode_detail = "LONG想定どおり UP"
+        else:
+            btc_mode_detail = f"LONG想定とズレ（{btc_mode or 'N/A'}）"
     else:
         btc_mode_ok = btc_mode in ("RANGE", "DOWN")
+        if btc_mode == "DOWN":
+            btc_mode_detail = "SHORT想定どおり DOWN"
+        elif btc_mode == "RANGE":
+            btc_mode_detail = "SHORT想定どおり RANGE"
+        else:
+            btc_mode_detail = f"SHORT想定とズレ（{btc_mode or 'N/A'}）"
 
-    ai_ok = (not np.isfinite(ai_score)) or (ai_score >= ai_th)
+    if not np.isfinite(ai_score):
+        ai_ok = False
+        ai_detail = "AI不明"
+    elif ai_score >= ai_th:
+        ai_ok = True
+        ai_detail = f"side基準を満たす（{ai_score:.1%} / TH {ai_th:.1%}）"
+    else:
+        ai_ok = False
+        ai_detail = f"side内で弱い（{ai_score:.1%} / TH {ai_th:.1%}）"
 
     risk_tags: List[str] = []
 
@@ -2385,6 +2403,11 @@ def _build_signal_audit_block(item: Dict[str, Any]) -> str:
     risk_tags = list(dict.fromkeys(risk_tags))
     risk_ok = (len(risk_tags) == 0)
 
+    if risk_ok:
+        risk_detail = "危険タグなし"
+    else:
+        risk_detail = " / ".join(risk_tags)
+
     extreme_parts: List[str] = []
     extreme_ok = True
 
@@ -2394,31 +2417,37 @@ def _build_signal_audit_block(item: Dict[str, Any]) -> str:
             extreme_parts.append(f"RSI={rsi:.1f}")
         if np.isfinite(vol_ratio) and vol_ratio >= float(V2_INCIDENT_VOLRATIO_SHOCK_MIN):
             extreme_ok = False
-            extreme_parts.append(f"VolR={vol_ratio:.2f}")
+            extreme_parts.append(f"VolRatio={vol_ratio:.2f}")
     else:
         if np.isfinite(rsi) and not (
             float(V2_SHORT_RSI_SWEET_MIN) <= rsi < float(V2_SHORT_RSI_SWEET_MAX)
         ):
             extreme_ok = False
-            extreme_parts.append(f"RSI={rsi:.1f}")
+            extreme_parts.append(
+                f"RSI={rsi:.1f}（許容 {float(V2_SHORT_RSI_SWEET_MIN):.0f}〜{float(V2_SHORT_RSI_SWEET_MAX):.0f} 未満）"
+            )
         if np.isfinite(vol_ratio) and vol_ratio > float(V2_SHORT_STRONG_VOLRATIO_MAX):
             extreme_ok = False
-            extreme_parts.append(f"VolR={vol_ratio:.2f}")
+            extreme_parts.append(
+                f"VolRatio={vol_ratio:.2f}（上限 {float(V2_SHORT_STRONG_VOLRATIO_MAX):.2f} 超え）"
+            )
 
-    ai_disp = "N/A" if not np.isfinite(ai_score) else f"{ai_score:.1%}"
-    risk_disp = "なし" if risk_ok else ",".join(risk_tags)
-    extreme_disp = "なし" if extreme_ok else ", ".join(extreme_parts)
+    if extreme_ok:
+        extreme_detail = "RSI, VolRatio とも許容"
+    else:
+        extreme_detail = " / ".join(extreme_parts)
 
     review_needed = not (btc_mode_ok and ai_ok and risk_ok and extreme_ok)
-    final_disp = "人間確認推奨" if review_needed else "自動候補OK"
+    final_disp = "見送り候補" if review_needed else "通過候補"
 
     return (
         "🔎 監査\n"
-        f"・BTC mode: {_audit_ok_text(btc_mode_ok)} ({btc_mode or 'N/A'})\n"
-        f"・AI: {_audit_ok_text(ai_ok)} ({ai_disp} / TH {ai_th:.1%})\n"
-        f"・危険タグ: {_audit_ok_text(risk_ok)} ({risk_disp})\n"
-        f"・極端値: {_audit_ok_text(extreme_ok)} ({extreme_disp})\n"
-        f"・判定: {final_disp}"
+        f"・BTC mode: {_audit_ok_text(btc_mode_ok)}（{btc_mode_detail}）\n"
+        f"・AI: {_audit_ok_text(ai_ok)}（{ai_detail}）\n"
+        f"・危険タグ: {_audit_ok_text(risk_ok)}（{risk_detail}）\n"
+        f"・極端値: {_audit_ok_text(extreme_ok)}（{extreme_detail}）\n"
+        "\n"
+        f"🧠 人間監査: {final_disp}"
     )
 
 
@@ -12605,6 +12634,7 @@ def logic_main(force: bool = False):
         audit_block = _build_signal_audit_block(item)
 
         msg = (
+            "━━━━━━━━━━━━━━━━━━━━\n"
             f"{icon} **{d_str}** {icon}\n"
             f"{VERSION} [{RULE_VERSION_TAG}]\n"
             f"💎 {sym} ({item['type']})\n"
@@ -12615,7 +12645,8 @@ def logic_main(force: bool = False):
             f"🎯 TP: {tp:.4f} ({tp_pct:.2f}%) HL:{hl_tp_pct:.1f}%\n"
             f"🛑 SL: {sl:.4f} ({sl_pct:.2f}%) HL:{hl_sl_pct:.1f}%\n"
             f"\n"
-            f"{audit_block}"
+            f"{audit_block}\n"
+            "━━━━━━━━━━━━━━━━━━━━"
         )
 
         send_discord_message(msg)
