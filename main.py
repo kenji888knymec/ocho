@@ -11471,7 +11471,7 @@ def logic_main(force: bool = False):
                             "vol_ratio": row.get("VolRatio", row.get("vol_ratio", np.nan)),
                         }
 
-                        short_core_ok = _is_short_win_bucket(short_ai_sig)
+                        short_core_ok, short_core_reason = _check_short_win_bucket(short_ai_sig)
                         short_push_ok = _is_short_strong_hour_bucket(short_ai_sig)
 
                         # 強いSHORTは AI hard gate を bypass
@@ -11483,6 +11483,7 @@ def logic_main(force: bool = False):
 
                         dbg["short_ai_mode"] = "soft"
                         dbg["short_ai_core_ok"] = bool(short_core_ok)
+                        dbg["short_ai_core_reason"] = str(short_core_reason)
                         dbg["short_ai_push_ok"] = bool(short_push_ok)
                         dbg["short_ai_score"] = float(ai_score)
                         dbg["short_ai_th_effective"] = 0.0
