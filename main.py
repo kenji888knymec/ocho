@@ -3474,6 +3474,7 @@ TRAIN_GCS_PREFIX = os.environ.get("TRAIN_GCS_PREFIX", "models")  # 例: models/<
 
 # --- V2 side別学習設定 ---
 TRAIN_V2_LOOKBACK_ROWS = int(float(os.environ.get("TRAIN_V2_LOOKBACK_ROWS", "20000")))
+TRAIN_V2_LOOKBACK_DAYS = float(os.environ.get("TRAIN_V2_LOOKBACK_DAYS", "10"))
 TRAIN_V2_LONG_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_LONG_MIN_SAMPLES", "80")))
 TRAIN_V2_SHORT_MIN_SAMPLES = int(float(os.environ.get("TRAIN_V2_SHORT_MIN_SAMPLES", "80")))
 
@@ -9210,7 +9211,11 @@ def _build_training_matrix_from_v2_shadow_ai(df: pd.DataFrame, side: str) -> Tup
     return X, y, info
 
 
-def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
+def _build_training_dataset_from_v2_shadow_ai(
+    side: str,
+    lookback_rows: int,
+    lookback_days: Optional[float] = None,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     v2_shadow_ai から LONG/SHORT 別の学習用 X, y を作るラッパー。
     追加方針:
@@ -9230,10 +9235,46 @@ def _build_training_dataset_from_v2_shadow_ai(side: str, lookback_rows: int) -> 
     if df is None or df.empty:
         raise RuntimeError("v2_shadow_ai is empty")
 
-    if lookback_rows is not None and int(lookback_rows) > 0:
+    applied_window: Dict[str, Any] = {
+        "mode": "all",
+        "lookback_rows": None,
+        "lookback_days": None,
+        "datetime_column": "",
+        "cutoff_jst": "",
+    }
+
+    dt_col = ""
+    if "Datetime_JST" in df.columns:
+        dt_col = "Datetime_JST"
+    elif "Time" in df.columns:
+        dt_col = "Time"
+
+    if lookback_days is not None and float(lookback_days) > 0 and dt_col:
+        dt_series = pd.to_datetime(df[dt_col].astype(str).str.strip(), errors="coerce")
+        cutoff = datetime.now(JST).replace(tzinfo=None) - timedelta(days=float(lookback_days))
+        df = df.loc[dt_series.notna() & (dt_series >= cutoff)].copy()
+
+        applied_window = {
+            "mode": "days",
+            "lookback_rows": None,
+            "lookback_days": float(lookback_days),
+            "datetime_column": dt_col,
+            "cutoff_jst": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    elif lookback_rows is not None and int(lookback_rows) > 0:
         df = df.tail(int(lookback_rows)).copy()
 
+        applied_window = {
+            "mode": "rows",
+            "lookback_rows": int(lookback_rows),
+            "lookback_days": None,
+            "datetime_column": "",
+            "cutoff_jst": "",
+        }
+
     meta["rows_scanned"] = int(len(df))
+    meta["window"] = applied_window
 
     work = df.copy()
 
@@ -13324,14 +13365,25 @@ def _train_v2_side_process(side: str):
         if not lock_ok:
             return jsonify({"ok": False, "error": "Busy (distributed mutex locked).", "version": VERSION}), 409
 
-        lookback = int(float(request.args.get("lookback", str(TRAIN_V2_LOOKBACK_ROWS))))
+        lookback_arg = str(request.args.get("lookback", str(TRAIN_V2_LOOKBACK_ROWS))).strip()
+        lookback = int(float(lookback_arg)) if lookback_arg else int(TRAIN_V2_LOOKBACK_ROWS)
+
+        lookback_days_arg = str(request.args.get("lookback_days", str(TRAIN_V2_LOOKBACK_DAYS))).strip()
+        lookback_days: Optional[float] = None
+        if lookback_days_arg not in ("", "0", "0.0"):
+            lookback_days = float(lookback_days_arg)
+
         default_min_samples = TRAIN_V2_LONG_MIN_SAMPLES if side_u == "LONG" else TRAIN_V2_SHORT_MIN_SAMPLES
         min_samples = int(float(request.args.get("min_samples", str(default_min_samples))))
         hot_reload = str(request.args.get("hot_reload", "1")).strip() == "1"
         upload = str(request.args.get("upload", "1")).strip() == "1"
         out_version = str(request.args.get("version", "")).strip()
 
-        X, y, info = _build_training_dataset_from_v2_shadow_ai(side_u, lookback)
+        X, y, info = _build_training_dataset_from_v2_shadow_ai(
+            side_u,
+            lookback,
+            lookback_days=lookback_days,
+        )
 
         n = int(len(y))
         if n < int(min_samples):
