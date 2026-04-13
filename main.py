@@ -297,6 +297,16 @@ SHORT_MODEL_GCS_URI = os.environ.get("SHORT_MODEL_GCS_URI", "").strip()
 LONG_MODEL_VERSION = os.environ.get("LONG_MODEL_VERSION", "").strip()
 SHORT_MODEL_VERSION = os.environ.get("SHORT_MODEL_VERSION", "").strip()
 
+LONG_TREND_MODEL_GCS_URI = os.environ.get("LONG_TREND_MODEL_GCS_URI", "").strip()
+LONG_RECOVERY_MODEL_GCS_URI = os.environ.get("LONG_RECOVERY_MODEL_GCS_URI", "").strip()
+SHORT_TREND_MODEL_GCS_URI = os.environ.get("SHORT_TREND_MODEL_GCS_URI", "").strip()
+SHORT_RETRACE_MODEL_GCS_URI = os.environ.get("SHORT_RETRACE_MODEL_GCS_URI", "").strip()
+
+LONG_TREND_MODEL_VERSION = os.environ.get("LONG_TREND_MODEL_VERSION", "").strip()
+LONG_RECOVERY_MODEL_VERSION = os.environ.get("LONG_RECOVERY_MODEL_VERSION", "").strip()
+SHORT_TREND_MODEL_VERSION = os.environ.get("SHORT_TREND_MODEL_VERSION", "").strip()
+SHORT_RETRACE_MODEL_VERSION = os.environ.get("SHORT_RETRACE_MODEL_VERSION", "").strip()
+
 LONG_AI_PROBA_INVERT = (os.environ.get("LONG_AI_PROBA_INVERT", "1" if AI_PROBA_INVERT else "0").strip() == "1")
 SHORT_AI_PROBA_INVERT = (os.environ.get("SHORT_AI_PROBA_INVERT", "1" if AI_PROBA_INVERT else "0").strip() == "1")
 
@@ -4378,21 +4388,49 @@ def get_ai_model_for_symbol(symbol_code: str):
     return m, ver, "gcs"
 
 
-def _get_side_model_uri(side: str) -> str:
+def _normalize_lane_name(lane: str) -> str:
+    return str(lane or "").strip().lower()
+
+
+def _get_lane_model_uri(side: str, lane: str = "") -> str:
     s = str(side or "").strip().upper()
+    lane_u = _normalize_lane_name(lane)
+
+    if lane_u == "long_trend":
+        return LONG_TREND_MODEL_GCS_URI or LONG_MODEL_GCS_URI
+    if lane_u == "long_recovery":
+        return LONG_RECOVERY_MODEL_GCS_URI or LONG_MODEL_GCS_URI
+    if lane_u == "short_trend":
+        return SHORT_TREND_MODEL_GCS_URI or SHORT_MODEL_GCS_URI
+    if lane_u == "short_retrace":
+        return SHORT_RETRACE_MODEL_GCS_URI or SHORT_MODEL_GCS_URI
+
     if s == "LONG":
         return LONG_MODEL_GCS_URI
     if s == "SHORT":
         return SHORT_MODEL_GCS_URI
     return ""
 
-def _get_side_model_version(side: str) -> str:
+
+def _get_lane_model_version(side: str, lane: str = "") -> str:
     s = str(side or "").strip().upper()
+    lane_u = _normalize_lane_name(lane)
+
+    if lane_u == "long_trend":
+        return LONG_TREND_MODEL_VERSION or LONG_MODEL_VERSION
+    if lane_u == "long_recovery":
+        return LONG_RECOVERY_MODEL_VERSION or LONG_MODEL_VERSION
+    if lane_u == "short_trend":
+        return SHORT_TREND_MODEL_VERSION or SHORT_MODEL_VERSION
+    if lane_u == "short_retrace":
+        return SHORT_RETRACE_MODEL_VERSION or SHORT_MODEL_VERSION
+
     if s == "LONG":
         return LONG_MODEL_VERSION
     if s == "SHORT":
         return SHORT_MODEL_VERSION
     return ""
+
 
 def _get_side_model_invert(side: str) -> bool:
     s = str(side or "").strip().upper()
@@ -4402,6 +4440,7 @@ def _get_side_model_invert(side: str) -> bool:
         return bool(SHORT_AI_PROBA_INVERT)
     return bool(AI_PROBA_INVERT)
 
+
 def _is_side_ai_enabled(side: str) -> bool:
     s = str(side or "").strip().upper()
     if s == "LONG":
@@ -4410,27 +4449,41 @@ def _is_side_ai_enabled(side: str) -> bool:
         return bool(SHORT_AI_ENABLE)
     return True
 
-def get_ai_model_for_side(side: str, sym_code: str):
+
+def _get_runtime_lane_for_signal(sig: Dict[str, Any], side: str) -> str:
+    s = str(side or "").strip().upper()
+    if s == "LONG":
+        lane_name, _ = _classify_long_lane(sig)
+        return lane_name
+    if s == "SHORT":
+        lane_name, _ = _classify_short_lane(sig)
+        return lane_name
+    return ""
+
+
+def get_ai_model_for_side(side: str, sym_code: str, lane: str = ""):
     """
     優先順位:
-      1) side専用モデル
-      2) 既存の銘柄別モデル
-      3) 既存の単一モデル
+      1) lane専用モデル
+      2) side専用モデル
+      3) 既存の銘柄別モデル
+      4) 既存の単一モデル
     """
     global ai_model_long, ai_model_short
     global AI_MODEL_VERSION_RUNTIME_LONG, AI_MODEL_SOURCE_RUNTIME_LONG
     global AI_MODEL_VERSION_RUNTIME_SHORT, AI_MODEL_SOURCE_RUNTIME_SHORT
 
     s = str(side or "").strip().upper()
+    lane_u = _normalize_lane_name(lane)
 
     if not _is_side_ai_enabled(s):
         return None, "", "disabled"
 
-    side_uri = _get_side_model_uri(s)
-    side_ver = _get_side_model_version(s)
+    model_uri = _get_lane_model_uri(s, lane_u)
+    model_ver = _get_lane_model_version(s, lane_u)
 
-    if side_uri.startswith("gs://"):
-        cached = _model_cache.get(side_uri)
+    if model_uri.startswith("gs://"):
+        cached = _model_cache.get(model_uri)
         now_ts = time.time()
 
         if cached and (now_ts - float(cached.get("ts", 0.0)) <= float(MODEL_CACHE_TTL_SEC)):
@@ -4438,8 +4491,8 @@ def get_ai_model_for_side(side: str, sym_code: str):
             meta = dict(cached.get("meta", {}) or {})
             model = _attach_model_meta(model, meta)
 
-            ver = str(cached.get("version", side_ver))
-            src = str(cached.get("source", side_uri))
+            ver = str(cached.get("version", model_ver))
+            src = str(cached.get("source", model_uri))
 
             if s == "LONG":
                 ai_model_long = model
@@ -4452,18 +4505,18 @@ def get_ai_model_for_side(side: str, sym_code: str):
 
             return model, ver, src
 
-        tmp_path = _safe_tmp_path_for_uri(side_uri)
-        ok_dl = _gcs_download_to(side_uri, tmp_path)
+        tmp_path = _safe_tmp_path_for_uri(model_uri)
+        ok_dl = _gcs_download_to(model_uri, tmp_path)
         if ok_dl and os.path.exists(tmp_path):
             model = _load_model_from_path(tmp_path)
             if model is not None:
-                meta = _load_model_meta_from_uri(side_uri)
+                meta = _load_model_meta_from_uri(model_uri)
                 model = _attach_model_meta(model, meta)
 
-                src = side_uri
-                ver = side_ver or ""
+                src = model_uri
+                ver = model_ver or ""
 
-                _model_cache[side_uri] = {
+                _model_cache[model_uri] = {
                     "model": model,
                     "meta": dict(meta or {}),
                     "ts": now_ts,
@@ -4480,18 +4533,21 @@ def get_ai_model_for_side(side: str, sym_code: str):
                     AI_MODEL_VERSION_RUNTIME_SHORT = ver
                     AI_MODEL_SOURCE_RUNTIME_SHORT = src
 
-                print(f"[AI] Side-model loaded side={s} uri={side_uri} ver={ver}")
+                print(
+                    f"[AI] Lane-model loaded side={s} lane={lane_u or 'side_default'} "
+                    f"uri={model_uri} ver={ver}"
+                )
                 try:
                     fn = getattr(model, "feature_names_in_", None)
                     if fn is not None:
-                        print(f"[AI] model_feature_names_in_({s})={list(fn)}")
+                        print(f"[AI] model_feature_names_in_({s}:{lane_u or 'side_default'})={list(fn)}")
                 except Exception:
                     pass
 
                 try:
                     if meta:
                         print(
-                            f"[AI] model_meta({s}) "
+                            f"[AI] model_meta({s}:{lane_u or 'side_default'}) "
                             f"schema_version={meta.get('feature_schema_version', '')} "
                             f"feature_hash={meta.get('feature_hash', '')}"
                         )
@@ -4506,7 +4562,10 @@ def get_ai_model_for_side(side: str, sym_code: str):
             if model_for_sym is not None:
                 return model_for_sym, ver_sym, src_sym
         except Exception as e:
-            print(f"[AI] get_ai_model_for_side symbol fallback failed side={s} sym={sym_code} err={type(e).__name__}: {e}")
+            print(
+                f"[AI] get_ai_model_for_side symbol fallback failed "
+                f"side={s} lane={lane_u} sym={sym_code} err={type(e).__name__}: {e}"
+            )
 
     try:
         model = get_ai_model()
@@ -6026,6 +6085,74 @@ def _is_short_strong_hour_bucket(sig: Dict[str, Any]) -> bool:
     return True
 
 
+def _classify_long_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    LONG を 2レーンに分ける。
+    - long_trend    : 順張りLONG（今の strong）
+    - long_recovery : 回復LONG（今の alt）
+    """
+    trend_ok, trend_reason = _check_long_strong_bucket(sig)
+    if trend_ok:
+        return "long_trend", str(trend_reason)
+
+    recovery_ok = _is_long_alt_win_bucket(sig)
+    if recovery_ok:
+        return "long_recovery", "long_recovery_pass"
+
+    return "", str(trend_reason)
+
+
+def _classify_short_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    SHORT を 2レーンに分ける。
+    - short_trend   : 下げ継続SHORT（今の core）
+    - short_retrace : 戻り売りSHORT（今の push/strong hour）
+    """
+    trend_ok, trend_reason = _check_short_win_bucket(sig)
+    if trend_ok:
+        return "short_trend", str(trend_reason)
+
+    retrace_ok = _is_short_strong_hour_bucket(sig)
+    if retrace_ok:
+        return "short_retrace", "short_retrace_pass"
+
+    return "", str(trend_reason)
+
+
+def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
+    """
+    v2_shadow_ai の学習用 row を、4レーンのどれかへ仮分類する。
+    ここは runtime の完全再現ではなく、まずは安定した lane 学習用の近似。
+    """
+    side = str(row.get("Direction", "") or "").strip().upper()
+    btc_mode = str(row.get("BTC_Mode_Compat", "") or "").strip().upper()
+
+    note = str(
+        row.get("Note", row.get("AI_Note", row.get("note", row.get("ai_note", "")))) or ""
+    ).lower()
+
+    if side == "LONG":
+        has_recovery_tag = (
+            ("pullback" in note)
+            or ("rsi_recovering" in note)
+            or ("bullish_bar" in note)
+        )
+        if btc_mode == "UP" and (not has_recovery_tag):
+            return "long_trend"
+        return "long_recovery"
+
+    if side == "SHORT":
+        has_retrace_tag = (
+            ("retracement" in note)
+            or ("rsi_optimal_short" in note)
+        )
+        if has_retrace_tag:
+            return "short_retrace"
+        return "short_trend"
+
+    return ""
+
+
 def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
     p1 = _safe_float_or_nan(sig.get("p1_score"))
     p2 = _safe_float_or_nan(sig.get("p2_score"))
@@ -7454,7 +7581,10 @@ def _predict_v2_ai_score(sig: Dict[str, Any], side: str, fallback_score: float) 
 
     threshold = V2_LONG_AI_MIN if side_u == "LONG" else V2_SHORT_AI_MIN
 
-    model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(side_u, sym_code)
+    lane_name = _get_runtime_lane_for_signal(sig, side_u)
+    model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(
+        side_u, sym_code, lane=lane_name
+    )
     invert_for_side = _get_side_model_invert(side_u)
 
     base = {
@@ -11239,7 +11369,24 @@ def logic_main(force: bool = False):
                   - bypass    : Trueなら予測できていない
                   - dbg       : safe_predict_proba のデバッグ（追跡用情報を必ず追記）
                 """
-                model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(side, sym_code)
+                btc_mode_compat_lane = btc_mode.upper()
+                hour_jst_lane = now_jst.hour
+                pseudo_sig = {
+                    "symbol": symbol,
+                    "direction": side,
+                    "btc_mode_compat": btc_mode_compat_lane,
+                    "rsi": float(row["RSI"]),
+                    "p1_score": float(sig_score),
+                    "p2_score": 0.0,
+                    "hour_jst": hour_jst_lane,
+                    "note": "",
+                    "ai_note": "",
+                }
+                lane_name = _get_runtime_lane_for_signal(pseudo_sig, side)
+
+                model_for_side, model_ver_side, model_src_side = get_ai_model_for_side(
+                    side, sym_code, lane=lane_name
+                )
                 invert_for_side = _get_side_model_invert(side)
 
                 d_base: Dict[str, Any] = {
@@ -13427,6 +13574,8 @@ def _train_v2_side_process(side: str):
         if lookback_days_arg not in ("", "0", "0.0"):
             lookback_days = float(lookback_days_arg)
 
+        lane = str(request.args.get("lane", "")).strip().lower()
+
         default_min_samples = TRAIN_V2_LONG_MIN_SAMPLES if side_u == "LONG" else TRAIN_V2_SHORT_MIN_SAMPLES
         min_samples = int(float(request.args.get("min_samples", str(default_min_samples))))
         hot_reload = str(request.args.get("hot_reload", "1")).strip() == "1"
@@ -13699,14 +13848,41 @@ def _train_v2_side_process(side: str):
                 reloaded = False
 
         next_env_vars = {}
-        if decision["promote"] and uploaded and side_u == "LONG":
-            next_env_vars = {"LONG_MODEL_VERSION": ts_ver, "LONG_MODEL_GCS_URI": out_uri}
-        elif decision["promote"] and uploaded and side_u == "SHORT":
-            next_env_vars = {"SHORT_MODEL_VERSION": ts_ver, "SHORT_MODEL_GCS_URI": out_uri}
+        if decision["promote"] and uploaded:
+            if lane == "long_trend":
+                next_env_vars = {
+                    "LONG_TREND_MODEL_VERSION": ts_ver,
+                    "LONG_TREND_MODEL_GCS_URI": out_uri,
+                }
+            elif lane == "long_recovery":
+                next_env_vars = {
+                    "LONG_RECOVERY_MODEL_VERSION": ts_ver,
+                    "LONG_RECOVERY_MODEL_GCS_URI": out_uri,
+                }
+            elif lane == "short_trend":
+                next_env_vars = {
+                    "SHORT_TREND_MODEL_VERSION": ts_ver,
+                    "SHORT_TREND_MODEL_GCS_URI": out_uri,
+                }
+            elif lane == "short_retrace":
+                next_env_vars = {
+                    "SHORT_RETRACE_MODEL_VERSION": ts_ver,
+                    "SHORT_RETRACE_MODEL_GCS_URI": out_uri,
+                }
+            elif side_u == "LONG":
+                next_env_vars = {
+                    "LONG_MODEL_VERSION": ts_ver,
+                    "LONG_MODEL_GCS_URI": out_uri,
+                }
+            elif side_u == "SHORT":
+                next_env_vars = {
+                    "SHORT_MODEL_VERSION": ts_ver,
+                    "SHORT_MODEL_GCS_URI": out_uri,
+                }
 
         try:
             msg_lines = [
-                f"[TRAIN_V2_{side_u}] decision={decision['reason']}",
+                f"[TRAIN_V2_{side_u}:{lane or 'side_default'}] decision={decision['reason']}",
                 f"promote={decision['promote']}",
                 f"serving_schema_match={decision['serving_schema_match']}",
                 f"train_schema={V2_TRAIN_FEATURE_SCHEMA_VERSION}",
@@ -13726,6 +13902,7 @@ def _train_v2_side_process(side: str):
             "ok": True,
             "version": VERSION,
             "side": side_u,
+            "lane": lane,
             "trained_samples": n,
             "trainer_name": trainer_name,
             "trainer_params": trainer_params,
