@@ -9397,19 +9397,24 @@ def _build_training_dataset_from_v2_shadow_ai(
     side: str,
     lookback_rows: int,
     lookback_days: Optional[float] = None,
+    lane: str = "",
 ) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, Any]]:
     """
     v2_shadow_ai から LONG/SHORT 別の学習用 X, y を作るラッパー。
     追加方針:
       - SHORT: VolConfirmed=True 優先、SHORT blocklist除外、mode選別
       - LONG : VolConfirmed=True 優先、LONG blocklist除外、UP中心
+      - lane 指定時は __lane__ で絞り込む
     """
     side_u = str(side or "").strip().upper()
+    lane_u = _normalize_lane_name(lane)
+
     meta: Dict[str, Any] = {
         "rows_scanned": 0,
         "rows_used": 0,
         "class_balance": {},
         "side": side_u,
+        "lane": lane_u,
         "train_filters": {},
     }
 
@@ -9478,6 +9483,26 @@ def _build_training_dataset_from_v2_shadow_ai(
     else:
         work["__volconf__"] = np.nan
 
+    work["__lane__"] = work.apply(
+        lambda row: _classify_train_lane_from_row(row.to_dict()),
+        axis=1,
+    )
+
+    lane_counts_before_filter = (
+        work["__lane__"]
+        .astype(str)
+        .value_counts(dropna=False)
+        .to_dict()
+    )
+    meta["lane_counts_before_filter"] = {
+        str(k): int(v) for k, v in lane_counts_before_filter.items()
+    }
+
+    if lane_u:
+        work = work[work["__lane__"].astype(str).str.strip().str.lower() == lane_u].copy()
+
+    meta["rows_after_lane_filter"] = int(len(work))
+
     if side_u == "SHORT":
         if V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST:
             short_block = set(V2_SHORT_SYMBOL_BLOCKLIST or [])
@@ -9495,6 +9520,7 @@ def _build_training_dataset_from_v2_shadow_ai(
             work = work[work["__mode__"] == "RANGE"].copy()
 
         meta["train_filters"] = {
+            "lane": lane_u,
             "require_volconf": bool(V2_SHORT_TRAIN_REQUIRE_VOLCONF),
             "exclude_blocklist": bool(V2_SHORT_TRAIN_EXCLUDE_BLOCKLIST),
             "mode": str(V2_SHORT_TRAIN_MODE),
@@ -9518,6 +9544,7 @@ def _build_training_dataset_from_v2_shadow_ai(
             work = work[work["__mode__"] == "UP"].copy()
 
         meta["train_filters"] = {
+            "lane": lane_u,
             "require_volconf": bool(V2_LONG_TRAIN_REQUIRE_VOLCONF),
             "exclude_blocklist": bool(V2_LONG_TRAIN_EXCLUDE_BLOCKLIST),
             "mode": str(V2_LONG_TRAIN_MODE),
@@ -13575,6 +13602,7 @@ def _train_v2_side_process(side: str):
             lookback_days = float(lookback_days_arg)
 
         lane = str(request.args.get("lane", "")).strip().lower()
+        lane_u = _normalize_lane_name(lane)
 
         default_min_samples = TRAIN_V2_LONG_MIN_SAMPLES if side_u == "LONG" else TRAIN_V2_SHORT_MIN_SAMPLES
         min_samples = int(float(request.args.get("min_samples", str(default_min_samples))))
@@ -13586,6 +13614,7 @@ def _train_v2_side_process(side: str):
             side_u,
             lookback,
             lookback_days=lookback_days,
+            lane=lane_u,
         )
 
         n = int(len(y))
