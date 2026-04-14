@@ -6121,9 +6121,10 @@ def _classify_short_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
 
 def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
     """
-    v2_shadow_ai の学習用 row を、runtime の bucket 判定に寄せて 4レーン分類する。
-    学習用 row から runtime 用 sig を組み立てて、
-    _classify_long_lane / _classify_short_lane をそのまま使う。
+    v2_shadow_ai の学習用 row を 4レーン分類する。
+    優先順位:
+      1) runtime の lane 判定をそのまま使う
+      2) runtime で lane が取れない場合は、学習用フォールバックで分類する
     """
     def _pick(*keys, default=""):
         for key in keys:
@@ -6143,6 +6144,27 @@ def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
             return v
 
         return default
+
+    def _to_num(v):
+        try:
+            if v is None:
+                return np.nan
+            if isinstance(v, str) and v.strip() == "":
+                return np.nan
+            return float(v)
+        except Exception:
+            return np.nan
+
+    def _to_bool01(v):
+        try:
+            return _normalize_bool01(v)
+        except Exception:
+            s = str(v or "").strip().lower()
+            if s in ("1", "true", "yes", "on"):
+                return 1.0
+            if s in ("0", "false", "no", "off"):
+                return 0.0
+            return np.nan
 
     side = str(_pick("Direction", "direction")).strip().upper()
     if side not in ("LONG", "SHORT"):
@@ -6231,15 +6253,68 @@ def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
     try:
         if side == "LONG":
             lane, _ = _classify_long_lane(sig)
-            return str(lane or "")
+            if str(lane or "").strip():
+                return str(lane).strip()
 
         if side == "SHORT":
             lane, _ = _classify_short_lane(sig)
-            return str(lane or "")
+            if str(lane or "").strip():
+                return str(lane).strip()
+    except Exception:
+        pass
+
+    btc_mode = str(sig.get("btc_mode_compat", "") or "").strip().upper()
+    p1 = _to_num(sig.get("p1_score"))
+    p2 = _to_num(sig.get("p2_score"))
+    rsi = _to_num(sig.get("rsi"))
+    volratio = _to_num(sig.get("vol_ratio"))
+    hour_raw = _to_num(sig.get("hour_jst"))
+    fr_available = _to_bool01(sig.get("fr_available"))
+
+    hour = None
+    if np.isfinite(hour_raw):
+        hour = int(hour_raw)
+
+    if side == "LONG":
+        strong_hour_ok = (hour is not None) and (hour in V2_LONG_STRONG_ALLOWED_HOURS)
+        strong_mode_ok = btc_mode in V2_LONG_STRONG_BUCKET_BTC_MODES
+        strong_p1_ok = np.isfinite(p1) and (float(V2_LONG_STRONG_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_STRONG_BUCKET_P1_MAX))
+        strong_rsi_ok = np.isfinite(rsi) and (float(V2_LONG_STRONG_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_STRONG_BUCKET_RSI_MAX))
+        strong_p2_ok = np.isfinite(p2) and (float(p2) >= float(V2_LONG_STRONG_BUCKET_P2_MIN))
+        strong_fr_ok = (not np.isfinite(fr_available)) or (float(fr_available) == 1.0)
+
+        if strong_hour_ok and strong_mode_ok and strong_p1_ok and strong_rsi_ok and strong_p2_ok and strong_fr_ok:
+            return "long_trend"
+
+        alt_hour_ok = (hour is not None) and (hour in V2_LONG_ALT_ALLOWED_HOURS)
+        alt_mode_ok = btc_mode in V2_LONG_ALT_BUCKET_BTC_MODES
+        alt_p1_ok = np.isfinite(p1) and (float(V2_LONG_ALT_BUCKET_P1_MIN) <= float(p1) < float(V2_LONG_ALT_BUCKET_P1_MAX))
+        alt_rsi_ok = np.isfinite(rsi) and (float(V2_LONG_ALT_BUCKET_RSI_MIN) <= float(rsi) < float(V2_LONG_ALT_BUCKET_RSI_MAX))
+        alt_p2_ok = np.isfinite(p2) and (float(p2) >= float(V2_LONG_ALT_BUCKET_P2_MIN))
+        alt_fr_ok = (not np.isfinite(fr_available)) or (float(fr_available) == 1.0)
+
+        if alt_hour_ok and alt_mode_ok and alt_p1_ok and alt_rsi_ok and alt_p2_ok and alt_fr_ok:
+            return "long_recovery"
 
         return ""
-    except Exception:
-        return ""
+
+    if side == "SHORT":
+        strong_hour_ok = (hour is not None) and (hour in V2_SHORT_STRONG_HOURS)
+        strong_p1_ok = np.isfinite(p1) and (float(V2_SHORT_BUCKET_P1_MIN) <= float(p1) < float(V2_SHORT_BUCKET_P1_MAX))
+        strong_rsi_ok = np.isfinite(rsi) and (float(V2_SHORT_RSI_SWEET_MIN) <= float(rsi) < float(V2_SHORT_RSI_SWEET_MAX))
+        strong_p2_ok = np.isfinite(p2) and (float(p2) >= float(V2_SHORT_STRONG_P2_MIN))
+        strong_vol_ok = (
+            np.isfinite(volratio)
+            and (float(volratio) >= float(V2_SHORT_STRONG_VOLRATIO_MIN))
+            and (float(volratio) <= float(V2_SHORT_STRONG_VOLRATIO_MAX))
+        )
+
+        if strong_hour_ok and strong_p1_ok and strong_rsi_ok and strong_p2_ok and strong_vol_ok:
+            return "short_retrace"
+
+        return "short_trend"
+
+    return ""
 
 
 def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
