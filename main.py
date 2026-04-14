@@ -6121,36 +6121,125 @@ def _classify_short_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
 
 def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
     """
-    v2_shadow_ai の学習用 row を、4レーンのどれかへ仮分類する。
-    ここは runtime の完全再現ではなく、まずは安定した lane 学習用の近似。
+    v2_shadow_ai の学習用 row を、runtime の bucket 判定に寄せて 4レーン分類する。
+    学習用 row から runtime 用 sig を組み立てて、
+    _classify_long_lane / _classify_short_lane をそのまま使う。
     """
-    side = str(row.get("Direction", "") or "").strip().upper()
-    btc_mode = str(row.get("BTC_Mode_Compat", "") or "").strip().upper()
+    def _pick(*keys, default=""):
+        for key in keys:
+            try:
+                v = row.get(key, None)
+            except Exception:
+                v = None
 
-    note = str(
-        row.get("Note", row.get("AI_Note", row.get("note", row.get("ai_note", "")))) or ""
-    ).lower()
+            if v is None:
+                continue
 
-    if side == "LONG":
-        has_recovery_tag = (
-            ("pullback" in note)
-            or ("rsi_recovering" in note)
-            or ("bullish_bar" in note)
-        )
-        if btc_mode == "UP" and (not has_recovery_tag):
-            return "long_trend"
-        return "long_recovery"
+            if isinstance(v, str):
+                if v.strip() == "":
+                    continue
+                return v
 
-    if side == "SHORT":
-        has_retrace_tag = (
-            ("retracement" in note)
-            or ("rsi_optimal_short" in note)
-        )
-        if has_retrace_tag:
-            return "short_retrace"
-        return "short_trend"
+            return v
 
-    return ""
+        return default
+
+    side = str(_pick("Direction", "direction")).strip().upper()
+    if side not in ("LONG", "SHORT"):
+        return ""
+
+    sig: Dict[str, Any] = {
+        "symbol": str(_pick("Symbol", "symbol")).strip(),
+        "direction": side,
+        "time": _pick("Datetime_JST", "Time", "time"),
+        "datetime_jst": _pick("Datetime_JST", "datetime_jst"),
+        "hour_jst": _pick("Hour_JST", "hour_jst"),
+        "total_score": _pick("TotalScore", "total_score"),
+        "p1_score": _pick("P1_TrendScore", "p1_score"),
+        "p2_score": _pick("P2_FundingScore", "p2_score"),
+        "p3_score": _pick("P3_VolumeScore", "p3_score"),
+        "sym_htf_strength": _pick("SymHTF_Strength", "sym_htf_strength"),
+        "btc_htf_strength": _pick("BTC_HTF_Strength", "btc_htf_strength"),
+        "vol_ratio": _pick("VolRatio", "vol_ratio"),
+        "atr": _pick("ATR", "atr"),
+        "rsi": _pick("RSI", "rsi"),
+        "ltf_aligned": _pick("LTF_Aligned", "ltf_aligned"),
+        "fr_available": _pick("FR_Available", "fr_available"),
+        "vol_confirmed": _pick("VolConfirmed", "vol_confirmed"),
+        "btc_mode_compat": str(_pick("BTC_Mode_Compat", "btc_mode_compat")).strip().upper(),
+        "long_ai_score": _pick(
+            "long_ai_score",
+            "LONG_AI_SCORE",
+            "ai_proba_used",
+            "AI_Proba_Used",
+            "proba_used",
+            "Proba_Used",
+            "score_used",
+            "Score_Used",
+            default=np.nan,
+        ),
+        "short_ai_score": _pick(
+            "short_ai_score",
+            "SHORT_AI_SCORE",
+            "ai_proba_used",
+            "AI_Proba_Used",
+            "proba_used",
+            "Proba_Used",
+            "score_used",
+            "Score_Used",
+            default=np.nan,
+        ),
+        "ai_proba_used": _pick(
+            "ai_proba_used",
+            "AI_Proba_Used",
+            "proba_used",
+            "Proba_Used",
+            "score_used",
+            "Score_Used",
+            default=np.nan,
+        ),
+        "proba_used": _pick(
+            "proba_used",
+            "Proba_Used",
+            "ai_proba_used",
+            "AI_Proba_Used",
+            "score_used",
+            "Score_Used",
+            default=np.nan,
+        ),
+        "score_used": _pick(
+            "score_used",
+            "Score_Used",
+            "ai_proba_used",
+            "AI_Proba_Used",
+            "proba_used",
+            "Proba_Used",
+            default=np.nan,
+        ),
+    }
+
+    raw_ai_debug = _pick("ai_debug", "AI_Debug", "market_ai_debug", default=None)
+    if raw_ai_debug not in (None, ""):
+        if isinstance(raw_ai_debug, dict):
+            sig["ai_debug"] = raw_ai_debug
+        else:
+            try:
+                sig["ai_debug"] = json.loads(str(raw_ai_debug))
+            except Exception:
+                pass
+
+    try:
+        if side == "LONG":
+            lane, _ = _classify_long_lane(sig)
+            return str(lane or "")
+
+        if side == "SHORT":
+            lane, _ = _classify_short_lane(sig)
+            return str(lane or "")
+
+        return ""
+    except Exception:
+        return ""
 
 
 def _is_long_down_win_bucket(sig: Dict[str, Any]) -> bool:
