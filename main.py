@@ -2353,7 +2353,21 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
     if dt_str:
         lines.append(f"🕒 {dt_str}")
 
-    return "\n".join([x for x in lines if x])
+    body = "\n".join([x for x in lines if x])
+
+    # 4項目の人間監査ブロックを追加（V2キーをV1互換形式にマップ）
+    audit_item: Dict[str, Any] = dict(sig)
+    audit_item["is_buy"] = (direction == "LONG")
+    audit_item["btc_mode"] = sig.get("btc_mode_compat", "")
+    _ai_prob_raw = sig.get("ai_prob_win", sig.get("AI_Prob_Win", sig.get("ai_proba_used", "")))
+    try:
+        _ai_prob_f = float(_ai_prob_raw)
+        audit_item["ai_score"] = _ai_prob_f
+    except Exception:
+        audit_item["ai_score"] = float("nan")
+    audit_block = _build_signal_audit_block(audit_item)
+
+    return body + "\n\n" + audit_block
 
 
 def _audit_float(v: Any) -> float:
