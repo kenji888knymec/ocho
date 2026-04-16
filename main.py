@@ -1486,6 +1486,200 @@ def _lane_display_name(lane: str) -> str:
     return ""
 
 
+def _profile_env_name(profile_name: str) -> str:
+    key = re.sub(r"[^A-Z0-9]+", "_", str(profile_name or "").strip().upper())
+    return f"V2_FEATURE_PROFILE_{key}"
+
+
+def _parse_profile_spec(raw: str) -> Dict[str, str]:
+    spec: Dict[str, str] = {}
+    text = str(raw or "").strip()
+    if text == "":
+        return spec
+
+    for part in text.split(";"):
+        part = str(part).strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        spec[str(k).strip().lower()] = str(v).strip()
+    return spec
+
+
+def _profile_sig_value(sig: Dict[str, Any], key: str):
+    k = str(key or "").strip().lower()
+
+    if k == "side":
+        return str(sig.get("direction", sig.get("side", "")) or "").strip().upper()
+    if k == "mode":
+        return str(sig.get("btc_mode_compat", sig.get("btc_mode", "")) or "").strip().upper()
+    if k == "p1":
+        return _safe_float_or_nan(sig.get("p1_score"))
+    if k == "p2":
+        return _safe_float_or_nan(sig.get("p2_score"))
+    if k == "p3":
+        return _safe_float_or_nan(sig.get("p3_score"))
+    if k == "rsi":
+        return _safe_float_or_nan(sig.get("rsi"))
+    if k == "volratio":
+        return _safe_float_or_nan(sig.get("vol_ratio"))
+    if k == "ai":
+        return _safe_float_or_nan(
+            sig.get("ai_prob_win", sig.get("AI_Prob_Win", sig.get("ai_proba_used", "")))
+        )
+    if k == "ltf_aligned":
+        v = sig.get("ltf_aligned", "")
+        s = str(v or "").strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return 1.0
+        if s in ("0", "false", "no", "off"):
+            return 0.0
+        return np.nan
+    if k == "volconfirmed":
+        v = sig.get("vol_confirmed", "")
+        s = str(v or "").strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return 1.0
+        if s in ("0", "false", "no", "off"):
+            return 0.0
+        return np.nan
+    if k == "fr_available":
+        v = sig.get("fr_available", "")
+        s = str(v or "").strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return 1.0
+        if s in ("0", "false", "no", "off"):
+            return 0.0
+        return np.nan
+
+    return None
+
+
+def _profile_match_numeric(val: Any, min_v: str = "", max_v: str = "") -> bool:
+    x = _safe_float_or_nan(val)
+    if not np.isfinite(x):
+        return False
+
+    if str(min_v).strip() != "":
+        if float(x) < float(min_v):
+            return False
+
+    if str(max_v).strip() != "":
+        if float(x) >= float(max_v):
+            return False
+
+    return True
+
+
+def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
+    raw = os.environ.get(_profile_env_name(profile_name), "").strip()
+    spec = _parse_profile_spec(raw)
+    if not spec:
+        return False
+
+    side = str(spec.get("side", "")).strip().upper()
+    mode = str(spec.get("mode", "")).strip().upper()
+
+    if side:
+        sig_side = str(_profile_sig_value(sig, "side") or "").strip().upper()
+        if sig_side != side:
+            return False
+
+    if mode:
+        sig_mode = str(_profile_sig_value(sig, "mode") or "").strip().upper()
+        if sig_mode != mode:
+            return False
+
+    if "p1_min" in spec or "p1_max" in spec:
+        if not _profile_match_numeric(_profile_sig_value(sig, "p1"), spec.get("p1_min", ""), spec.get("p1_max", "")):
+            return False
+
+    if "p2_min" in spec or "p2_max" in spec:
+        if not _profile_match_numeric(_profile_sig_value(sig, "p2"), spec.get("p2_min", ""), spec.get("p2_max", "")):
+            return False
+
+    if "p3_min" in spec or "p3_max" in spec:
+        if not _profile_match_numeric(_profile_sig_value(sig, "p3"), spec.get("p3_min", ""), spec.get("p3_max", "")):
+            return False
+
+    if "rsi_min" in spec or "rsi_max" in spec:
+        if not _profile_match_numeric(_profile_sig_value(sig, "rsi"), spec.get("rsi_min", ""), spec.get("rsi_max", "")):
+            return False
+
+    if "volratio_min" in spec or "volratio_max" in spec:
+        if not _profile_match_numeric(
+            _profile_sig_value(sig, "volratio"),
+            spec.get("volratio_min", ""),
+            spec.get("volratio_max", ""),
+        ):
+            return False
+
+    if "ai_min" in spec or "ai_max" in spec:
+        if not _profile_match_numeric(_profile_sig_value(sig, "ai"), spec.get("ai_min", ""), spec.get("ai_max", "")):
+            return False
+
+    if "ltf_aligned" in spec:
+        v = _profile_sig_value(sig, "ltf_aligned")
+        if not np.isfinite(v) or int(v) != int(float(spec["ltf_aligned"])):
+            return False
+
+    if "volconfirmed" in spec:
+        v = _profile_sig_value(sig, "volconfirmed")
+        if not np.isfinite(v) or int(v) != int(float(spec["volconfirmed"])):
+            return False
+
+    if "fr_available" in spec:
+        v = _profile_sig_value(sig, "fr_available")
+        if not np.isfinite(v) or int(v) != int(float(spec["fr_available"])):
+            return False
+
+    return True
+
+
+def _apply_feature_profiles(sig: Dict[str, Any]) -> Dict[str, Any]:
+    allow_hits: List[str] = []
+    reject_hits: List[str] = []
+
+    if not V2_FEATURE_PROFILE_ENABLE:
+        sig["_feature_profile_allow_hits"] = allow_hits
+        sig["_feature_profile_reject_hits"] = reject_hits
+        sig["_feature_profile_gate"] = ""
+        return sig
+
+    for name in V2_FEATURE_ALLOW_PROFILES:
+        if _match_feature_profile(sig, name):
+            allow_hits.append(name)
+
+    for name in V2_FEATURE_REJECT_PROFILES:
+        if _match_feature_profile(sig, name):
+            reject_hits.append(name)
+
+    sig["_feature_profile_allow_hits"] = allow_hits
+    sig["_feature_profile_reject_hits"] = reject_hits
+
+    if reject_hits:
+        sig["_feature_profile_gate"] = "reject"
+    elif V2_FEATURE_PROFILE_REQUIRE_MATCH and V2_FEATURE_ALLOW_PROFILES and not allow_hits:
+        sig["_feature_profile_gate"] = "no_match"
+    elif allow_hits:
+        sig["_feature_profile_gate"] = "allow"
+    else:
+        sig["_feature_profile_gate"] = ""
+
+    return sig
+
+
+def _feature_profile_label(sig: Dict[str, Any]) -> str:
+    allow_hits = [str(x) for x in (sig.get("_feature_profile_allow_hits", []) or []) if str(x).strip()]
+    reject_hits = [str(x) for x in (sig.get("_feature_profile_reject_hits", []) or []) if str(x).strip()]
+
+    if reject_hits:
+        return f"reject:{'|'.join(reject_hits)}"
+    if allow_hits:
+        return f"allow:{'|'.join(allow_hits)}"
+    return ""
+
+
 def _detect_signal_lane(sig: Dict[str, Any]) -> str:
     direction = str(sig.get("direction", "") or sig.get("Direction", "")).strip().upper()
     if direction not in ("LONG", "SHORT"):
@@ -2366,10 +2560,14 @@ def _build_v2_discord_message(sig: Dict[str, Any]) -> str:
         recent_global_line = f"🌐 全体直近{int(recent_global['n'])}件: 参考不足"
 
     lane_name = _lane_display_name(_detect_signal_lane(sig))
+    feature_profile_text = ""
+    if V2_FEATURE_PROFILE_SHOW_IN_DISCORD:
+        feature_profile_text = _feature_profile_label(sig)
 
     lines = [
         f"{side_emoji}【{symbol} {direction}】",
         f"🧩 パターン：{lane_name}" if lane_name else "",
+        f"🧬 特徴量プロファイル：{feature_profile_text}" if feature_profile_text else "",
         f"🏷️ 強さ：{strength}",
         f"💰 Entry: {entry}" if entry else "",
         f"{tp_emoji} TP: {tp_price}" if tp_price else "",
@@ -4850,6 +5048,31 @@ V2_LONG_STRONG_BUCKET_RSI_MIN = _env_float("V2_LONG_STRONG_BUCKET_RSI_MIN", 40.0
 V2_LONG_STRONG_BUCKET_RSI_MAX = _env_float("V2_LONG_STRONG_BUCKET_RSI_MAX", 60.0)
 V2_LONG_STRONG_BUCKET_P2_MIN  = _env_float("V2_LONG_STRONG_BUCKET_P2_MIN", 0.0)
 V2_LONG_STRONG_AI_TH          = _env_float("V2_LONG_STRONG_AI_TH", 0.15)
+
+# --- Feature profile gate (env-driven) ---
+V2_FEATURE_PROFILE_ENABLE = str(
+    os.environ.get("V2_FEATURE_PROFILE_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_FEATURE_PROFILE_REQUIRE_MATCH = str(
+    os.environ.get("V2_FEATURE_PROFILE_REQUIRE_MATCH", "0")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_FEATURE_PROFILE_SHOW_IN_DISCORD = str(
+    os.environ.get("V2_FEATURE_PROFILE_SHOW_IN_DISCORD", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
+V2_FEATURE_ALLOW_PROFILES = [
+    s.strip()
+    for s in str(os.environ.get("V2_FEATURE_ALLOW_PROFILES", "")).split(",")
+    if s.strip()
+]
+
+V2_FEATURE_REJECT_PROFILES = [
+    s.strip()
+    for s in str(os.environ.get("V2_FEATURE_REJECT_PROFILES", "")).split(",")
+    if s.strip()
+]
 
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
@@ -11174,6 +11397,34 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     # Selection Pipeline: フィルター → スコア → ランキング
     # REJECTされたSHORTも ai_pass="0" で含まれる
     final_signals = v2_selection_pipeline(raw_signals)
+
+    for sig in final_signals:
+        _apply_feature_profiles(sig)
+
+        cur_note = str(sig.get("ai_note", "") or "")
+        profile_label = _feature_profile_label(sig)
+        if profile_label:
+            sig["ai_note"] = f"{cur_note};matched_profile={profile_label}" if cur_note else f"matched_profile={profile_label}"
+
+        gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
+        if gate == "reject":
+            cur_note2 = str(sig.get("ai_note", "") or "")
+            sig["ai_pass"] = "0"
+            sig["ai_band"] = "FEATURE_PROFILE_REJECT"
+            sig["ai_note"] = (
+                f"{cur_note2};selected=false;reason=feature_profile_reject"
+                if cur_note2 else
+                "selected=false;reason=feature_profile_reject"
+            )
+        elif gate == "no_match":
+            cur_note2 = str(sig.get("ai_note", "") or "")
+            sig["ai_pass"] = "0"
+            sig["ai_band"] = "FEATURE_PROFILE_NO_MATCH"
+            sig["ai_note"] = (
+                f"{cur_note2};selected=false;reason=feature_profile_no_match"
+                if cur_note2 else
+                "selected=false;reason=feature_profile_no_match"
+            )
 
     n_short_pass = sum(
         1 for x in final_signals
