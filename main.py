@@ -11407,6 +11407,17 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             sig["ai_note"] = f"{cur_note};matched_profile={profile_label}" if cur_note else f"matched_profile={profile_label}"
 
         gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
+
+        print(
+            "[FEATURE_PROFILE] "
+            f"sym={sig.get('symbol','')} "
+            f"side={sig.get('direction','')} "
+            f"gate={gate} "
+            f"allow_hits={sig.get('_feature_profile_allow_hits', [])} "
+            f"reject_hits={sig.get('_feature_profile_reject_hits', [])}",
+            flush=True,
+        )
+
         if gate == "reject":
             cur_note2 = str(sig.get("ai_note", "") or "")
             sig["ai_pass"] = "0"
