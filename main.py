@@ -12387,13 +12387,13 @@ def logic_main(force: bool = False):
                             _hour_fallback_for_long_ai = np.nan
 
                         long_ai_sig = {
-                            "symbol": row.get("Symbol", row.get("symbol", sym_code)),
-                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
-                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
-                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
-                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
-                            "hour_jst": row.get("Hour_JST", row.get("hour_jst", row.get("hour", _hour_fallback_for_long_ai))),
-                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
+                            "symbol": symbol.replace("/USDT", ""),
+                            "p1_score": np.nan,
+                            "p2_score": np.nan,
+                            "rsi": float(row["RSI"]) if "RSI" in row and pd.notna(row["RSI"]) else np.nan,
+                            "btc_mode_compat": str(btc_mode),
+                            "hour_jst": _hour_fallback_for_long_ai,
+                            "fr_available": "",
                         }
 
                         strong_ok, strong_reason = _check_long_strong_bucket(long_ai_sig)
