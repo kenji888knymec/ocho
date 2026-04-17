@@ -12714,8 +12714,8 @@ def logic_main(force: bool = False):
                 proba_used_val = chosen_dbg.get("proba_used", "")
                 invert_applied_val = chosen_dbg.get("ai_proba_invert_applied", "")
             else:
-                proba_raw_val = ""
-                proba_used_val = ""
+                proba_raw_val = ai_proba_used_val if ai_proba_used_val != "" else ""
+                proba_used_val = ai_proba_used_val if ai_proba_used_val != "" else ""
                 invert_applied_val = ""
             
             # --- DIRECT/REVERSE は ai_debug(AO) ではなく tag に逃がす ---
@@ -12750,7 +12750,7 @@ def logic_main(force: bool = False):
 
                 # AI_PROBA_INVERT の「証拠」も item に入れる（必要なら後で列追加できる）
                 "proba_raw": proba_raw_val,
-                "proba_used": proba_used_val,
+                "proba_used": proba_used_val if proba_used_val != "" else ai_proba_used_val,
                 "invert_applied": invert_applied_val,
                 "is_flip": bool(flipped),
 
@@ -12760,7 +12760,7 @@ def logic_main(force: bool = False):
                 # learn_log(AP..AS) 用
                 "ai_proba_base": ai_proba_base_val,
                 "ai_proba_flip": ai_proba_flip_val,
-                "ai_proba_used": ai_proba_used_val,
+                "ai_proba_used": ai_proba_used_val if ai_proba_used_val != "" else proba_used_val,
                 "ai_margin": ai_margin_val,
 
                 "BandWidth": float(row["BandWidth"]),
@@ -13212,7 +13212,7 @@ def logic_main(force: bool = False):
                 "[AI_DEC]"
                 f" sym={sym} side={('LONG' if item['is_buy'] else 'SHORT')}"
                 f" base={ai_proba_base_v} flip={ai_proba_flip_v} used={ai_proba_used_v} margin={ai_margin_v}"
-                f" ai_th={ai_th_effective} ai_pass={bool(item.get('ai_pass'))}"
+                f" ai_th={ai_th_effective} ai_pass={_is_ai_pass_true(item.get('ai_pass'))}"
                 f" invert_env={ai_proba_invert_env} invert_applied={invert_applied_v} proba_raw={proba_raw_v}"
             )
 
