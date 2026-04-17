@@ -11611,41 +11611,44 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             )
 
         # レーンプロファイル判定（ai_pass="1" の通過シグナルのみ）
-        if str(sig.get("ai_pass", "")) == "1":
-            _sig_direction = str(sig.get("direction", "")).strip().upper()
-            if _sig_direction in ("LONG", "SHORT"):
-                _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
-                profile_decision = _classify_lane_profile(_sig_direction, _lane, sig)
-                profile_name = profile_decision["profile"]
-                profile_stage = profile_decision["stage"]
-                profile_notify = profile_decision["notify"]
+        try:
+            if str(sig.get("ai_pass", "")) == "1":
+                _sig_direction = str(sig.get("direction", "")).strip().upper()
+                if _sig_direction in ("LONG", "SHORT"):
+                    _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
+                    profile_decision = _classify_lane_profile(_sig_direction, _lane, sig)
+                    profile_name = profile_decision["profile"]
+                    profile_stage = profile_decision["stage"]
+                    profile_notify = profile_decision["notify"]
 
-                sig["_lane_profile"] = profile_name
-                sig["_lane_profile_stage"] = profile_stage
+                    sig["_lane_profile"] = profile_name
+                    sig["_lane_profile_stage"] = profile_stage
 
-                if profile_stage == "reject":
-                    sig["ai_pass"] = "0"
-                    sig["_notify_pass"] = "0"
-                    cur_note3 = str(sig.get("ai_note", "") or "")
-                    sig["ai_note"] = (
-                        f"{cur_note3};lane_profile_reject={profile_name}"
-                        if cur_note3 else f"lane_profile_reject={profile_name}"
-                    )
-                elif profile_stage == "research":
-                    sig["_notify_pass"] = "0"
-                    cur_note3 = str(sig.get("ai_note", "") or "")
-                    sig["ai_note"] = (
-                        f"{cur_note3};lane_profile_research={profile_name}"
-                        if cur_note3 else f"lane_profile_research={profile_name}"
-                    )
-                else:
-                    if not profile_notify:
+                    if profile_stage == "reject":
+                        sig["ai_pass"] = "0"
                         sig["_notify_pass"] = "0"
                         cur_note3 = str(sig.get("ai_note", "") or "")
                         sig["ai_note"] = (
-                            f"{cur_note3};lane_profile_no_notify={profile_name}"
-                            if cur_note3 else f"lane_profile_no_notify={profile_name}"
+                            f"{cur_note3};lane_profile_reject={profile_name}"
+                            if cur_note3 else f"lane_profile_reject={profile_name}"
                         )
+                    elif profile_stage == "research":
+                        sig["_notify_pass"] = "0"
+                        cur_note3 = str(sig.get("ai_note", "") or "")
+                        sig["ai_note"] = (
+                            f"{cur_note3};lane_profile_research={profile_name}"
+                            if cur_note3 else f"lane_profile_research={profile_name}"
+                        )
+                    else:
+                        if not profile_notify:
+                            sig["_notify_pass"] = "0"
+                            cur_note3 = str(sig.get("ai_note", "") or "")
+                            sig["ai_note"] = (
+                                f"{cur_note3};lane_profile_no_notify={profile_name}"
+                                if cur_note3 else f"lane_profile_no_notify={profile_name}"
+                            )
+        except Exception as _lp_err:
+            logging.warning(f"[LANE-PROFILE-ERR] sym={sig.get('symbol','')} err={_lp_err}")
 
         try:
             _ai_prob_dbg = sig.get("ai_prob", sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")))
