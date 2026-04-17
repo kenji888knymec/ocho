@@ -5076,6 +5076,12 @@ V2_FEATURE_REJECT_PROFILES = [
     if s.strip()
 ]
 
+V2_FEATURE_BYPASS_PROFILES = [
+    s.strip()
+    for s in str(os.environ.get("V2_FEATURE_BYPASS_PROFILES", "")).split(",")
+    if s.strip()
+]
+
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
 V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8")))
@@ -11609,6 +11615,44 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 if cur_note2 else
                 "selected=false;reason=feature_profile_no_match"
             )
+        else:
+            allow_hits = [
+                str(x).strip()
+                for x in sig.get("_feature_profile_allow_hits", [])
+                if str(x).strip()
+            ]
+            bypass_hits = [
+                x for x in allow_hits
+                if x in V2_FEATURE_BYPASS_PROFILES
+            ]
+
+            if bypass_hits:
+                selected_bypass = bypass_hits[0]
+                cur_note2 = str(sig.get("ai_note", "") or "")
+
+                sig["_feature_bypass"] = "1"
+                sig["_feature_bypass_profile"] = selected_bypass
+                sig["ai_pass"] = "1"
+                sig["_notify_pass"] = "1"
+
+                if not str(sig.get("ai_band", "")).strip():
+                    sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
+
+                bypass_note = f"feature_profile_bypass={selected_bypass}"
+                if bypass_note not in cur_note2:
+                    sig["ai_note"] = (
+                        f"{cur_note2};{bypass_note}"
+                        if cur_note2 else
+                        bypass_note
+                    )
+
+                print(
+                    "[FEATURE_BYPASS] "
+                    f"sym={sig.get('symbol','')} "
+                    f"side={sig.get('direction','')} "
+                    f"profile={selected_bypass}",
+                    flush=True,
+                )
 
         # レーンプロファイル判定（ai_pass="1" の通過シグナルのみ）
         try:
