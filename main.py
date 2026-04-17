@@ -6171,6 +6171,19 @@ def v2_generate_signal(
 # Stage C: 15分スロットごとに上位N件のみ残す
 # ==========================================
 
+def _is_ai_pass_true(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return False
+
+
 def _safe_float_or_nan(value: Any) -> float:
     try:
         if value is None:
@@ -8656,6 +8669,15 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
 
             ai_res = _predict_v2_ai_score(sig, "SHORT", qs)
+
+            print(
+                f"[SHORT-AI-RES] sym={sig.get('symbol')} "
+                f"ok={bool(ai_res.get('ok'))} "
+                f"score={ai_res.get('score', '')} "
+                f"note={ai_res.get('note', '')} "
+                f"model_type={ai_res.get('model_type', '')} "
+                f"model_version={ai_res.get('model_version', '')}"
+            )
 
             if not bool(ai_res.get("ok")):
                 ai_score = ai_res.get("score", np.nan)
@@ -13044,7 +13066,7 @@ def logic_main(force: bool = False):
                 f" sym={sym} side={('LONG' if item['is_buy'] else 'SHORT')}"
                 f" reason={missing_reason}"
                 f" base={ai_proba_base_v} flip={ai_proba_flip_v} used={ai_proba_used_v} ai_th={ai_th_effective}"
-                f" ai_pass={bool(item.get('ai_pass'))}"
+                f" ai_pass={_is_ai_pass_true(item.get('ai_pass'))}"
                 f" invert_env={os.environ.get('AI_PROBA_INVERT', '')}"
             )
             # 欠損時は列には空欄を書き込む（候補行は残す）
@@ -13080,7 +13102,7 @@ def logic_main(force: bool = False):
             dt_cell, sym, ("LONG" if item["is_buy"] else "SHORT"),
             float(item["close"]), float(item["score"]), float(item["sigma"]), "CANDIDATE",
             float(tp), float(sl), float(tp_pct), float(sl_pct),
-            DEFAULT_LEV, "", "", bool(item["ai_pass"]), bool(BTC_CALM),
+            DEFAULT_LEV, "", "", _is_ai_pass_true(item.get("ai_pass")), bool(BTC_CALM),
             VERSION, item["type"], "", "",
             ("STORM" if not BTC_CALM else "CALM"), btc_mode, float(btc_1h_change),
             float(item["rsi"]), note_str,
