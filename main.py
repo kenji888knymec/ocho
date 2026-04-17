@@ -12352,18 +12352,26 @@ def logic_main(force: bool = False):
 
                         ai_th_effective = max(float(ai_th_used), float(LONG_AI_TH))
 
-                        src_sig = locals().get("item", {})
-                        if not isinstance(src_sig, dict):
-                            src_sig = {}
+                        _time_ms_for_long_ai = row.get("Time", row.get("time", None))
+                        _hour_fallback_for_long_ai = np.nan
+
+                        try:
+                            if _time_ms_for_long_ai is not None and str(_time_ms_for_long_ai).strip() != "":
+                                _hour_fallback_for_long_ai = datetime.fromtimestamp(
+                                    float(_time_ms_for_long_ai) / 1000.0,
+                                    JST,
+                                ).hour
+                        except Exception:
+                            _hour_fallback_for_long_ai = np.nan
 
                         long_ai_sig = {
-                            "symbol": src_sig.get("symbol", row.get("Symbol", row.get("symbol", sym_code))),
-                            "p1_score": src_sig.get("p1_score", row.get("P1_TrendScore", row.get("p1_score", np.nan))),
-                            "p2_score": src_sig.get("p2_score", row.get("P2_FundingScore", row.get("p2_score", np.nan))),
-                            "rsi": src_sig.get("rsi", row.get("RSI", row.get("rsi", np.nan))),
-                            "btc_mode_compat": src_sig.get("btc_mode_compat", row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode))),
-                            "hour_jst": src_sig.get("hour", row.get("Hour_JST", row.get("hour", row.get("hour_jst", np.nan)))),
-                            "fr_available": src_sig.get("fr_available", row.get("FR_Available", row.get("fr_available", ""))),
+                            "symbol": row.get("Symbol", row.get("symbol", sym_code)),
+                            "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
+                            "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
+                            "rsi": row.get("RSI", row.get("rsi", np.nan)),
+                            "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
+                            "hour_jst": row.get("Hour_JST", row.get("hour_jst", row.get("hour", _hour_fallback_for_long_ai))),
+                            "fr_available": row.get("FR_Available", row.get("fr_available", "")),
                         }
 
                         strong_ok, strong_reason = _check_long_strong_bucket(long_ai_sig)
@@ -12625,6 +12633,16 @@ def logic_main(force: bool = False):
                 "market_ai_score": "",
                 "market_ai_pass": "",
                 "market_ai_debug": "",
+
+                # --- lane profile 用の runtime 特徴量を保持 ---
+                "p1_score": row.get("P1_TrendScore", row.get("p1_score", np.nan)),
+                "p2_score": row.get("P2_FundingScore", row.get("p2_score", np.nan)),
+                "p3_score": row.get("P3_VolumeScore", row.get("p3_score", np.nan)),
+                "hour_jst": row.get("Hour_JST", row.get("hour_jst", now_jst.hour)),
+                "fr_available": row.get("FR_Available", row.get("fr_available", "")),
+                "vol_confirmed": row.get("VolConfirmed", row.get("vol_confirmed", "")),
+                "btc_mode_compat": row.get("BTC_Mode_Compat", row.get("btc_mode_compat", btc_mode)),
+                "ai_prob_win": ai_proba_used_val if ai_proba_used_val != "" else ai_score,
 
                 # --- 追加：通知判定結果の一時保持用（Phase1/Phase2で使用） ---
                 "_regime_mode": "",
