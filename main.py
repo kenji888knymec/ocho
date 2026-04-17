@@ -6,6 +6,7 @@ import subprocess
 import re
 import json
 import math
+import logging
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -11636,14 +11637,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             _notify_dbg = str(sig.get("_notify_pass", "0"))
             _th_dbg = LONG_AI_TH if _dir_dbg == "LONG" else SHORT_AI_TH if _dir_dbg == "SHORT" else AI_TH
 
-            print(
+            logging.warning(
                 f"[AI-TRACE] side={_dir_dbg} symbol={_sym_dbg} "
                 f"score={_score_dbg} ai_prob={_ai_prob_dbg} th={_th_dbg} "
                 f"ai_pass={_ai_pass_dbg} notify={_notify_dbg} "
                 f"lane={_lane_dbg} lane_profile={_lp_dbg} lane_stage={_lps_dbg}"
             )
         except Exception as e:
-            print(f"[AI-TRACE-ERR] {e}")
+            logging.warning(f"[AI-TRACE-ERR] {e}")
 
     n_short_pass = sum(
         1 for x in final_signals
