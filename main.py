@@ -11740,8 +11740,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 )
 
         # レーンプロファイル判定（ai_pass="1" の通過シグナルのみ）
+        # ただし feature bypass 通過シグナルは lane profile で落とさない
         try:
-            if str(sig.get("ai_pass", "")) == "1":
+            if str(sig.get("ai_pass", "")) == "1" and str(sig.get("_feature_bypass", "0")) != "1":
                 _sig_direction = str(sig.get("direction", "")).strip().upper()
                 if _sig_direction in ("LONG", "SHORT"):
                     _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
