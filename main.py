@@ -5076,6 +5076,12 @@ V2_FEATURE_REJECT_PROFILES = [
     if s.strip()
 ]
 
+V2_FEATURE_BYPASS_PROFILES = [
+    s.strip()
+    for s in str(os.environ.get("V2_FEATURE_BYPASS_PROFILES", "")).split(",")
+    if s.strip()
+]
+
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
 V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8")))
@@ -11609,43 +11615,84 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 if cur_note2 else
                 "selected=false;reason=feature_profile_no_match"
             )
+        else:
+            allow_hits = [
+                str(x).strip()
+                for x in sig.get("_feature_profile_allow_hits", [])
+                if str(x).strip()
+            ]
+            bypass_hits = [
+                x for x in allow_hits
+                if x in V2_FEATURE_BYPASS_PROFILES
+            ]
+
+            if bypass_hits:
+                selected_bypass = bypass_hits[0]
+                cur_note2 = str(sig.get("ai_note", "") or "")
+
+                sig["_feature_bypass"] = "1"
+                sig["_feature_bypass_profile"] = selected_bypass
+                sig["ai_pass"] = "1"
+                sig["_notify_pass"] = "1"
+
+                if not str(sig.get("ai_band", "")).strip():
+                    sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
+
+                bypass_note = f"feature_profile_bypass={selected_bypass}"
+                if bypass_note not in cur_note2:
+                    sig["ai_note"] = (
+                        f"{cur_note2};{bypass_note}"
+                        if cur_note2 else
+                        bypass_note
+                    )
+
+                print(
+                    "[FEATURE_BYPASS] "
+                    f"sym={sig.get('symbol','')} "
+                    f"side={sig.get('direction','')} "
+                    f"profile={selected_bypass}",
+                    flush=True,
+                )
 
         # レーンプロファイル判定（ai_pass="1" の通過シグナルのみ）
-        if str(sig.get("ai_pass", "")) == "1":
-            _sig_direction = str(sig.get("direction", "")).strip().upper()
-            if _sig_direction in ("LONG", "SHORT"):
-                _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
-                profile_decision = _classify_lane_profile(_sig_direction, _lane, sig)
-                profile_name = profile_decision["profile"]
-                profile_stage = profile_decision["stage"]
-                profile_notify = profile_decision["notify"]
+        try:
+            if str(sig.get("ai_pass", "")) == "1":
+                _sig_direction = str(sig.get("direction", "")).strip().upper()
+                if _sig_direction in ("LONG", "SHORT"):
+                    _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
+                    profile_decision = _classify_lane_profile(_sig_direction, _lane, sig)
+                    profile_name = profile_decision["profile"]
+                    profile_stage = profile_decision["stage"]
+                    profile_notify = profile_decision["notify"]
 
-                sig["_lane_profile"] = profile_name
-                sig["_lane_profile_stage"] = profile_stage
+                    sig["_lane_profile"] = profile_name
+                    sig["_lane_profile_stage"] = profile_stage
 
-                if profile_stage == "reject":
-                    sig["ai_pass"] = "0"
-                    sig["_notify_pass"] = "0"
-                    cur_note3 = str(sig.get("ai_note", "") or "")
-                    sig["ai_note"] = (
-                        f"{cur_note3};lane_profile_reject={profile_name}"
-                        if cur_note3 else f"lane_profile_reject={profile_name}"
-                    )
-                elif profile_stage == "research":
-                    sig["_notify_pass"] = "0"
-                    cur_note3 = str(sig.get("ai_note", "") or "")
-                    sig["ai_note"] = (
-                        f"{cur_note3};lane_profile_research={profile_name}"
-                        if cur_note3 else f"lane_profile_research={profile_name}"
-                    )
-                else:
-                    if not profile_notify:
+                    if profile_stage == "reject":
+                        sig["ai_pass"] = "0"
                         sig["_notify_pass"] = "0"
                         cur_note3 = str(sig.get("ai_note", "") or "")
                         sig["ai_note"] = (
-                            f"{cur_note3};lane_profile_no_notify={profile_name}"
-                            if cur_note3 else f"lane_profile_no_notify={profile_name}"
+                            f"{cur_note3};lane_profile_reject={profile_name}"
+                            if cur_note3 else f"lane_profile_reject={profile_name}"
                         )
+                    elif profile_stage == "research":
+                        sig["_notify_pass"] = "0"
+                        cur_note3 = str(sig.get("ai_note", "") or "")
+                        sig["ai_note"] = (
+                            f"{cur_note3};lane_profile_research={profile_name}"
+                            if cur_note3 else f"lane_profile_research={profile_name}"
+                        )
+                    else:
+                        if not profile_notify:
+                            sig["_notify_pass"] = "0"
+                            cur_note3 = str(sig.get("ai_note", "") or "")
+                            sig["ai_note"] = (
+                                f"{cur_note3};lane_profile_no_notify={profile_name}"
+                                if cur_note3 else f"lane_profile_no_notify={profile_name}"
+                            )
+        except Exception as _lp_err:
+            logging.warning(f"[LANE-PROFILE-ERR] sym={sig.get('symbol','')} err={_lp_err}")
 
         try:
             _ai_prob_dbg = sig.get("ai_prob", sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")))
