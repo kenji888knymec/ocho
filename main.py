@@ -96,6 +96,10 @@ V2_NOTIFY_IGNORE_RUNTIME_DEDUP = str(
     os.environ.get("V2_NOTIFY_IGNORE_RUNTIME_DEDUP", "0")
 ).strip().lower() in ("1", "true", "yes", "on")
 
+V2_WATCH_NOTIFY_ENABLE = str(
+    os.environ.get("V2_WATCH_NOTIFY_ENABLE", "1")
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Hyperliquid: 最大5倍銘柄（この銘柄だけ HL 表示を x5 にする）
 # ※環境変数 MAX_LEV_5X_SYMBOLS が未設定（空）の場合は、このデフォルトセットを使う
 HL_MAX5_SYMBOLS = {"STX", "XLM", "FET", "HBAR", "POL"}
@@ -11872,7 +11876,11 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         ]
 
         sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
-        watch_sent_n, watch_runtime_dedup_skipped_n = send_v2_watch_discord_alerts(final_signals)
+
+        if V2_WATCH_NOTIFY_ENABLE:
+            watch_sent_n, watch_runtime_dedup_skipped_n = send_v2_watch_discord_alerts(final_signals)
+        else:
+            watch_sent_n, watch_runtime_dedup_skipped_n = 0, 0
 
         print(
             f"[V2] engine_mode=v2_live "
@@ -11881,7 +11889,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             f"discord_runtime_dedup_skipped={runtime_dedup_skipped_n} "
             f"watch_discord_sent={watch_sent_n} "
             f"watch_runtime_dedup_skipped={watch_runtime_dedup_skipped_n} "
-            f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)}"
+            f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)} "
+            f"watch_notify_enable={int(V2_WATCH_NOTIFY_ENABLE)}"
         )
     else:
         sent_n, runtime_dedup_skipped_n = 0, 0
