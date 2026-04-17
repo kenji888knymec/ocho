@@ -5082,6 +5082,35 @@ V2_FEATURE_BYPASS_PROFILES = [
     if s.strip()
 ]
 
+def _get_feature_bypass_profile(sig: Dict[str, Any]) -> str:
+    """
+    強い特徴量プロファイルに一致した場合だけ、その profile 名を返す。
+    一致しなければ空文字を返す。
+    """
+    if not V2_FEATURE_PROFILE_ENABLE:
+        return ""
+
+    try:
+        _apply_feature_profiles(sig)
+    except Exception:
+        return ""
+
+    gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
+    if gate != "allow":
+        return ""
+
+    allow_hits = [
+        str(x).strip()
+        for x in sig.get("_feature_profile_allow_hits", [])
+        if str(x).strip()
+    ]
+
+    for name in allow_hits:
+        if name in V2_FEATURE_BYPASS_PROFILES:
+            return name
+
+    return ""
+
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_PAUSE_LOOKBACK_HOURS = int(float(os.environ.get("V2_SHORT_PAUSE_LOOKBACK_HOURS", "24")))
 V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8")))
@@ -8645,6 +8674,32 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         direction = str(sig.get("direction", "")).strip().upper()
 
         if direction == "SHORT":
+            bypass_profile = _get_feature_bypass_profile(sig)
+            if bypass_profile:
+                cur_note = str(sig.get("ai_note", "") or "")
+                bypass_note = f"feature_profile_bypass={bypass_profile}"
+
+                sig["_feature_bypass"] = "1"
+                sig["_feature_bypass_profile"] = bypass_profile
+                sig["ai_pass"] = "1"
+                sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
+                sig["ai_model_version"] = "feature_profile"
+                sig["ai_model_type"] = "SHORT_FEATURE_BYPASS"
+
+                if bypass_note not in cur_note:
+                    sig["ai_note"] = (
+                        f"{cur_note};{bypass_note}"
+                        if cur_note else
+                        bypass_note
+                    )
+
+                short_passed.append(sig)
+                print(
+                    f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=SHORT profile={bypass_profile}",
+                    flush=True,
+                )
+                continue
+
             ok, reason = defensive_filter(sig)
 
             if not ok:
@@ -8723,6 +8778,32 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             continue
 
         if direction == "LONG":
+            bypass_profile = _get_feature_bypass_profile(sig)
+            if bypass_profile:
+                cur_note = str(sig.get("ai_note", "") or "")
+                bypass_note = f"feature_profile_bypass={bypass_profile}"
+
+                sig["_feature_bypass"] = "1"
+                sig["_feature_bypass_profile"] = bypass_profile
+                sig["ai_pass"] = "1"
+                sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
+                sig["ai_model_version"] = "feature_profile"
+                sig["ai_model_type"] = "LONG_FEATURE_BYPASS"
+
+                if bypass_note not in cur_note:
+                    sig["ai_note"] = (
+                        f"{cur_note};{bypass_note}"
+                        if cur_note else
+                        bypass_note
+                    )
+
+                long_passed.append(sig)
+                print(
+                    f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=LONG profile={bypass_profile}",
+                    flush=True,
+                )
+                continue
+
             research_tags = _get_long_research_tags(sig)
             research_note = "|".join(research_tags)
             rescued_p1 = _allow_long_p1_rescue(sig)
