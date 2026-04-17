@@ -5,6 +5,7 @@ import hashlib
 import subprocess
 import re
 import json
+import math
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -6379,18 +6380,167 @@ def _classify_long_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
 def _classify_short_lane(sig: Dict[str, Any]) -> Tuple[str, str]:
     """
     SHORT を 2レーンに分ける。
+    - short_retrace : 戻り売りSHORT（push/strong hour — 先に判定）
     - short_trend   : 下げ継続SHORT（今の core）
-    - short_retrace : 戻り売りSHORT（今の push/strong hour）
     """
-    trend_ok, trend_reason = _check_short_win_bucket(sig)
-    if trend_ok:
-        return "short_trend", str(trend_reason)
-
     retrace_ok = _is_short_strong_hour_bucket(sig)
     if retrace_ok:
         return "short_retrace", "short_retrace_pass"
 
+    trend_ok, trend_reason = _check_short_win_bucket(sig)
+    if trend_ok:
+        return "short_trend", str(trend_reason)
+
     return "", str(trend_reason)
+
+
+PROFILE_KEYMAP = {
+    "p1": "p1_score",
+    "p2": "p2_score",
+    "p3": "p3_score",
+    "rsi": "rsi",
+    "vol": "vol_ratio",
+    "ai": "ai_prob_win",
+    "volconfirmed": "vol_confirmed",
+}
+
+
+def _profile_raw_value(feats, name):
+    key = PROFILE_KEYMAP[name]
+    return feats.get(key)
+
+
+def _profile_float(feats, name):
+    value = _profile_raw_value(feats, name)
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except Exception:
+        return None
+    if math.isnan(value):
+        return None
+    return value
+
+
+def _profile_bool(feats, name):
+    value = _profile_raw_value(feats, name)
+    if isinstance(value, bool):
+        return value
+    if value in (1, "1", "true", "True", "TRUE"):
+        return True
+    if value in (0, "0", "false", "False", "FALSE"):
+        return False
+    return None
+
+
+def _peq(value, target, tol=1e-9):
+    if value is None:
+        return False
+    return abs(value - target) <= tol
+
+
+def _plt(value, target):
+    return value is not None and value < target
+
+
+def _ple(value, target):
+    return value is not None and value <= target
+
+
+def _pge(value, target):
+    return value is not None and value >= target
+
+
+def _pband(value, low=None, high=None):
+    if value is None:
+        return False
+    if low is not None and value < low:
+        return False
+    if high is not None and value >= high:
+        return False
+    return True
+
+
+def _pis_missing(value):
+    if value is None:
+        return True
+    try:
+        return math.isnan(float(value))
+    except Exception:
+        return False
+
+
+def _pcsv_env(name, default_value):
+    raw = os.getenv(name, default_value).strip()
+    if not raw:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+LANE_NOTIFY_STAGES = {
+    "long_trend": _pcsv_env("LANE_LONG_TREND_NOTIFY_STAGES", "stable,mid"),
+    "long_recovery": _pcsv_env("LANE_LONG_RECOVERY_NOTIFY_STAGES", ""),
+    "short_trend": _pcsv_env("LANE_SHORT_TREND_NOTIFY_STAGES", "stable,mid"),
+    "short_retrace": _pcsv_env("LANE_SHORT_RETRACE_NOTIFY_STAGES", ""),
+}
+
+
+def _notify_stage_enabled(lane, stage):
+    return stage in LANE_NOTIFY_STAGES.get(lane, set())
+
+
+def _classify_lane_profile(side: str, lane: str, feats: Dict[str, Any]) -> Dict[str, Any]:
+    p1 = _profile_float(feats, "p1")
+    p2 = _profile_float(feats, "p2")
+    p3 = _profile_float(feats, "p3")
+    rsi = _profile_float(feats, "rsi")
+    vol = _profile_float(feats, "vol")
+    ai_raw = _profile_raw_value(feats, "ai")
+    ai = _profile_float(feats, "ai")
+    volconfirmed = _profile_bool(feats, "volconfirmed")
+
+    if side == "LONG" and lane == "long_trend":
+        if _pband(p1, 2.0, 2.5) and _peq(p2, 0.0) and _ple(p3, -0.1) and _pband(ai, 0.45, 0.8):
+            return {"profile": "lt_stable_p1_20_25_p2_0_p3_le_m01_ai_045_08", "stage": "stable", "notify": _notify_stage_enabled("long_trend", "stable")}
+        if _peq(p2, 0.0) and _pband(rsi, 40.0, 45.0) and _ple(vol, 0.5):
+            return {"profile": "lt_stable_p2_0_rsi_40_45_vol_le_05", "stage": "stable", "notify": _notify_stage_enabled("long_trend", "stable")}
+        if _pband(p1, 1.5, 2.0) and _ple(vol, 0.5) and _ple(p3, -0.1):
+            return {"profile": "lt_mid_p1_15_20_vol_le_05_p3_le_m01", "stage": "mid", "notify": _notify_stage_enabled("long_trend", "mid")}
+        if _pband(p1, 1.5, 2.0) and _pband(rsi, 40.0, 45.0) and _pband(vol, 0.5, 1.0):
+            return {"profile": "lt_reject_p1_15_20_rsi_40_45_vol_05_10", "stage": "reject", "notify": False}
+        if _pband(p1, 2.0, 2.5) and _pband(ai, 0.2, 0.45):
+            return {"profile": "lt_reject_p1_20_25_ai_02_045", "stage": "reject", "notify": False}
+        return {"profile": "lt_other", "stage": "research", "notify": False}
+
+    if side == "LONG" and lane == "long_recovery":
+        if _pband(p1, 2.0, 2.5) and _peq(p2, 0.0) and _ple(p3, -0.1) and _pband(rsi, 55.0, 60.0):
+            return {"profile": "lr_research_p1_20_25_p2_0_p3_le_m01_rsi_55_60", "stage": "research", "notify": False}
+        if _pband(p1, 2.0, 2.5) and _ple(p3, -0.1) and _pband(rsi, 55.0, 60.0):
+            return {"profile": "lr_research_p1_20_25_p3_le_m01_rsi_55_60", "stage": "research", "notify": False}
+        if _pge(p1, 2.5) and _ple(vol, 0.5):
+            return {"profile": "lr_reject_p1_ge_25_vol_le_05", "stage": "reject", "notify": False}
+        return {"profile": "lr_other", "stage": "research", "notify": False}
+
+    if side == "SHORT" and lane == "short_trend":
+        if _peq(p2, 0.0) and _plt(rsi, 40.0):
+            return {"profile": "st_stable_p2_0_rsi_lt_40", "stage": "stable", "notify": _notify_stage_enabled("short_trend", "stable")}
+        if _pband(p1, 1.5, 2.0) and _pis_missing(ai_raw) and _pband(vol, 0.5, 1.0):
+            return {"profile": "st_stable_p1_15_20_ai_nan_vol_05_10", "stage": "stable", "notify": _notify_stage_enabled("short_trend", "stable")}
+        if _pband(p1, 1.5, 2.0) and _pge(p3, 0.1) and _pband(vol, 1.0, 2.0) and volconfirmed is True:
+            return {"profile": "st_mid_p1_15_20_p3_ge_01_vol_10_20_volconfirmed_1", "stage": "mid", "notify": _notify_stage_enabled("short_trend", "mid")}
+        if _pband(rsi, 45.0, 50.0) and volconfirmed is False:
+            return {"profile": "st_reject_rsi_45_50_volconfirmed_0", "stage": "reject", "notify": False}
+        if _peq(p2, 0.0) and _pband(rsi, 45.0, 50.0):
+            return {"profile": "st_reject_p2_0_rsi_45_50", "stage": "reject", "notify": False}
+        return {"profile": "st_other", "stage": "research", "notify": False}
+
+    if side == "SHORT" and lane == "short_retrace":
+        if _pband(vol, 1.0, 2.0) and _pband(p1, 1.5, 2.0) and _plt(rsi, 45.0) and _pis_missing(ai_raw):
+            return {"profile": "sr_research_vol_10_20_p1_15_20_rsi_lt_45_ai_nan", "stage": "research", "notify": False}
+        return {"profile": "sr_other", "stage": "research", "notify": False}
+
+    return {"profile": "unknown_lane", "stage": "reject", "notify": False}
 
 
 def _classify_train_lane_from_row(row: Dict[str, Any]) -> str:
@@ -11436,6 +11586,43 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 if cur_note2 else
                 "selected=false;reason=feature_profile_no_match"
             )
+
+        # レーンプロファイル判定（ai_pass="1" の通過シグナルのみ）
+        if str(sig.get("ai_pass", "")) == "1":
+            _sig_direction = str(sig.get("direction", "")).strip().upper()
+            if _sig_direction in ("LONG", "SHORT"):
+                _lane = _get_runtime_lane_for_signal(sig, _sig_direction)
+                profile_decision = _classify_lane_profile(_sig_direction, _lane, sig)
+                profile_name = profile_decision["profile"]
+                profile_stage = profile_decision["stage"]
+                profile_notify = profile_decision["notify"]
+
+                sig["_lane_profile"] = profile_name
+                sig["_lane_profile_stage"] = profile_stage
+
+                if profile_stage == "reject":
+                    sig["ai_pass"] = "0"
+                    sig["_notify_pass"] = "0"
+                    cur_note3 = str(sig.get("ai_note", "") or "")
+                    sig["ai_note"] = (
+                        f"{cur_note3};lane_profile_reject={profile_name}"
+                        if cur_note3 else f"lane_profile_reject={profile_name}"
+                    )
+                elif profile_stage == "research":
+                    sig["_notify_pass"] = "0"
+                    cur_note3 = str(sig.get("ai_note", "") or "")
+                    sig["ai_note"] = (
+                        f"{cur_note3};lane_profile_research={profile_name}"
+                        if cur_note3 else f"lane_profile_research={profile_name}"
+                    )
+                else:
+                    if not profile_notify:
+                        sig["_notify_pass"] = "0"
+                        cur_note3 = str(sig.get("ai_note", "") or "")
+                        sig["ai_note"] = (
+                            f"{cur_note3};lane_profile_no_notify={profile_name}"
+                            if cur_note3 else f"lane_profile_no_notify={profile_name}"
+                        )
 
     n_short_pass = sum(
         1 for x in final_signals
