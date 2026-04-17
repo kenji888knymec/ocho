@@ -11624,6 +11624,27 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                             if cur_note3 else f"lane_profile_no_notify={profile_name}"
                         )
 
+        try:
+            _ai_prob_dbg = sig.get("ai_prob", sig.get("ai_prob_win", sig.get("AI_Prob_Win", "")))
+            _score_dbg = sig.get("score", sig.get("total_score", sig.get("TotalScore", "")))
+            _dir_dbg = str(sig.get("direction", "")).upper()
+            _lane_dbg = sig.get("_runtime_lane", sig.get("lane", ""))
+            _lp_dbg = sig.get("_lane_profile", "")
+            _lps_dbg = sig.get("_lane_profile_stage", "")
+            _sym_dbg = sig.get("symbol", sig.get("Symbol", ""))
+            _ai_pass_dbg = str(sig.get("ai_pass", ""))
+            _notify_dbg = str(sig.get("_notify_pass", "0"))
+            _th_dbg = LONG_AI_TH if _dir_dbg == "LONG" else SHORT_AI_TH if _dir_dbg == "SHORT" else AI_TH
+
+            print(
+                f"[AI-TRACE] side={_dir_dbg} symbol={_sym_dbg} "
+                f"score={_score_dbg} ai_prob={_ai_prob_dbg} th={_th_dbg} "
+                f"ai_pass={_ai_pass_dbg} notify={_notify_dbg} "
+                f"lane={_lane_dbg} lane_profile={_lp_dbg} lane_stage={_lps_dbg}"
+            )
+        except Exception as e:
+            print(f"[AI-TRACE-ERR] {e}")
+
     n_short_pass = sum(
         1 for x in final_signals
         if str(x.get("direction", "")).upper() == "SHORT" and str(x.get("ai_pass", "")) == "1"
