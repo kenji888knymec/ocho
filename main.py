@@ -5896,6 +5896,7 @@ def v2_generate_signal(
     btc_htf: Dict[str, Any],
     now_jst: datetime,
     regime_info: Optional[Dict[str, Any]] = None,
+    feature_probe_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     1銘柄を評価。合意なければ None。
@@ -6033,6 +6034,58 @@ def v2_generate_signal(
             )
             return None
 
+    # feature_probe_only モード用ヘルパー
+    # direction が確定した後のゲートで return None する代わりに呼ぶ。
+    # p2/p3 はこの時点では未取得なので np.nan を入れる（バイパスプロファイル判定には不要）。
+    def _build_feature_probe_sig(probe_reason: str) -> Optional[Dict[str, Any]]:
+        if not feature_probe_only:
+            return None
+        _dir = direction
+        _ltf_e = ltf_eval_long if _dir == "LONG" else ltf_eval_short
+        _p1 = float(sym_htf_strength) + float(_ltf_e.get("score", 0.0) or 0.0)
+        if btc_dir == _dir:
+            _p1 += btc_str * 0.5
+        return {
+            "symbol": sym,
+            "direction": _dir,
+            "p1_score": _p1,
+            "p2_score": np.nan,
+            "p3_score": np.nan,
+            "total_score": _p1,
+            "score": _p1,
+            "rsi": _ltf_e.get("rsi", np.nan),
+            "ltf_aligned": _ltf_e.get("score", 0.0) >= 0.5,
+            "fr_available": False,
+            "vol_confirmed": False,
+            "vol_ratio": np.nan,
+            "funding_rate": np.nan,
+            "btc_htf_dir": btc_dir,
+            "btc_htf_strength": btc_str,
+            "sym_htf_dir": sym_htf.get("direction", ""),
+            "sym_htf_strength": sym_htf_strength,
+            "btc_mode_compat": {"LONG": "Up", "SHORT": "Down", "NEUTRAL": "Range"}.get(btc_dir, "Range"),
+            "hour": hour,
+            "hour_jst": hour,
+            "_feature_probe": "1",
+            "_probe_reason": probe_reason,
+            "entry_price": np.nan,
+            "tp": np.nan,
+            "sl": np.nan,
+            "tp_pct": np.nan,
+            "sl_pct": np.nan,
+            "atr": np.nan,
+            "sigma": np.nan,
+            "BandWidth": np.nan,
+            "BW_Change": np.nan,
+            "Vol_Change": np.nan,
+            "btc_ret": np.nan,
+            "btc_vol": np.nan,
+            "time_ms": closed_bar_time_ms,
+            "dt": closed_bar_dt,
+            "long_raw_rescue": bool(long_rescue),
+            "short_raw_rescue": bool(short_rescue),
+        }
+
     # side別シンボル blocklist
     long_block = set(V2_LONG_SYMBOL_BLOCKLIST or [])
     short_block = set(V2_SHORT_SYMBOL_BLOCKLIST or [])
@@ -6042,14 +6095,14 @@ def v2_generate_signal(
             "long_symbol_block",
             f"sym={sym} blocklist={sorted(long_block)}"
         )
-        return None
+        return _build_feature_probe_sig("long_symbol_block")
 
     if direction == "SHORT" and sym in short_block:
         _v2_reject(
             "short_symbol_block",
             f"sym={sym} blocklist={sorted(short_block)}"
         )
-        return None
+        return _build_feature_probe_sig("short_symbol_block")
 
     # BTC整合チェック
     # LONG raw rescue で方向を LONG にした場合は、ここで即死させず後段に回す
@@ -6059,21 +6112,21 @@ def v2_generate_signal(
                 "btc_conflict_block",
                 f"direction={direction} btc_dir={btc_dir} btc_str={btc_str} min={V2_BTC_CONFLICT_STRONG_TH}"
             )
-            return None
+            return _build_feature_probe_sig("btc_conflict_block")
 
     if V2_SHORT_REGIME_CONFLICT_BLOCK_ENABLE and short_regime_conflict and direction == "SHORT":
         _v2_reject(
             "regime_conflict_block",
             f"direction={direction} btc_dir={btc_dir} short_regime_conflict=True"
         )
-        return None
+        return _build_feature_probe_sig("regime_conflict_block_short")
 
     if long_regime_conflict and direction == "LONG":
         _v2_reject(
             "regime_conflict_block",
             f"direction={direction} btc_dir={btc_dir} long_regime_conflict=True"
         )
-        return None
+        return _build_feature_probe_sig("regime_conflict_block_long")
 
     # 方向別LTF評価
     if direction == "LONG":
@@ -6099,7 +6152,7 @@ def v2_generate_signal(
             f"sym_htf_strength={sym_htf['strength']:.4f} ltf_score={ltf_eval['score']:.4f} "
             f"btc_dir={btc_dir} btc_str={btc_str:.4f}"
         )
-        return None
+        return _build_feature_probe_sig("pillar1_below_min")
 
     # ---- Pillar2: ファンディングレート ----
     fr = fetch_funding_rate_safe(exchange, symbol)
@@ -6118,7 +6171,7 @@ def v2_generate_signal(
             f"direction={direction} total={total:.4f} min={V2_MIN_SCORE} "
             f"p1={p1_score:.4f} p2={p2_score:.4f} p3={p3_score:.4f}"
         )
-        return None
+        return _build_feature_probe_sig("total_below_min")
 
     # ---- TP/SL ----
     entry = float(ltf_df["Close"].iloc[-2])
@@ -11654,19 +11707,41 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     for symbol in symbols:
         try:
             sig = v2_generate_signal(exchange, symbol, btc_htf, now_jst, regime_info=regime)
+            if sig is None:
+                sig = v2_generate_signal(
+                    exchange, symbol, btc_htf, now_jst,
+                    regime_info=regime, feature_probe_only=True,
+                )
+                if sig is not None:
+                    cur_note = str(sig.get("ai_note", "") or "")
+                    sig["ai_note"] = (
+                        f"{cur_note};feature_probe_source=post_reject_fallback"
+                        if cur_note else "feature_probe_source=post_reject_fallback"
+                    )
+                    print(
+                        f"[V2] FEATURE-PROBE: sym={sig.get('symbol')} dir={sig.get('direction')} "
+                        f"reason={sig.get('_probe_reason', '')} "
+                        f"p1={sig.get('p1_score', '')} rsi={sig.get('rsi', '')}",
+                        flush=True,
+                    )
             if sig is not None:
-                sig["v2_version"] = "V2-Shadow"
+                if not str(sig.get("v2_version", "")).strip():
+                    sig["v2_version"] = "V2-Shadow"
                 sig["note"] = ""
                 sig["btc_ret"] = _safe_float_or_nan(btc_ret)
                 sig["btc_vol"] = _safe_float_or_nan(btc_vol)
 
                 raw_signals.append(sig)
 
+                _p2_disp = sig.get("p2_score", np.nan)
+                _p3_disp = sig.get("p3_score", np.nan)
                 print(
                     f"[V2] RAW-SIG: {sig['symbol']} {sig['direction']} "
                     f"total={sig['total_score']:.2f} "
-                    f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
-                    f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')}"
+                    f"P1={sig['p1_score']:.2f} "
+                    f"P2={_p2_disp:.2f} P3={_p3_disp:.2f} "
+                    f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')} "
+                    f"probe={sig.get('_feature_probe', '0')}"
                 )
         except Exception as e:
             print(f"[V2-ERR] {symbol}: {e}")
