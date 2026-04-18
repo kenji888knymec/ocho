@@ -1517,8 +1517,30 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
 
     if k == "side":
         return str(sig.get("direction", sig.get("side", "")) or "").strip().upper()
+
+    if k == "lane":
+        lane = str(sig.get("_runtime_lane", sig.get("lane", "")) or "").strip().lower()
+        if lane == "":
+            try:
+                side = str(sig.get("direction", sig.get("side", "")) or "").strip().upper()
+                if side in ("LONG", "SHORT"):
+                    lane = str(_get_runtime_lane_for_signal(sig, side) or "").strip().lower()
+            except Exception:
+                lane = ""
+        return lane
+
+    if k == "symbol":
+        raw = str(sig.get("symbol", sig.get("Symbol", "")) or "").strip().upper()
+        return raw.split("/", 1)[0]
+
+    if k == "hour":
+        return _safe_float_or_nan(
+            sig.get("hour_jst", sig.get("Hour_JST", sig.get("hour", "")))
+        )
+
     if k == "mode":
         return str(sig.get("btc_mode_compat", sig.get("btc_mode", "")) or "").strip().upper()
+
     if k == "p1":
         return _safe_float_or_nan(sig.get("p1_score"))
     if k == "p2":
@@ -1533,6 +1555,7 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         return _safe_float_or_nan(
             sig.get("ai_prob_win", sig.get("AI_Prob_Win", sig.get("ai_proba_used", "")))
         )
+
     if k == "ltf_aligned":
         v = sig.get("ltf_aligned", "")
         s = str(v or "").strip().lower()
@@ -1541,6 +1564,7 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
+
     if k == "volconfirmed":
         v = sig.get("vol_confirmed", "")
         s = str(v or "").strip().lower()
@@ -1549,6 +1573,7 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
+
     if k == "fr_available":
         v = sig.get("fr_available", "")
         s = str(v or "").strip().lower()
@@ -1583,60 +1608,48 @@ def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
     if not spec:
         return False
 
-    side = str(spec.get("side", "")).strip().upper()
-    mode = str(spec.get("mode", "")).strip().upper()
+    # exact match
+    for key, expected in spec.items():
+        k = str(key).strip().lower()
+        exp = str(expected).strip()
 
-    if side:
-        sig_side = str(_profile_sig_value(sig, "side") or "").strip().upper()
-        if sig_side != side:
-            return False
+        if k.endswith("_min") or k.endswith("_max"):
+            continue
 
-    if mode:
-        sig_mode = str(_profile_sig_value(sig, "mode") or "").strip().upper()
-        if sig_mode != mode:
-            return False
+        actual = _profile_sig_value(sig, k)
 
-    if "p1_min" in spec or "p1_max" in spec:
-        if not _profile_match_numeric(_profile_sig_value(sig, "p1"), spec.get("p1_min", ""), spec.get("p1_max", "")):
-            return False
+        if k == "lane":
+            if str(actual or "").strip().lower() != exp.lower():
+                return False
+            continue
 
-    if "p2_min" in spec or "p2_max" in spec:
-        if not _profile_match_numeric(_profile_sig_value(sig, "p2"), spec.get("p2_min", ""), spec.get("p2_max", "")):
-            return False
+        if k == "symbol":
+            if str(actual or "").strip().upper() != exp.upper():
+                return False
+            continue
 
-    if "p3_min" in spec or "p3_max" in spec:
-        if not _profile_match_numeric(_profile_sig_value(sig, "p3"), spec.get("p3_min", ""), spec.get("p3_max", "")):
-            return False
+        if k in ("side", "mode"):
+            if str(actual or "").strip().upper() != exp.upper():
+                return False
+            continue
 
-    if "rsi_min" in spec or "rsi_max" in spec:
-        if not _profile_match_numeric(_profile_sig_value(sig, "rsi"), spec.get("rsi_min", ""), spec.get("rsi_max", "")):
-            return False
+        if k in ("ltf_aligned", "volconfirmed", "fr_available"):
+            ax = _safe_float_or_nan(actual)
+            if not np.isfinite(ax):
+                return False
+            if float(ax) != float(exp):
+                return False
+            continue
 
-    if "volratio_min" in spec or "volratio_max" in spec:
-        if not _profile_match_numeric(
-            _profile_sig_value(sig, "volratio"),
-            spec.get("volratio_min", ""),
-            spec.get("volratio_max", ""),
-        ):
-            return False
+    # numeric range match
+    for base in ("p1", "p2", "p3", "rsi", "volratio", "ai", "hour"):
+        min_v = spec.get(f"{base}_min", "")
+        max_v = spec.get(f"{base}_max", "")
+        if str(min_v).strip() == "" and str(max_v).strip() == "":
+            continue
 
-    if "ai_min" in spec or "ai_max" in spec:
-        if not _profile_match_numeric(_profile_sig_value(sig, "ai"), spec.get("ai_min", ""), spec.get("ai_max", "")):
-            return False
-
-    if "ltf_aligned" in spec:
-        v = _profile_sig_value(sig, "ltf_aligned")
-        if not np.isfinite(v) or int(v) != int(float(spec["ltf_aligned"])):
-            return False
-
-    if "volconfirmed" in spec:
-        v = _profile_sig_value(sig, "volconfirmed")
-        if not np.isfinite(v) or int(v) != int(float(spec["volconfirmed"])):
-            return False
-
-    if "fr_available" in spec:
-        v = _profile_sig_value(sig, "fr_available")
-        if not np.isfinite(v) or int(v) != int(float(spec["fr_available"])):
+        actual = _profile_sig_value(sig, base)
+        if not _profile_match_numeric(actual, min_v, max_v):
             return False
 
     return True
