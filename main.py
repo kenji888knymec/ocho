@@ -11884,10 +11884,22 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             )
 
     if engine_mode == "v2_live":
-        notify_candidates = [
-            x for x in final_signals
-            if str(x.get("_notify_pass", "0")) == "1"
-        ]
+        # 特徴量の掛け合わせ条件に一致したものだけ通知する
+        feature_only_candidates = []
+        for x in final_signals:
+            is_feature_hit = str(x.get("_feature_bypass", "0")) == "1"
+
+            if is_feature_hit:
+                x["_notify_pass"] = "1"
+                x["_notify_reason"] = "feature_profile_only"
+                feature_only_candidates.append(x)
+            else:
+                x["_notify_pass"] = "0"
+                cur_note = str(x.get("ai_note", "") or "")
+                add_note = "notify_sent=0;notify_send_reason=feature_profile_only_no_match"
+                x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+        notify_candidates = feature_only_candidates
 
         sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
 
@@ -11904,7 +11916,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             f"watch_discord_sent={watch_sent_n} "
             f"watch_runtime_dedup_skipped={watch_runtime_dedup_skipped_n} "
             f"notify_ignore_runtime_dedup={int(V2_NOTIFY_IGNORE_RUNTIME_DEDUP)} "
-            f"watch_notify_enable={int(V2_WATCH_NOTIFY_ENABLE)}"
+            f"watch_notify_enable={int(V2_WATCH_NOTIFY_ENABLE)} "
+            f"feature_only_mode=1"
         )
     else:
         sent_n, runtime_dedup_skipped_n = 0, 0
