@@ -1514,10 +1514,19 @@ def _parse_profile_spec(raw: str) -> Dict[str, str]:
 
 def _profile_sig_value(sig: Dict[str, Any], key: str):
     k = str(key or "").strip().lower()
-
+    aliases = {
+        "btc_mode_compat": "mode",
+        "btc_mode": "mode",
+        "vol_ratio": "volratio",
+        "band_width": "bandwidth",
+        "bwchange": "bw_change",
+        "volchange": "vol_change",
+        "fravailable": "fr_available",
+        "vol_confirmed": "volconfirmed",
+    }
+    k = aliases.get(k, k)
     if k == "side":
         return str(sig.get("direction", sig.get("side", "")) or "").strip().upper()
-
     if k == "lane":
         lane = str(sig.get("_runtime_lane", sig.get("lane", "")) or "").strip().lower()
         if lane == "":
@@ -1528,19 +1537,15 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
             except Exception:
                 lane = ""
         return lane
-
     if k == "symbol":
         raw = str(sig.get("symbol", sig.get("Symbol", "")) or "").strip().upper()
         return raw.split("/", 1)[0]
-
     if k == "hour":
         return _safe_float_or_nan(
             sig.get("hour_jst", sig.get("Hour_JST", sig.get("hour", "")))
         )
-
     if k == "mode":
         return str(sig.get("btc_mode_compat", sig.get("btc_mode", "")) or "").strip().upper()
-
     if k == "p1":
         return _safe_float_or_nan(sig.get("p1_score"))
     if k == "p2":
@@ -1555,7 +1560,6 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         return _safe_float_or_nan(
             sig.get("ai_prob_win", sig.get("AI_Prob_Win", sig.get("ai_proba_used", "")))
         )
-
     if k == "bandwidth":
         return _safe_float_or_nan(sig.get("BandWidth"))
     if k == "bw_change":
@@ -1566,7 +1570,6 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         return _safe_float_or_nan(sig.get("btc_ret"))
     if k == "btc_vol":
         return _safe_float_or_nan(sig.get("btc_vol"))
-
     if k == "ltf_aligned":
         v = sig.get("ltf_aligned", "")
         s = str(v or "").strip().lower()
@@ -1575,7 +1578,6 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
-
     if k == "volconfirmed":
         v = sig.get("vol_confirmed", "")
         s = str(v or "").strip().lower()
@@ -1584,7 +1586,6 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
-
     if k == "fr_available":
         v = sig.get("fr_available", "")
         s = str(v or "").strip().lower()
@@ -1593,7 +1594,9 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
-
+    sig["_feature_unknown_keys"] = list(
+        sorted(set((sig.get("_feature_unknown_keys", []) or []) + [k]))
+    )
     return None
 
 
@@ -1669,45 +1672,43 @@ def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
 def _apply_feature_profiles(sig: Dict[str, Any]) -> Dict[str, Any]:
     allow_hits: List[str] = []
     reject_hits: List[str] = []
-
+    force_hits: List[str] = []
     if not V2_FEATURE_PROFILE_ENABLE:
         sig["_feature_profile_allow_hits"] = allow_hits
         sig["_feature_profile_reject_hits"] = reject_hits
+        sig["_feature_force_hits"] = force_hits
         sig["_feature_profile_gate"] = ""
+        sig["_feature_force_profile"] = ""
         return sig
-
     for name in V2_FEATURE_ALLOW_PROFILES:
         if _match_feature_profile(sig, name):
             allow_hits.append(name)
-
     for name in V2_FEATURE_REJECT_PROFILES:
         if _match_feature_profile(sig, name):
             reject_hits.append(name)
-
+    bypass_names = [str(x).strip() for x in V2_FEATURE_BYPASS_PROFILES if str(x).strip()]
+    if not bypass_names:
+        bypass_names = [str(x).strip() for x in V2_FEATURE_ALLOW_PROFILES if str(x).strip()]
+    for name in allow_hits:
+        if name in bypass_names:
+            force_hits.append(name)
     sig["_feature_profile_allow_hits"] = allow_hits
     sig["_feature_profile_reject_hits"] = reject_hits
-
-    # 重要:
-    # 特徴量一致なら reject より allow を優先する
-    # = この時だけ他フィルターを外す
-    if allow_hits:
+    sig["_feature_force_hits"] = force_hits
+    sig["_feature_force_profile"] = force_hits[0] if force_hits else ""
+    if force_hits:
+        sig["_feature_profile_gate"] = "force"
+    elif allow_hits:
         sig["_feature_profile_gate"] = "allow"
     elif V2_FEATURE_PROFILE_REQUIRE_MATCH and V2_FEATURE_ALLOW_PROFILES:
         sig["_feature_profile_gate"] = "no_match"
     else:
         sig["_feature_profile_gate"] = ""
-
     return sig
-
-
 def _is_feature_force_pass(sig: Dict[str, Any]) -> bool:
     gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
-    allow_hits = [
-        str(x).strip()
-        for x in sig.get("_feature_profile_allow_hits", []) or []
-        if str(x).strip()
-    ]
-    return gate == "allow" and bool(allow_hits)
+    force_profile = str(sig.get("_feature_force_profile", "") or "").strip()
+    return gate == "force" and force_profile != ""
 
 
 def _feature_profile_label(sig: Dict[str, Any]) -> str:
@@ -3051,8 +3052,8 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
         sig["_notified_at_jst"] = ""
 
         key = _v2_notify_key(sig)
-
-        if (not V2_NOTIFY_IGNORE_RUNTIME_DEDUP) and key in last_alert_records:
+        is_feature_force = _is_feature_force_pass(sig) or str(sig.get("_feature_bypass", "0")).strip() == "1"
+        if (not is_feature_force) and (not V2_NOTIFY_IGNORE_RUNTIME_DEDUP) and key in last_alert_records:
             runtime_dedup_skipped += 1
             cur_note = str(sig.get("ai_note", "") or "")
             add_note = "notify_sent=0;notify_send_reason=runtime_dedup_skip"
@@ -5122,32 +5123,14 @@ V2_FEATURE_BYPASS_PROFILES = [
 ]
 
 def _get_feature_bypass_profile(sig: Dict[str, Any]) -> str:
-    """
-    強い特徴量プロファイルに一致した場合だけ、その profile 名を返す。
-    一致しなければ空文字を返す。
-    """
     if not V2_FEATURE_PROFILE_ENABLE:
         return ""
-
     try:
         _apply_feature_profiles(sig)
     except Exception:
         return ""
-
-    gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
-    if gate != "allow":
-        return ""
-
-    allow_hits = [
-        str(x).strip()
-        for x in sig.get("_feature_profile_allow_hits", [])
-        if str(x).strip()
-    ]
-
-    for name in allow_hits:
-        if name in V2_FEATURE_BYPASS_PROFILES:
-            return name
-
+    if _is_feature_force_pass(sig):
+        return str(sig.get("_feature_force_profile", "") or "").strip()
     return ""
 
 V2_SHORT_PAUSE_ENABLE = str(os.environ.get("V2_SHORT_PAUSE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
@@ -5939,26 +5922,134 @@ def v2_generate_signal(
                 msg += f" {extra}"
             print(msg)
 
+    def _build_early_feature_probe_sig(probe_reason: str, forced_direction: str = "") -> Optional[Dict[str, Any]]:
+        if not feature_probe_only:
+            return None
+        probe_direction = str(forced_direction or "").strip().upper()
+        btc_dir_probe = str(btc_htf.get("direction", "NEUTRAL") or "").strip().upper()
+        btc_str_probe = _safe_float_or_nan(btc_htf.get("strength"))
+        if probe_direction not in ("LONG", "SHORT"):
+            if btc_dir_probe in ("LONG", "SHORT"):
+                probe_direction = btc_dir_probe
+            elif btc_dir_probe == "UP":
+                probe_direction = "LONG"
+            elif btc_dir_probe == "DOWN":
+                probe_direction = "SHORT"
+            else:
+                probe_direction = "LONG"
+        btc_mode_probe = {
+            "LONG": "Up",
+            "SHORT": "Down",
+            "UP": "Up",
+            "DOWN": "Down",
+            "NEUTRAL": "Range",
+            "RANGE": "Range",
+        }.get(btc_dir_probe, "Range")
+        entry_probe = np.nan
+        sigma_probe = np.nan
+        bw_probe_val = np.nan
+        bw_change_probe_val = np.nan
+        vol_change_probe_val = np.nan
+        rsi_probe = np.nan
+        dt_probe = now_jst
+        hour_probe = now_jst.hour
+        time_ms_probe = np.nan
+        try:
+            if 'ltf_df' in dir() and isinstance(ltf_df, pd.DataFrame) and len(ltf_df) >= 2:
+                close_probe = pd.to_numeric(ltf_df["Close"], errors="coerce")
+                vol_probe = pd.to_numeric(ltf_df["Volume"], errors="coerce")
+                pct_probe = close_probe.pct_change(fill_method=None)
+                sigma_s = pct_probe.rolling(20).std()
+                ma20_probe = close_probe.rolling(20).mean()
+                std20_probe = close_probe.rolling(20).std()
+                bb_upper_probe = ma20_probe + (2.0 * std20_probe)
+                bb_lower_probe = ma20_probe - (2.0 * std20_probe)
+                bw_s = ((bb_upper_probe - bb_lower_probe) / ma20_probe.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+                bw_change_s = bw_s.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+                vol_change_s = vol_probe.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+                rsi_s = calculate_rsi(close_probe).replace([np.inf, -np.inf], np.nan)
+                entry_probe = _safe_float_or_nan(close_probe.iloc[-2])
+                sigma_probe = _safe_float_or_nan(sigma_s.iloc[-2]) if len(sigma_s) >= 2 else np.nan
+                bw_probe_val = _safe_float_or_nan(bw_s.iloc[-2]) if len(bw_s) >= 2 else np.nan
+                bw_change_probe_val = _safe_float_or_nan(bw_change_s.iloc[-2]) if len(bw_change_s) >= 2 else np.nan
+                vol_change_probe_val = _safe_float_or_nan(vol_change_s.iloc[-2]) if len(vol_change_s) >= 2 else np.nan
+                rsi_probe = _safe_float_or_nan(rsi_s.iloc[-2]) if len(rsi_s) >= 2 else np.nan
+                try:
+                    time_ms_probe = int(ltf_df["Time"].iloc[-2])
+                    dt_probe = datetime.fromtimestamp(time_ms_probe / 1000, JST)
+                    hour_probe = dt_probe.hour
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return {
+            "symbol": sym,
+            "direction": probe_direction,
+            "entry_price": entry_probe,
+            "total_score": 0.0,
+            "score": 0.0,
+            "p1_score": np.nan,
+            "p2_score": 0.0,
+            "p3_score": 0.0,
+            "sym_htf_dir": "NEUTRAL",
+            "sym_htf_strength": 0.0,
+            "btc_htf_dir": btc_dir_probe,
+            "btc_htf_strength": btc_str_probe if np.isfinite(btc_str_probe) else 0.0,
+            "ltf_aligned": False,
+            "ltf_reasons": [],
+            "funding_rate": np.nan,
+            "fr_available": False,
+            "vol_ratio": np.nan,
+            "vol_confirmed": False,
+            "tp": np.nan,
+            "sl": np.nan,
+            "tp_pct": np.nan,
+            "sl_pct": np.nan,
+            "atr": np.nan,
+            "rsi": rsi_probe,
+            "hour": hour_probe,
+            "btc_mode_compat": btc_mode_probe,
+            "sigma": sigma_probe,
+            "BandWidth": bw_probe_val,
+            "BW_Change": bw_change_probe_val,
+            "Vol_Change": vol_change_probe_val,
+            "btc_ret": np.nan,
+            "btc_vol": np.nan,
+            "time_ms": time_ms_probe,
+            "dt": dt_probe,
+            "long_raw_rescue": True,
+            "short_raw_rescue": True,
+            "v2_version": "V2-FeatureProbe",
+            "note": "",
+            "ai_note": f"feature_probe_only=1;probe_reason={probe_reason}",
+        }
     # ---- データ取得 ----
     ltf = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
+    ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"]) if ltf else pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     if not ltf or len(ltf) < 30:
         _v2_reject("ltf_insufficient", f"len={0 if not ltf else len(ltf)} need=30")
+        early_sig = _build_early_feature_probe_sig("ltf_insufficient")
+        if early_sig is not None:
+            return early_sig
         return None
-    ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-
     try:
         closed_bar_time_ms = int(ltf_df["Time"].iloc[-2])
         closed_bar_dt = datetime.fromtimestamp(closed_bar_time_ms / 1000, JST)
         hour = closed_bar_dt.hour
     except Exception as e:
         _v2_reject("closed_bar_time_invalid", f"e={e}")
+        early_sig = _build_early_feature_probe_sig("closed_bar_time_invalid")
+        if early_sig is not None:
+            return early_sig
         return None
-
     htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
+    htf_df = pd.DataFrame(htf, columns=["Time", "Open", "High", "Low", "Close", "Volume"]) if htf else pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     if not htf or len(htf) < V2_EMA_SLOW + 5:
         _v2_reject("htf_insufficient", f"len={0 if not htf else len(htf)} need={V2_EMA_SLOW + 5}")
+        early_sig = _build_early_feature_probe_sig("htf_insufficient")
+        if early_sig is not None:
+            return early_sig
         return None
-    htf_df = pd.DataFrame(htf, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
 
     # ---- Pillar1: 多時間足トレンド ----
     sym_htf = assess_htf_trend(htf_df)
@@ -5996,11 +6087,15 @@ def v2_generate_signal(
     )
 
     # LONG raw rescue:
-    # ここは一時的に無効化する。
-    # 目的は、SHORT raw rescue が本当に発火するかを確認すること。
-    # direction は assess_htf_trend() の結果のまま維持する。
-    long_rescue = False
-    long_rescue_reason = ""
+    # 通常ルートは従来どおり。
+    # ただし feature_probe_only のときは LONG 側も hidden filter を越えるため、
+    # 救済扱いを有効にする。
+    if feature_probe_only and direction == "LONG":
+        long_rescue = True
+        long_rescue_reason = "feature_probe_only_force_route"
+    else:
+        long_rescue = False
+        long_rescue_reason = ""
 
     # SHORT raw rescue:
     # HTFがNEUTRALまたは弱いLONGでも、BTCがSHORT寄りでLTF_SHORTが十分強ければSHORT候補を救う
@@ -6049,6 +6144,21 @@ def v2_generate_signal(
                 f"sym_htf_strength={sym_htf_strength}"
             )
             direction = "LONG"
+        elif feature_probe_only:
+            long_ltf_score = _safe_float_or_nan(ltf_eval_long.get("score"))
+            short_ltf_score = _safe_float_or_nan(ltf_eval_short.get("score"))
+            if np.isfinite(long_ltf_score) and np.isfinite(short_ltf_score):
+                direction = "LONG" if long_ltf_score >= short_ltf_score else "SHORT"
+            elif btc_dir in ("LONG", "UP"):
+                direction = "LONG"
+            elif btc_dir in ("SHORT", "DOWN"):
+                direction = "SHORT"
+            else:
+                direction = "LONG"
+            _v2_reject(
+                "sym_htf_neutral_force_probe",
+                f"forced_direction={direction} sym_htf_dir={sym_htf.get('direction')} sym_htf_strength={sym_htf_strength}"
+            )
         else:
             _v2_reject(
                 "sym_htf_neutral",
@@ -7913,6 +8023,8 @@ def _get_long_research_tags(sig: Dict[str, Any]) -> List[str]:
 
 
 def _long_notify_gate(sig: Dict[str, Any]) -> Tuple[bool, str]:
+    if _is_feature_force_pass(sig) or str(sig.get("_feature_bypass", "0")).strip() == "1":
+        return True, "feature_force_pass_long_notify"
     if not V2_LONG_NOTIFY_GATE_ENABLE:
         return True, "notify_gate_disabled"
 
@@ -11750,27 +11862,48 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             )
 
             if sig is None:
-                sig = v2_generate_signal(
-                    exchange,
-                    symbol,
-                    btc_htf,
-                    now_jst,
-                    regime_info=regime,
-                    feature_probe_only=True,
-                )
-
-                if sig is not None:
-                    cur_note = str(sig.get("ai_note", "") or "")
-                    add_note = "feature_probe_source=post_reject_fallback"
-                    sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-
+                probe_candidates: List[Dict[str, Any]] = []
+                try:
+                    for forced_direction in ("LONG", "SHORT"):
+                        probe_sig = v2_generate_signal(
+                            exchange,
+                            symbol,
+                            btc_htf,
+                            now_jst,
+                            regime_info=regime,
+                            feature_probe_only=True,
+                        )
+                        if probe_sig is None:
+                            continue
+                        if forced_direction in ("LONG", "SHORT"):
+                            probe_sig["direction"] = forced_direction
+                        _apply_feature_profiles(probe_sig)
+                        if not _is_feature_force_pass(probe_sig):
+                            continue
+                        probe_sig["_feature_bypass"] = "1"
+                        probe_sig["_feature_bypass_profile"] = str(
+                            probe_sig.get("_feature_force_profile", "") or ""
+                        )
+                        cur_note = str(probe_sig.get("ai_note", "") or "")
+                        add_note = "feature_probe_source=post_reject_fallback"
+                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                        probe_candidates.append(probe_sig)
+                except Exception as e:
+                    print(f"[V2] FEATURE-PROBE-POST-REJECT-ERR sym={symbol} err={e}")
+                for probe_sig in probe_candidates:
                     print(
-                        f"[V2] FEATURE-PROBE: {sig['symbol']} {sig['direction']} "
-                        f"total={sig['total_score']:.2f} "
-                        f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
-                        f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')} "
-                        f"NOTE={sig.get('ai_note', '')}"
+                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
+                        f"total={probe_sig['total_score']:.2f} "
+                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
+                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
+                        f"NOTE={probe_sig.get('ai_note', '')}"
                     )
+                    if not str(probe_sig.get("v2_version", "")).strip():
+                        probe_sig["v2_version"] = "V2-FeatureProbe"
+                    probe_sig["note"] = ""
+                    probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                    probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+                    raw_signals.append(probe_sig)
 
             if sig is not None:
                 if not str(sig.get("v2_version", "")).strip():
@@ -12272,36 +12405,49 @@ def logic_main(force: bool = False):
                 except Exception:
                     pass
 
-                probe_sig = None
+                probe_candidates: List[Dict[str, Any]] = []
                 try:
-                    probe_sig = v2_generate_signal(
-                        exchange,
-                        symbol,
-                        btc_htf_for_probe,
-                        now_jst,
-                        regime_info=None,
-                        feature_probe_only=True,
-                    )
+                    for forced_direction in ("LONG", "SHORT"):
+                        probe_sig = v2_generate_signal(
+                            exchange,
+                            symbol,
+                            btc_htf_for_probe,
+                            now_jst,
+                            regime_info=None,
+                            feature_probe_only=True,
+                        )
+                        if probe_sig is None:
+                            continue
+                        probe_sig["direction"] = forced_direction
+                        _apply_feature_profiles(probe_sig)
+                        if not _is_feature_force_pass(probe_sig):
+                            continue
+                        probe_sig["_feature_bypass"] = "1"
+                        probe_sig["_feature_bypass_profile"] = str(
+                            probe_sig.get("_feature_force_profile", "") or ""
+                        )
+                        cur_note = str(probe_sig.get("ai_note", "") or "")
+                        add_note = "feature_probe_source=pre_candidate_skip"
+                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                        if not str(probe_sig.get("v2_version", "")).strip():
+                            probe_sig["v2_version"] = "V2-FeatureProbe"
+                        probe_sig["note"] = ""
+                        try:
+                            probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                        except Exception:
+                            pass
+                        try:
+                            probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+                        except Exception:
+                            pass
+                        probe_candidates.append(probe_sig)
                 except Exception as e:
-                    print(f"[V2] FEATURE-PROBE-SKIP-ERR sym={symbol} err={e}")
-
-                if probe_sig is not None:
-                    cur_note = str(probe_sig.get("ai_note", "") or "")
-                    add_note = f"feature_probe_source=pre_candidate_skip;bad_col={bad_col}"
-                    probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-
-                    if not str(probe_sig.get("v2_version", "")).strip():
-                        probe_sig["v2_version"] = "V2-FeatureProbe"
-
-                    probe_sig["note"] = ""
-                    probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
-                    probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
-
+                    print(f"[V2] FEATURE-PROBE-PRE-CAND-ERR sym={symbol} err={e}")
+                for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
-
                     print(
                         f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
-                        f"src=pre_candidate_skip bad_col={bad_col} "
+                        f"src=pre_candidate_skip "
                         f"total={probe_sig['total_score']:.2f} "
                         f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
                         f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
@@ -12346,33 +12492,45 @@ def logic_main(force: bool = False):
                 signal_type = "LONG"
 
             if not (is_buy or is_sell):
-                probe_sig = None
+                probe_candidates: List[Dict[str, Any]] = []
                 try:
-                    probe_sig = v2_generate_signal(
-                        exchange,
-                        symbol,
-                        btc_htf_for_probe,
-                        now_jst,
-                        regime_info=None,
-                        feature_probe_only=True,
-                    )
+                    for forced_direction in ("LONG", "SHORT"):
+                        probe_sig = v2_generate_signal(
+                            exchange,
+                            symbol,
+                            btc_htf_for_probe,
+                            now_jst,
+                            regime_info=None,
+                            feature_probe_only=True,
+                        )
+                        if probe_sig is None:
+                            continue
+                        probe_sig["direction"] = forced_direction
+                        _apply_feature_profiles(probe_sig)
+                        if not _is_feature_force_pass(probe_sig):
+                            continue
+                        probe_sig["_feature_bypass"] = "1"
+                        probe_sig["_feature_bypass_profile"] = str(
+                            probe_sig.get("_feature_force_profile", "") or ""
+                        )
+                        cur_note = str(probe_sig.get("ai_note", "") or "")
+                        add_note = "feature_probe_source=signal_type_skip"
+                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                        if not str(probe_sig.get("v2_version", "")).strip():
+                            probe_sig["v2_version"] = "V2-FeatureProbe"
+                        probe_sig["note"] = ""
+                        try:
+                            probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                        except Exception:
+                            pass
+                        try:
+                            probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+                        except Exception:
+                            pass
+                        probe_candidates.append(probe_sig)
                 except Exception as e:
                     print(f"[V2] FEATURE-PROBE-SIGNALTYPE-ERR sym={symbol} err={e}")
-                if probe_sig is not None:
-                    cur_note = str(probe_sig.get("ai_note", "") or "")
-                    add_note = "feature_probe_source=signal_type_skip"
-                    probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-                    if not str(probe_sig.get("v2_version", "")).strip():
-                        probe_sig["v2_version"] = "V2-FeatureProbe"
-                    probe_sig["note"] = ""
-                    try:
-                        probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
-                    except Exception:
-                        pass
-                    try:
-                        probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
-                    except Exception:
-                        pass
+                for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
                     print(
                         f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
