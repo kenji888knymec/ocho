@@ -1700,6 +1700,16 @@ def _apply_feature_profiles(sig: Dict[str, Any]) -> Dict[str, Any]:
     return sig
 
 
+def _is_feature_force_pass(sig: Dict[str, Any]) -> bool:
+    gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
+    allow_hits = [
+        str(x).strip()
+        for x in sig.get("_feature_profile_allow_hits", []) or []
+        if str(x).strip()
+    ]
+    return gate == "allow" and bool(allow_hits)
+
+
 def _feature_profile_label(sig: Dict[str, Any]) -> str:
     allow_hits = [str(x) for x in (sig.get("_feature_profile_allow_hits", []) or []) if str(x).strip()]
     reject_hits = [str(x) for x in (sig.get("_feature_profile_reject_hits", []) or []) if str(x).strip()]
@@ -7065,6 +7075,8 @@ def defensive_filter(sig: Dict[str, Any]) -> Tuple[bool, str]:
     direction = str(sig.get("direction", "")).strip().upper()
     if direction != "SHORT":
         return True, "not_short"
+    if _is_feature_force_pass(sig):
+        return True, "feature_force_pass_short"
 
     if not V2_SHORT_DEF_ENABLE:
         return True, "short_def_disabled"
@@ -7516,6 +7528,8 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     direction = str(sig.get("direction", "")).strip().upper()
     if direction != "LONG":
         return True, "not_long"
+    if _is_feature_force_pass(sig):
+        return True, "feature_force_pass_long"
 
     if not V2_LONG_DEF_ENABLE:
         return True, "long_def_disabled"
