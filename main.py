@@ -6068,6 +6068,10 @@ def v2_generate_signal(
 
     btc_mode_compat = {"LONG": "Up", "SHORT": "Down", "NEUTRAL": "Range"}.get(btc_dir, "Range")
 
+    # クロージャ用プレースホルダー。外側ループが sig["btc_ret"]/sig["btc_vol"] を実値で上書きする。
+    btc_ret = np.nan
+    btc_vol = np.nan
+
     def _build_feature_probe_sig(probe_reason: str) -> Optional[Dict[str, Any]]:
         if not feature_probe_only:
             return None
@@ -6122,8 +6126,8 @@ def v2_generate_signal(
             "BandWidth": bw_val,
             "BW_Change": bw_change_val,
             "Vol_Change": vol_change_val,
-            "btc_ret": np.nan,
-            "btc_vol": np.nan,
+            "btc_ret": _safe_float_or_nan(btc_ret),
+            "btc_vol": _safe_float_or_nan(btc_vol),
             "time_ms": closed_bar_time_ms,
             "dt": closed_bar_dt,
             "long_raw_rescue": bool(long_rescue),
