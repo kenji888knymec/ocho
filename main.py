@@ -12379,19 +12379,67 @@ def logic_main(force: bool = False):
             sig_score = float(max(float(row["Rise_Score"]), float(row["Drop_Score"])))
 
             def _make_feats(side: str) -> Optional[pd.DataFrame]:
-                _is_long = 1.0 if side == "LONG" else 0.0
-                _is_short = 1.0 - _is_long
+                side_u = str(side).strip().upper()
+
+                total_score = _safe_float_or_nan(sig_score)
+                p1_score = _safe_float_or_nan(sig_score)
+                p2_score = 0.0
+                p3_score = 0.0
+
+                sym_htf_strength = _safe_float_or_nan(sig_score)
+
+                btc_htf_strength = 0.0
+                try:
+                    if "BTC_1h_Change" in row and pd.notna(row["BTC_1h_Change"]):
+                        btc_htf_strength = abs(float(row["BTC_1h_Change"]))
+                except Exception:
+                    btc_htf_strength = 0.0
+
+                vol_ratio = 1.0
+
+                atr_val = 0.0
+                try:
+                    if "Dynamic_Sigma" in row and pd.notna(row["Dynamic_Sigma"]):
+                        atr_val = abs(float(row["Dynamic_Sigma"]))
+                except Exception:
+                    atr_val = 0.0
+
+                rsi_val = _safe_float_or_nan(float(row["RSI"])) if "RSI" in row and pd.notna(row["RSI"]) else np.nan
+
+                time_ms_val = row.get("Time", row.get("time", None))
+                hour_jst_val = np.nan
+                try:
+                    if time_ms_val is not None and str(time_ms_val).strip() != "":
+                        hour_jst_val = datetime.fromtimestamp(float(time_ms_val) / 1000.0, JST).hour
+                except Exception:
+                    hour_jst_val = np.nan
+
+                ltf_aligned_val = 0.0
+                fr_available_val = 0.0
+                vol_confirmed_val = 0.0
+
+                btc_mode_u = str(btc_mode).strip().upper()
+                btc_mode_up = 1.0 if btc_mode_u == "UP" else 0.0
+                btc_mode_range = 1.0 if btc_mode_u == "RANGE" else 0.0
+                btc_mode_down = 1.0 if btc_mode_u == "DOWN" else 0.0
 
                 feats = pd.DataFrame([{
-                    "Sigma": float(row["Dynamic_Sigma"]),
-                    "BandWidth": float(row["BandWidth"]),
-                    "BW_Change": float(row["BW_Change"]),
-                    "RSI": float(row["RSI"]),
-                    "Vol_Change": float(row["Vol_Change"]),
-                    "Rise_Score": float(sig_score) * _is_long,
-                    "Drop_Score": float(sig_score) * _is_short,
-                    "BTC_Ret": float(btc_ret),
-                    "BTC_Vol": float(btc_vol),
+                    "TotalScore": total_score,
+                    "P1_TrendScore": p1_score,
+                    "P2_FundingScore": p2_score,
+                    "P3_VolumeScore": p3_score,
+                    "SymHTF_Strength": sym_htf_strength,
+                    "BTC_HTF_Strength": btc_htf_strength,
+                    "VolRatio": vol_ratio,
+                    "ATR": atr_val,
+                    "RSI": rsi_val,
+                    "Hour_JST": hour_jst_val,
+                    "LTF_Aligned": ltf_aligned_val,
+                    "FR_Available": fr_available_val,
+                    "VolConfirmed": vol_confirmed_val,
+                    "BTC_Mode_UP": btc_mode_up,
+                    "BTC_Mode_RANGE": btc_mode_range,
+                    "BTC_Mode_DOWN": btc_mode_down,
                 }])
 
                 feats = feats.replace([np.inf, -np.inf], np.nan)
@@ -12401,11 +12449,11 @@ def logic_main(force: bool = False):
                     bad_cols = [c for c in feats.columns if mask[c].any()]
                     try:
                         print(
-                            f"[AI-FEAT-SKIP] sym={symbol} side={side} "
+                            f"[AI-FEAT-SKIP] sym={symbol} side={side_u} "
                             f"bad_cols={bad_cols} "
-                            f"btc_ret={btc_ret} btc_vol={btc_vol} "
-                            f"volchg={row.get('Vol_Change', np.nan)} "
-                            f"sigma={row.get('Dynamic_Sigma', np.nan)} "
+                            f"btc_mode={btc_mode} "
+                            f"time_ms={time_ms_val} "
+                            f"rsi={row.get('RSI', np.nan)} "
                             f"score={sig_score}"
                         )
                     except Exception:
