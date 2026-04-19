@@ -5902,6 +5902,7 @@ def v2_generate_signal(
     now_jst: datetime,
     regime_info: Optional[Dict[str, Any]] = None,
     feature_probe_only: bool = False,
+    forced_probe_direction: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     1銘柄を評価。合意なければ None。
@@ -6133,6 +6134,17 @@ def v2_generate_signal(
                 f"ema_close_short_ok={ema_close_short_ok} "
                 f"ema_gap_small_ok={ema_gap_small_ok}"
             )
+
+    forced_probe_direction = str(forced_probe_direction or "").strip().upper()
+
+    if feature_probe_only and forced_probe_direction in ("LONG", "SHORT"):
+        direction = forced_probe_direction
+        if direction == "LONG":
+            long_rescue = True
+            long_rescue_reason = "forced_probe_direction"
+        elif direction == "SHORT":
+            short_rescue = True
+            short_rescue_reason = "forced_probe_direction"
 
     if direction == "NEUTRAL":
         if V2_FET_HTF_NEUTRAL_FAIL_OPEN and sym == "FET":
@@ -11848,6 +11860,71 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         "BONK/USDT", "TRX/USDT", "STX/USDT", "POL/USDT",
     ]
 
+    def _build_feature_probe_candidates(
+        symbol: str,
+        btc_htf_probe: Dict[str, Any],
+        now_jst_probe: datetime,
+        regime_info_probe: Optional[Dict[str, Any]],
+        note_suffix: str,
+        include_bad_col: str = "",
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+
+        for forced_side in ("LONG", "SHORT"):
+            probe_sig = None
+            try:
+                probe_sig = v2_generate_signal(
+                    exchange,
+                    symbol,
+                    btc_htf_probe,
+                    now_jst_probe,
+                    regime_info=regime_info_probe,
+                    feature_probe_only=True,
+                    forced_probe_direction=forced_side,
+                )
+            except Exception as e:
+                print(
+                    f"[V2] FEATURE-PROBE-BUILD-ERR sym={symbol} side={forced_side} "
+                    f"src={note_suffix} err={e}"
+                )
+                continue
+
+            if probe_sig is None:
+                continue
+
+            _apply_feature_profiles(probe_sig)
+
+            if not _is_feature_force_pass(probe_sig):
+                continue
+
+            probe_sig["_feature_bypass"] = "1"
+            probe_sig["_feature_bypass_profile"] = str(
+                probe_sig.get("_feature_force_profile", "") or ""
+            )
+
+            cur_note = str(probe_sig.get("ai_note", "") or "")
+            add_note = f"feature_probe_source={note_suffix}"
+            if include_bad_col:
+                add_note += f";bad_col={include_bad_col}"
+            probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+            if not str(probe_sig.get("v2_version", "")).strip():
+                probe_sig["v2_version"] = "V2-FeatureProbe"
+
+            probe_sig["note"] = ""
+            try:
+                probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+            except Exception:
+                pass
+            try:
+                probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+            except Exception:
+                pass
+
+            out.append(probe_sig)
+
+        return out
+
     raw_signals: List[Dict[str, Any]] = []
 
     for symbol in symbols:
@@ -11862,48 +11939,24 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             )
 
             if sig is None:
-                probe_candidates: List[Dict[str, Any]] = []
-                try:
-                    for forced_direction in ("LONG", "SHORT"):
-                        probe_sig = v2_generate_signal(
-                            exchange,
-                            symbol,
-                            btc_htf,
-                            now_jst,
-                            regime_info=regime,
-                            feature_probe_only=True,
-                        )
-                        if probe_sig is None:
-                            continue
-                        if forced_direction in ("LONG", "SHORT"):
-                            probe_sig["direction"] = forced_direction
-                        _apply_feature_profiles(probe_sig)
-                        if not _is_feature_force_pass(probe_sig):
-                            continue
-                        probe_sig["_feature_bypass"] = "1"
-                        probe_sig["_feature_bypass_profile"] = str(
-                            probe_sig.get("_feature_force_profile", "") or ""
-                        )
-                        cur_note = str(probe_sig.get("ai_note", "") or "")
-                        add_note = "feature_probe_source=post_reject_fallback"
-                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-                        probe_candidates.append(probe_sig)
-                except Exception as e:
-                    print(f"[V2] FEATURE-PROBE-POST-REJECT-ERR sym={symbol} err={e}")
-                for probe_sig in probe_candidates:
+                probe_candidates = _build_feature_probe_candidates(
+                    symbol=symbol,
+                    btc_htf_probe=btc_htf,
+                    now_jst_probe=now_jst,
+                    regime_info_probe=regime,
+                    note_suffix="post_reject_fallback",
+                )
+
+                if probe_candidates:
+                    sig = probe_candidates[0]
+
                     print(
-                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
-                        f"total={probe_sig['total_score']:.2f} "
-                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
-                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
-                        f"NOTE={probe_sig.get('ai_note', '')}"
+                        f"[V2] FEATURE-PROBE: {sig['symbol']} {sig['direction']} "
+                        f"total={sig['total_score']:.2f} "
+                        f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
+                        f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')} "
+                        f"NOTE={sig.get('ai_note', '')}"
                     )
-                    if not str(probe_sig.get("v2_version", "")).strip():
-                        probe_sig["v2_version"] = "V2-FeatureProbe"
-                    probe_sig["note"] = ""
-                    probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
-                    probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
-                    raw_signals.append(probe_sig)
 
             if sig is not None:
                 if not str(sig.get("v2_version", "")).strip():
@@ -12288,6 +12341,72 @@ def logic_main(force: bool = False):
 
     pending_candidates: List[Dict[str, Any]] = []
     pending_alerts: List[Dict[str, Any]] = []
+
+    def _build_feature_probe_candidates(
+        symbol: str,
+        btc_htf_probe: Dict[str, Any],
+        now_jst_probe: datetime,
+        regime_info_probe: Optional[Dict[str, Any]],
+        note_suffix: str,
+        include_bad_col: str = "",
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+
+        for forced_side in ("LONG", "SHORT"):
+            probe_sig = None
+            try:
+                probe_sig = v2_generate_signal(
+                    exchange,
+                    symbol,
+                    btc_htf_probe,
+                    now_jst_probe,
+                    regime_info=regime_info_probe,
+                    feature_probe_only=True,
+                    forced_probe_direction=forced_side,
+                )
+            except Exception as e:
+                print(
+                    f"[V2] FEATURE-PROBE-BUILD-ERR sym={symbol} side={forced_side} "
+                    f"src={note_suffix} err={e}"
+                )
+                continue
+
+            if probe_sig is None:
+                continue
+
+            _apply_feature_profiles(probe_sig)
+
+            if not _is_feature_force_pass(probe_sig):
+                continue
+
+            probe_sig["_feature_bypass"] = "1"
+            probe_sig["_feature_bypass_profile"] = str(
+                probe_sig.get("_feature_force_profile", "") or ""
+            )
+
+            cur_note = str(probe_sig.get("ai_note", "") or "")
+            add_note = f"feature_probe_source={note_suffix}"
+            if include_bad_col:
+                add_note += f";bad_col={include_bad_col}"
+            probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+            if not str(probe_sig.get("v2_version", "")).strip():
+                probe_sig["v2_version"] = "V2-FeatureProbe"
+
+            probe_sig["note"] = ""
+            try:
+                probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+            except Exception:
+                pass
+            try:
+                probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+            except Exception:
+                pass
+
+            out.append(probe_sig)
+
+        return out
+
     raw_signals: List[Dict[str, Any]] = []
 
     # CAND-SKIP probe 用に btc_htf を V1 BTC データから構築する
@@ -12405,49 +12524,21 @@ def logic_main(force: bool = False):
                 except Exception:
                     pass
 
-                probe_candidates: List[Dict[str, Any]] = []
-                try:
-                    for forced_direction in ("LONG", "SHORT"):
-                        probe_sig = v2_generate_signal(
-                            exchange,
-                            symbol,
-                            btc_htf_for_probe,
-                            now_jst,
-                            regime_info=None,
-                            feature_probe_only=True,
-                        )
-                        if probe_sig is None:
-                            continue
-                        probe_sig["direction"] = forced_direction
-                        _apply_feature_profiles(probe_sig)
-                        if not _is_feature_force_pass(probe_sig):
-                            continue
-                        probe_sig["_feature_bypass"] = "1"
-                        probe_sig["_feature_bypass_profile"] = str(
-                            probe_sig.get("_feature_force_profile", "") or ""
-                        )
-                        cur_note = str(probe_sig.get("ai_note", "") or "")
-                        add_note = "feature_probe_source=pre_candidate_skip"
-                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-                        if not str(probe_sig.get("v2_version", "")).strip():
-                            probe_sig["v2_version"] = "V2-FeatureProbe"
-                        probe_sig["note"] = ""
-                        try:
-                            probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
-                        except Exception:
-                            pass
-                        try:
-                            probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
-                        except Exception:
-                            pass
-                        probe_candidates.append(probe_sig)
-                except Exception as e:
-                    print(f"[V2] FEATURE-PROBE-PRE-CAND-ERR sym={symbol} err={e}")
+                probe_candidates = _build_feature_probe_candidates(
+                    symbol=symbol,
+                    btc_htf_probe=btc_htf_for_probe,
+                    now_jst_probe=now_jst,
+                    regime_info_probe=None,
+                    note_suffix="pre_candidate_skip",
+                    include_bad_col=bad_col,
+                )
+
                 for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
+
                     print(
                         f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
-                        f"src=pre_candidate_skip "
+                        f"src=pre_candidate_skip bad_col={bad_col} "
                         f"total={probe_sig['total_score']:.2f} "
                         f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
                         f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
@@ -12492,44 +12583,14 @@ def logic_main(force: bool = False):
                 signal_type = "LONG"
 
             if not (is_buy or is_sell):
-                probe_candidates: List[Dict[str, Any]] = []
-                try:
-                    for forced_direction in ("LONG", "SHORT"):
-                        probe_sig = v2_generate_signal(
-                            exchange,
-                            symbol,
-                            btc_htf_for_probe,
-                            now_jst,
-                            regime_info=None,
-                            feature_probe_only=True,
-                        )
-                        if probe_sig is None:
-                            continue
-                        probe_sig["direction"] = forced_direction
-                        _apply_feature_profiles(probe_sig)
-                        if not _is_feature_force_pass(probe_sig):
-                            continue
-                        probe_sig["_feature_bypass"] = "1"
-                        probe_sig["_feature_bypass_profile"] = str(
-                            probe_sig.get("_feature_force_profile", "") or ""
-                        )
-                        cur_note = str(probe_sig.get("ai_note", "") or "")
-                        add_note = "feature_probe_source=signal_type_skip"
-                        probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
-                        if not str(probe_sig.get("v2_version", "")).strip():
-                            probe_sig["v2_version"] = "V2-FeatureProbe"
-                        probe_sig["note"] = ""
-                        try:
-                            probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
-                        except Exception:
-                            pass
-                        try:
-                            probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
-                        except Exception:
-                            pass
-                        probe_candidates.append(probe_sig)
-                except Exception as e:
-                    print(f"[V2] FEATURE-PROBE-SIGNALTYPE-ERR sym={symbol} err={e}")
+                probe_candidates = _build_feature_probe_candidates(
+                    symbol=symbol,
+                    btc_htf_probe=btc_htf_for_probe,
+                    now_jst_probe=now_jst,
+                    regime_info_probe=None,
+                    note_suffix="signal_type_skip",
+                )
+
                 for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
                     print(
