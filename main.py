@@ -6072,6 +6072,25 @@ def v2_generate_signal(
         if not feature_probe_only:
             return None
 
+        close_probe = pd.to_numeric(ltf_df["Close"], errors="coerce")
+        vol_probe = pd.to_numeric(ltf_df["Volume"], errors="coerce")
+
+        sigma_s = close_probe.pct_change(fill_method=None).rolling(20).std()
+
+        ma20_probe = close_probe.rolling(20).mean()
+        std20_probe = close_probe.rolling(20).std()
+        bb_upper_probe = ma20_probe + (2.0 * std20_probe)
+        bb_lower_probe = ma20_probe - (2.0 * std20_probe)
+
+        bw_probe = ((bb_upper_probe - bb_lower_probe) / ma20_probe.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        bw_change_probe = bw_probe.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+        vol_change_probe = vol_probe.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+
+        sigma_val = _safe_float_or_nan(sigma_s.iloc[-2]) if len(sigma_s) >= 2 else np.nan
+        bw_val = _safe_float_or_nan(bw_probe.iloc[-2]) if len(bw_probe) >= 2 else np.nan
+        bw_change_val = _safe_float_or_nan(bw_change_probe.iloc[-2]) if len(bw_change_probe) >= 2 else np.nan
+        vol_change_val = _safe_float_or_nan(vol_change_probe.iloc[-2]) if len(vol_change_probe) >= 2 else np.nan
+
         return {
             "symbol": sym,
             "direction": direction,
@@ -6099,10 +6118,10 @@ def v2_generate_signal(
             "rsi": ltf_eval.get("rsi", np.nan),
             "hour": hour,
             "btc_mode_compat": btc_mode_compat,
-            "sigma": np.nan,
-            "BandWidth": np.nan,
-            "BW_Change": np.nan,
-            "Vol_Change": np.nan,
+            "sigma": sigma_val,
+            "BandWidth": bw_val,
+            "BW_Change": bw_change_val,
+            "Vol_Change": vol_change_val,
             "btc_ret": np.nan,
             "btc_vol": np.nan,
             "time_ms": closed_bar_time_ms,
@@ -12106,6 +12125,18 @@ def logic_main(force: bool = False):
 
     pending_candidates: List[Dict[str, Any]] = []
     pending_alerts: List[Dict[str, Any]] = []
+    raw_signals: List[Dict[str, Any]] = []
+
+    # CAND-SKIP probe 用に btc_htf を V1 BTC データから構築する
+    _btc_dir_probe = {"Up": "LONG", "Down": "SHORT"}.get(btc_mode, "NEUTRAL")
+    _btc_str_probe = abs(float(btc_1h_change)) if np.isfinite(float(btc_1h_change)) else 0.0
+    btc_htf_for_probe: Dict[str, Any] = {
+        "direction": _btc_dir_probe,
+        "strength": _btc_str_probe,
+        "ema_fast": np.nan,
+        "ema_slow": np.nan,
+        "close": np.nan,
+    }
 
     for symbol in symbols:
         try:
@@ -12210,6 +12241,43 @@ def logic_main(force: bool = False):
                     )
                 except Exception:
                     pass
+
+                probe_sig = None
+                try:
+                    probe_sig = v2_generate_signal(
+                        exchange,
+                        symbol,
+                        btc_htf_for_probe,
+                        now_jst,
+                        regime_info=None,
+                        feature_probe_only=True,
+                    )
+                except Exception as e:
+                    print(f"[V2] FEATURE-PROBE-SKIP-ERR sym={symbol} err={e}")
+
+                if probe_sig is not None:
+                    cur_note = str(probe_sig.get("ai_note", "") or "")
+                    add_note = f"feature_probe_source=pre_candidate_skip;bad_col={bad_col}"
+                    probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+                    if not str(probe_sig.get("v2_version", "")).strip():
+                        probe_sig["v2_version"] = "V2-FeatureProbe"
+
+                    probe_sig["note"] = ""
+                    probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                    probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+
+                    raw_signals.append(probe_sig)
+
+                    print(
+                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
+                        f"src=pre_candidate_skip bad_col={bad_col} "
+                        f"total={probe_sig['total_score']:.2f} "
+                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
+                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
+                        f"NOTE={probe_sig.get('ai_note', '')}"
+                    )
+
                 continue
 
 
