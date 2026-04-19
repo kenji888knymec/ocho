@@ -1687,12 +1687,13 @@ def _apply_feature_profiles(sig: Dict[str, Any]) -> Dict[str, Any]:
     sig["_feature_profile_allow_hits"] = allow_hits
     sig["_feature_profile_reject_hits"] = reject_hits
 
-    if reject_hits:
-        sig["_feature_profile_gate"] = "reject"
-    elif V2_FEATURE_PROFILE_REQUIRE_MATCH and V2_FEATURE_ALLOW_PROFILES and not allow_hits:
-        sig["_feature_profile_gate"] = "no_match"
-    elif allow_hits:
+    # 重要:
+    # 特徴量一致なら reject より allow を優先する
+    # = この時だけ他フィルターを外す
+    if allow_hits:
         sig["_feature_profile_gate"] = "allow"
+    elif V2_FEATURE_PROFILE_REQUIRE_MATCH and V2_FEATURE_ALLOW_PROFILES:
+        sig["_feature_profile_gate"] = "no_match"
     else:
         sig["_feature_profile_gate"] = ""
 
@@ -12331,6 +12332,42 @@ def logic_main(force: bool = False):
                 signal_type = "LONG"
 
             if not (is_buy or is_sell):
+                probe_sig = None
+                try:
+                    probe_sig = v2_generate_signal(
+                        exchange,
+                        symbol,
+                        btc_htf_for_probe,
+                        now_jst,
+                        regime_info=None,
+                        feature_probe_only=True,
+                    )
+                except Exception as e:
+                    print(f"[V2] FEATURE-PROBE-SIGNALTYPE-ERR sym={symbol} err={e}")
+                if probe_sig is not None:
+                    cur_note = str(probe_sig.get("ai_note", "") or "")
+                    add_note = "feature_probe_source=signal_type_skip"
+                    probe_sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                    if not str(probe_sig.get("v2_version", "")).strip():
+                        probe_sig["v2_version"] = "V2-FeatureProbe"
+                    probe_sig["note"] = ""
+                    try:
+                        probe_sig["btc_ret"] = _safe_float_or_nan(btc_ret)
+                    except Exception:
+                        pass
+                    try:
+                        probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+                    except Exception:
+                        pass
+                    raw_signals.append(probe_sig)
+                    print(
+                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
+                        f"src=signal_type_skip "
+                        f"total={probe_sig['total_score']:.2f} "
+                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
+                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
+                        f"NOTE={probe_sig.get('ai_note', '')}"
+                    )
                 continue
 
 
