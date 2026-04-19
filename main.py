@@ -1556,6 +1556,17 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
             sig.get("ai_prob_win", sig.get("AI_Prob_Win", sig.get("ai_proba_used", "")))
         )
 
+    if k == "bandwidth":
+        return _safe_float_or_nan(sig.get("BandWidth"))
+    if k == "bw_change":
+        return _safe_float_or_nan(sig.get("BW_Change"))
+    if k == "vol_change":
+        return _safe_float_or_nan(sig.get("Vol_Change"))
+    if k == "btc_ret":
+        return _safe_float_or_nan(sig.get("btc_ret"))
+    if k == "btc_vol":
+        return _safe_float_or_nan(sig.get("btc_vol"))
+
     if k == "ltf_aligned":
         v = sig.get("ltf_aligned", "")
         s = str(v or "").strip().lower()
@@ -1642,7 +1653,7 @@ def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
             continue
 
     # numeric range match
-    for base in ("p1", "p2", "p3", "rsi", "volratio", "ai", "hour"):
+    for base in ("p1", "p2", "p3", "rsi", "volratio", "ai", "hour", "bandwidth", "bw_change", "vol_change", "btc_ret", "btc_vol"):
         min_v = spec.get(f"{base}_min", "")
         max_v = spec.get(f"{base}_max", "")
         if str(min_v).strip() == "" and str(max_v).strip() == "":
