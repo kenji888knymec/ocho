@@ -1722,6 +1722,36 @@ def _feature_profile_label(sig: Dict[str, Any]) -> str:
     return ""
 
 
+def _feature_profile_log_parts(sig: Dict[str, Any]) -> Dict[str, str]:
+    gate = str(sig.get("_feature_profile_gate", "") or "").strip()
+    allow_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_profile_allow_hits", []) or [])
+        if str(x).strip()
+    ]
+    reject_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_profile_reject_hits", []) or [])
+        if str(x).strip()
+    ]
+    force_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_force_hits", []) or [])
+        if str(x).strip()
+    ]
+    bypass_profile = str(
+        sig.get("_feature_bypass_profile", sig.get("_feature_force_profile", "")) or ""
+    ).strip()
+
+    return {
+        "FEATURE_GATE": gate,
+        "ALLOW_HITS": ",".join(allow_hits),
+        "REJECT_HITS": ",".join(reject_hits),
+        "FORCE_HITS": ",".join(force_hits),
+        "BYPASS_PROFILE": bypass_profile,
+    }
+
+
 def _detect_signal_lane(sig: Dict[str, Any]) -> str:
     direction = str(sig.get("direction", "") or sig.get("Direction", "")).strip().upper()
     if direction not in ("LONG", "SHORT"):
@@ -11991,13 +12021,18 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
         gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
 
+        force_hits = sig.get("_feature_force_hits", []) or []
+        bypass_profile = str(sig.get("_feature_bypass_profile", sig.get("_feature_force_profile", "")) or "")
+
         print(
             "[FEATURE_PROFILE] "
             f"sym={sig.get('symbol','')} "
             f"side={sig.get('direction','')} "
             f"gate={gate} "
             f"allow_hits={sig.get('_feature_profile_allow_hits', [])} "
-            f"reject_hits={sig.get('_feature_profile_reject_hits', [])}",
+            f"reject_hits={sig.get('_feature_profile_reject_hits', [])} "
+            f"force_hits={force_hits} "
+            f"bypass_profile={bypass_profile}",
             flush=True,
         )
 
@@ -12158,6 +12193,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         notify_pass = str(sig.get("_notify_pass", "0"))
         notify_reason = str(sig.get("_notify_reason", "") or "")
 
+        fp = _feature_profile_log_parts(sig)
+        feature_gate = fp["FEATURE_GATE"]
+        allow_hits = fp["ALLOW_HITS"]
+        reject_hits = fp["REJECT_HITS"]
+        force_hits = fp["FORCE_HITS"]
+        bypass_profile = fp["BYPASS_PROFILE"]
+
         if direction == "SHORT" and ai_pass == "1":
             print(
                 f"[V2] SHORT-SELECTED: {sig['symbol']} {sig['direction']} "
@@ -12166,12 +12208,23 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')} "
                 f"NOTIFY={notify_pass} "
-                f"NOTIFY_REASON={notify_reason}"
+                f"NOTIFY_REASON={notify_reason} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile}"
             )
         elif direction == "SHORT" and ai_pass == "0":
             print(
                 f"[V2] SHORT-REJECTED: {sig['symbol']} {sig['direction']} "
-                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
+                f"BAND={sig.get('ai_band', '')} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile} "
+                f"NOTE={sig.get('ai_note', '')}"
             )
         elif direction == "LONG" and ai_pass == "1":
             print(
@@ -12181,12 +12234,23 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')} "
                 f"NOTIFY={notify_pass} "
-                f"NOTIFY_REASON={notify_reason}"
+                f"NOTIFY_REASON={notify_reason} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile}"
             )
         elif direction == "LONG" and ai_pass == "0":
             print(
                 f"[V2] LONG-REJECTED: {sig['symbol']} {sig['direction']} "
-                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
+                f"BAND={sig.get('ai_band', '')} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile} "
+                f"NOTE={sig.get('ai_note', '')}"
             )
 
     if engine_mode == "v2_live":
