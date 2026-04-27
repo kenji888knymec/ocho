@@ -8948,38 +8948,49 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     _seltm(f"enter n={len(signals)}")
 
-    for sig in signals:
+    loop_start = time.time()
+    
+    for i, sig in enumerate(signals, start=1):
         direction = str(sig.get("direction", "")).strip().upper()
-
+        one_start = time.time()
+    
         if direction == "SHORT":
             bypass_profile = _get_feature_bypass_profile(sig)
             if bypass_profile:
                 cur_note = str(sig.get("ai_note", "") or "")
                 bypass_note = f"feature_profile_bypass={bypass_profile}"
-
+    
                 sig["_feature_bypass"] = "1"
                 sig["_feature_bypass_profile"] = bypass_profile
                 sig["ai_pass"] = "1"
                 sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
                 sig["ai_model_version"] = "feature_profile"
                 sig["ai_model_type"] = "SHORT_FEATURE_BYPASS"
-
+    
                 if bypass_note not in cur_note:
                     sig["ai_note"] = (
                         f"{cur_note};{bypass_note}"
                         if cur_note else
                         bypass_note
                     )
-
+    
                 short_passed.append(sig)
                 print(
                     f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=SHORT profile={bypass_profile}",
                     flush=True,
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline short_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={time.time() - one_start:.2f} "
+                    f"score_sec=0.00 total_sec={time.time() - one_start:.2f} "
+                    f"passed=1 bypass=1"
+                )
                 continue
-
+    
             ok, reason = defensive_filter(sig)
-
+            t_after_filter = time.time()
+    
             if not ok:
                 sig["ai_prob_win"] = ""
                 sig["ai_pass"] = "0"
@@ -8989,10 +9000,19 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:{reason}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={reason}")
+                print(
+                    f"[TIMER] v2_selection_pipeline short_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={time.time() - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             qs = calc_quality_score(sig)
-
+            t_after_score = time.time()
+    
             if qs < V2_SHORT_QS_MIN:
                 sig["ai_prob_win"] = round(qs, 6)
                 sig["ai_pass"] = "0"
@@ -9005,10 +9025,18 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT "
                     f"reason=qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline short_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={t_after_score - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             ai_res = _predict_v2_ai_score(sig, "SHORT", qs)
-
+    
             print(
                 f"[SHORT-AI-RES] sym={sig.get('symbol')} "
                 f"ok={bool(ai_res.get('ok'))} "
@@ -9017,7 +9045,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"model_type={ai_res.get('model_type', '')} "
                 f"model_version={ai_res.get('model_version', '')}"
             )
-
+    
             if not bool(ai_res.get("ok")):
                 ai_score = ai_res.get("score", np.nan)
                 sig["ai_prob_win"] = round(float(ai_score), 6) if np.isfinite(ai_score) else ""
@@ -9035,8 +9063,16 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={ai_res.get('note', 'ai_reject')}")
+                print(
+                    f"[TIMER] v2_selection_pipeline short_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             ai_score = float(ai_res["score"])
             sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
@@ -9051,42 +9087,58 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"btcstr={_fmt_sig_num_or_blank(sig, 'btc_htf_strength')};"
                 f"rsi={sig.get('rsi', '')}"
             )
-
+    
             short_passed.append(sig)
+            print(
+                f"[TIMER] v2_selection_pipeline short_one "
+                f"i={i} symbol={sig.get('symbol','')} "
+                f"filter_sec={t_after_filter - one_start:.2f} "
+                f"score_sec={t_after_score - t_after_filter:.2f} "
+                f"total_sec={time.time() - one_start:.2f} "
+                f"passed=1"
+            )
             continue
-
+    
         if direction == "LONG":
             bypass_profile = _get_feature_bypass_profile(sig)
             if bypass_profile:
                 cur_note = str(sig.get("ai_note", "") or "")
                 bypass_note = f"feature_profile_bypass={bypass_profile}"
-
+    
                 sig["_feature_bypass"] = "1"
                 sig["_feature_bypass_profile"] = bypass_profile
                 sig["ai_pass"] = "1"
                 sig["ai_band"] = "FEATURE_PROFILE_BYPASS"
                 sig["ai_model_version"] = "feature_profile"
                 sig["ai_model_type"] = "LONG_FEATURE_BYPASS"
-
+    
                 if bypass_note not in cur_note:
                     sig["ai_note"] = (
                         f"{cur_note};{bypass_note}"
                         if cur_note else
                         bypass_note
                     )
-
+    
                 long_passed.append(sig)
                 print(
                     f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=LONG profile={bypass_profile}",
                     flush=True,
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={time.time() - one_start:.2f} "
+                    f"score_sec=0.00 total_sec={time.time() - one_start:.2f} "
+                    f"passed=1 bypass=1"
+                )
                 continue
-
+    
             research_tags = _get_long_research_tags(sig)
             research_note = "|".join(research_tags)
             rescued_p1 = _allow_long_p1_rescue(sig)
             ok, reason = defensive_filter_long(sig)
-
+            t_after_filter = time.time()
+    
             if not ok:
                 sig["ai_prob_win"] = ""
                 sig["ai_pass"] = "0"
@@ -9096,11 +9148,20 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:{reason};rescued_p1={rescued_p1};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={reason}")
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={time.time() - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             qs = calc_long_quality_score(sig)
+            t_after_score = time.time()
             sig["qs"] = round(float(qs), 6) if np.isfinite(qs) else ""
-
+    
             if not np.isfinite(qs):
                 sig["ai_prob_win"] = ""
                 sig["ai_pass"] = "0"
@@ -9110,8 +9171,16 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:missing_qs_feature;rescued_p1={rescued_p1};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason=missing_qs_feature")
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={t_after_score - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             if qs < V2_LONG_QS_MIN:
                 sig["ai_prob_win"] = round(qs, 6)
                 sig["ai_pass"] = "0"
@@ -9128,13 +9197,21 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason=qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={t_after_score - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             bad_regime = _assess_long_ai_bad_regime(sig)
             sig["_long_bad_regime_mode"] = str(bad_regime.get("mode", "NORMAL") or "NORMAL").upper()
             sig["_long_bad_regime_hits"] = int(bad_regime.get("hit_count", 0) or 0)
             sig["_long_bad_regime_tags"] = list(bad_regime.get("tags", []) or [])
-
+    
             bad_tags_text = "|".join(str(x) for x in sig["_long_bad_regime_tags"]) if sig["_long_bad_regime_tags"] else "none"
             bad_regime_note = (
                 f"bad_mode={sig['_long_bad_regime_mode']};"
@@ -9142,7 +9219,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"bad_tags={bad_tags_text};"
                 f"bad_note={bad_regime.get('note', '')}"
             )
-
+    
             print(
                 f"[V2-LONG-BADREGIME] sym={sig.get('symbol')} "
                 f"mode={sig['_long_bad_regime_mode']} "
@@ -9153,7 +9230,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"p2={_fmt_sig_num_or_blank(sig, 'p2_score')} "
                 f"p3={_fmt_sig_num_or_blank(sig, 'p3_score')}"
             )
-
+    
             if sig["_long_bad_regime_mode"] == "STOP":
                 sig["ai_prob_win"] = ""
                 sig["ai_pass"] = "0"
@@ -9179,17 +9256,25 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason=bad_regime_stop;{bad_regime_note}"
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             ai_res = _predict_v2_ai_score(sig, "LONG", qs)
-
+    
             if sig["_long_bad_regime_mode"] == "CAUTION":
                 caution_penalty = float(V2_LONG_AI_BADREGIME_CAUTION_PENALTY)
                 caution_note = (
                     f"{bad_regime_note};"
                     f"bad_penalty={caution_penalty:.4f}"
                 )
-
+    
                 if np.isfinite(float(ai_res.get("score", np.nan))) and bool(ai_res.get("ok")):
                     raw_score_before_penalty = float(ai_res["score"])
                     penalized_score = max(0.0, raw_score_before_penalty - caution_penalty)
@@ -9199,7 +9284,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                         f"{caution_note};"
                         f"raw_before_penalty={raw_score_before_penalty:.6f}"
                     )
-
+    
                     if penalized_score < float(V2_LONG_AI_MIN):
                         ai_res["ok"] = False
                         ai_res["note"] = f"{ai_res.get('note', '')};bad_regime_caution_below_min"
@@ -9207,7 +9292,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     ai_res["note"] = f"{ai_res.get('note', '')};{caution_note};penalty_not_applied"
             else:
                 ai_res["note"] = f"{ai_res.get('note', '')};{bad_regime_note}"
-
+    
             if not bool(ai_res.get("ok")):
                 ai_score = ai_res.get("score", np.nan)
                 sig["ai_prob_win"] = round(float(ai_score), 6) if np.isfinite(ai_score) else ""
@@ -9233,8 +9318,16 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason={ai_res.get('note', 'ai_reject')}"
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             ai_score = float(ai_res["score"])
             sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
@@ -9254,7 +9347,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"rescued_p1={rescued_p1};"
                 f"research_tags={research_note}"
             )
-
+    
             gate_ok, gate_reason = _long_notify_gate(sig)
             if not gate_ok:
                 sig["ai_pass"] = "0"
@@ -9278,18 +9371,34 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason={gate_reason}"
                 )
+                print(
+                    f"[TIMER] v2_selection_pipeline long_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={time.time() - one_start:.2f} "
+                    f"passed=0"
+                )
                 continue
-
+    
             print(
                 f"[V2-LONG-AI] sym={sig.get('symbol')} "
                 f"ai_prob_win={sig.get('ai_prob_win', '')} "
                 f"band={sig.get('ai_band', '')} "
                 f"{bad_regime_note}"
             )
-
+    
             long_passed.append(sig)
+            print(
+                f"[TIMER] v2_selection_pipeline long_one "
+                f"i={i} symbol={sig.get('symbol','')} "
+                f"filter_sec={t_after_filter - one_start:.2f} "
+                f"score_sec={t_after_score - t_after_filter:.2f} "
+                f"total_sec={time.time() - one_start:.2f} "
+                f"passed=1"
+            )
             continue
-
+    
         sig["ai_prob_win"] = ""
         sig["ai_pass"] = ""
         sig["ai_band"] = "COMMON"
@@ -9297,6 +9406,8 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         sig["ai_model_type"] = "COMMON"
         sig["ai_note"] = ""
         output.append(sig)
+    
+    print(f"[TIMER] v2_selection_pipeline loop_done sec={time.time() - loop_start:.2f}")
 
     _seltm(f"after_direction_filters short_passed={len(short_passed)} long_passed={len(long_passed)} output={len(output)}")
 
