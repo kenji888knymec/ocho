@@ -1722,6 +1722,36 @@ def _feature_profile_label(sig: Dict[str, Any]) -> str:
     return ""
 
 
+def _feature_profile_log_parts(sig: Dict[str, Any]) -> Dict[str, str]:
+    gate = str(sig.get("_feature_profile_gate", "") or "").strip()
+    allow_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_profile_allow_hits", []) or [])
+        if str(x).strip()
+    ]
+    reject_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_profile_reject_hits", []) or [])
+        if str(x).strip()
+    ]
+    force_hits = [
+        str(x).strip()
+        for x in (sig.get("_feature_force_hits", []) or [])
+        if str(x).strip()
+    ]
+    bypass_profile = str(
+        sig.get("_feature_bypass_profile", sig.get("_feature_force_profile", "")) or ""
+    ).strip()
+
+    return {
+        "FEATURE_GATE": gate,
+        "ALLOW_HITS": ",".join(allow_hits),
+        "REJECT_HITS": ",".join(reject_hits),
+        "FORCE_HITS": ",".join(force_hits),
+        "BYPASS_PROFILE": bypass_profile,
+    }
+
+
 def _detect_signal_lane(sig: Dict[str, Any]) -> str:
     direction = str(sig.get("direction", "") or sig.get("Direction", "")).strip().upper()
     if direction not in ("LONG", "SHORT"):
@@ -4943,6 +4973,8 @@ V2_JUDGE_PRIORITY_BANDS         = [
     if s.strip()
 ]
 V2_DEBUG_REJECTS                = str(os.environ.get("V2_DEBUG_REJECTS", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_DEBUG_RAW_SIG                = str(os.environ.get("V2_DEBUG_RAW_SIG", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_DEBUG_FEATURE_PROBE          = str(os.environ.get("V2_DEBUG_FEATURE_PROBE", "0")).strip().lower() in ("1", "true", "yes", "on")
 V2_LONG_SYMBOL_BLOCKLIST        = [s.strip().upper() for s in str(os.environ.get("V2_LONG_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
 V2_SHORT_SYMBOL_BLOCKLIST       = [s.strip().upper() for s in str(os.environ.get("V2_SHORT_SYMBOL_BLOCKLIST", "")).split(",") if s.strip()]
 
@@ -5298,6 +5330,7 @@ V2_RETRAIN_TRIGGER_PNL_GAP            = _env_float("V2_RETRAIN_TRIGGER_PNL_GAP",
 
 # --- V2 Shadow 出力先シート ---
 V2_SHADOW_SHEET            = os.environ.get("V2_SHADOW_SHEET", "v2_shadow_ai")
+V2_SHADOW_WRITE_ENABLE     = str(os.environ.get("V2_SHADOW_WRITE_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- V2 regime-aware notify policy ---
 V2_REGIME_POLICY_ENABLE         = str(os.environ.get("V2_REGIME_POLICY_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
@@ -11950,13 +11983,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 if probe_candidates:
                     sig = probe_candidates[0]
 
-                    print(
-                        f"[V2] FEATURE-PROBE: {sig['symbol']} {sig['direction']} "
-                        f"total={sig['total_score']:.2f} "
-                        f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
-                        f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')} "
-                        f"NOTE={sig.get('ai_note', '')}"
-                    )
+                    if V2_DEBUG_FEATURE_PROBE:
+                        print(
+                            f"[V2] FEATURE-PROBE: {sig['symbol']} {sig['direction']} "
+                            f"total={sig['total_score']:.2f} "
+                            f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
+                            f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')} "
+                            f"NOTE={sig.get('ai_note', '')}"
+                        )
 
             if sig is not None:
                 if not str(sig.get("v2_version", "")).strip():
@@ -11968,12 +12002,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
                 raw_signals.append(sig)
 
-                print(
-                    f"[V2] RAW-SIG: {sig['symbol']} {sig['direction']} "
-                    f"total={sig['total_score']:.2f} "
-                    f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
-                    f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')}"
-                )
+                if V2_DEBUG_RAW_SIG:
+                    print(
+                        f"[V2] RAW-SIG: {sig['symbol']} {sig['direction']} "
+                        f"total={sig['total_score']:.2f} "
+                        f"P1={sig['p1_score']:.2f} P2={sig['p2_score']:.2f} P3={sig['p3_score']:.2f} "
+                        f"RSI={sig.get('rsi', '')} BTCstr={sig.get('btc_htf_strength', '')}"
+                    )
         except Exception as e:
             print(f"[V2-ERR] {symbol}: {e}")
 
@@ -11991,13 +12026,18 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
         gate = str(sig.get("_feature_profile_gate", "") or "").strip().lower()
 
+        force_hits = sig.get("_feature_force_hits", []) or []
+        bypass_profile = str(sig.get("_feature_bypass_profile", sig.get("_feature_force_profile", "")) or "")
+
         print(
             "[FEATURE_PROFILE] "
             f"sym={sig.get('symbol','')} "
             f"side={sig.get('direction','')} "
             f"gate={gate} "
             f"allow_hits={sig.get('_feature_profile_allow_hits', [])} "
-            f"reject_hits={sig.get('_feature_profile_reject_hits', [])}",
+            f"reject_hits={sig.get('_feature_profile_reject_hits', [])} "
+            f"force_hits={force_hits} "
+            f"bypass_profile={bypass_profile}",
             flush=True,
         )
 
@@ -12158,6 +12198,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         notify_pass = str(sig.get("_notify_pass", "0"))
         notify_reason = str(sig.get("_notify_reason", "") or "")
 
+        fp = _feature_profile_log_parts(sig)
+        feature_gate = fp["FEATURE_GATE"]
+        allow_hits = fp["ALLOW_HITS"]
+        reject_hits = fp["REJECT_HITS"]
+        force_hits = fp["FORCE_HITS"]
+        bypass_profile = fp["BYPASS_PROFILE"]
+
         if direction == "SHORT" and ai_pass == "1":
             print(
                 f"[V2] SHORT-SELECTED: {sig['symbol']} {sig['direction']} "
@@ -12166,12 +12213,23 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')} "
                 f"NOTIFY={notify_pass} "
-                f"NOTIFY_REASON={notify_reason}"
+                f"NOTIFY_REASON={notify_reason} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile}"
             )
         elif direction == "SHORT" and ai_pass == "0":
             print(
                 f"[V2] SHORT-REJECTED: {sig['symbol']} {sig['direction']} "
-                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
+                f"BAND={sig.get('ai_band', '')} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile} "
+                f"NOTE={sig.get('ai_note', '')}"
             )
         elif direction == "LONG" and ai_pass == "1":
             print(
@@ -12181,12 +12239,23 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"QS={sig.get('ai_prob_win', '')} "
                 f"TYPE={sig.get('ai_model_type', '')} "
                 f"NOTIFY={notify_pass} "
-                f"NOTIFY_REASON={notify_reason}"
+                f"NOTIFY_REASON={notify_reason} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile}"
             )
         elif direction == "LONG" and ai_pass == "0":
             print(
                 f"[V2] LONG-REJECTED: {sig['symbol']} {sig['direction']} "
-                f"BAND={sig.get('ai_band', '')} NOTE={sig.get('ai_note', '')}"
+                f"BAND={sig.get('ai_band', '')} "
+                f"FEATURE_GATE={feature_gate} "
+                f"ALLOW_HITS={allow_hits} "
+                f"REJECT_HITS={reject_hits} "
+                f"FORCE_HITS={force_hits} "
+                f"BYPASS_PROFILE={bypass_profile} "
+                f"NOTE={sig.get('ai_note', '')}"
             )
 
     if engine_mode == "v2_live":
@@ -12237,8 +12306,11 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     # シート書き込み（選抜通過もREJECTも全部書く）
     # 重要: 送信結果を ai_note に反映したあとで書く
-    rows = [v2_build_shadow_row(sig) for sig in final_signals]
-    v2_write_shadow_rows(rows)
+    if V2_SHADOW_WRITE_ENABLE:
+        rows = [v2_build_shadow_row(sig) for sig in final_signals]
+        v2_write_shadow_rows(rows)
+    else:
+        print("[V2] shadow write skipped by V2_SHADOW_WRITE_ENABLE=0")
 
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
 
@@ -12536,14 +12608,15 @@ def logic_main(force: bool = False):
                 for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
 
-                    print(
-                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
-                        f"src=pre_candidate_skip bad_col={bad_col} "
-                        f"total={probe_sig['total_score']:.2f} "
-                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
-                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
-                        f"NOTE={probe_sig.get('ai_note', '')}"
-                    )
+                    if V2_DEBUG_FEATURE_PROBE:
+                        print(
+                            f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
+                            f"src=pre_candidate_skip bad_col={bad_col} "
+                            f"total={probe_sig['total_score']:.2f} "
+                            f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
+                            f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
+                            f"NOTE={probe_sig.get('ai_note', '')}"
+                        )
 
                 continue
 
@@ -12593,14 +12666,15 @@ def logic_main(force: bool = False):
 
                 for probe_sig in probe_candidates:
                     raw_signals.append(probe_sig)
-                    print(
-                        f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
-                        f"src=signal_type_skip "
-                        f"total={probe_sig['total_score']:.2f} "
-                        f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
-                        f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
-                        f"NOTE={probe_sig.get('ai_note', '')}"
-                    )
+                    if V2_DEBUG_FEATURE_PROBE:
+                        print(
+                            f"[V2] FEATURE-PROBE: {probe_sig['symbol']} {probe_sig['direction']} "
+                            f"src=signal_type_skip "
+                            f"total={probe_sig['total_score']:.2f} "
+                            f"P1={probe_sig['p1_score']:.2f} P2={probe_sig['p2_score']:.2f} P3={probe_sig['p3_score']:.2f} "
+                            f"RSI={probe_sig.get('rsi', '')} BTCstr={probe_sig.get('btc_htf_strength', '')} "
+                            f"NOTE={probe_sig.get('ai_note', '')}"
+                        )
                 continue
 
 
@@ -15824,7 +15898,7 @@ def judge_v2_sheet(
     return judged
 
 
-def judge_v2_main() -> str:
+def judge_v2_main(run_backfill: bool = False) -> str:
     recent_total = judge_v2_sheet(
         V2_SHADOW_SHEET,
         lookback_rows=V2_JUDGE_LOOKBACK_ROWS,
@@ -15835,7 +15909,7 @@ def judge_v2_main() -> str:
     )
 
     backfill_total = 0
-    if V2_JUDGE_BACKFILL_ENABLE and V2_JUDGE_BACKFILL_MAX_ROWS > 0:
+    if run_backfill and V2_JUDGE_BACKFILL_ENABLE and V2_JUDGE_BACKFILL_MAX_ROWS > 0:
         backfill_total = judge_v2_sheet(
             V2_SHADOW_SHEET,
             lookback_rows=max(V2_JUDGE_BACKFILL_LOOKBACK_ROWS, V2_JUDGE_LOOKBACK_ROWS),
@@ -15922,7 +15996,8 @@ def judge_v2_process():
                 print(f"[JUDGE15M-V2]{msg}")
                 return msg, 200
 
-            return str(judge_v2_main()), 200
+            run_backfill = str(request.args.get("backfill", "0")).strip() == "1"
+            return str(judge_v2_main(run_backfill=run_backfill)), 200
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             print(f"[ERR] /judge_v2 crashed: {err}")
