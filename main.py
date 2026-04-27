@@ -11766,7 +11766,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     - LONGは今まで通り通す
     - REJECTされたSHORTも ai_pass=0 でシートに記録（検証用）
     """
+    v2_start = time.time()
+
+    def _v2tm(label: str):
+        print(f"[TIMER] v2_shadow_run {label} sec={time.time() - v2_start:.2f}")
+
     engine_mode = str(SIGNAL_ENGINE).strip().lower()
+    _v2tm("enter")
 
     # 15分足確定待ち
     if (not force) and ((now_jst.minute % 15) < 10):
@@ -11775,6 +11781,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     # シート準備
     try:
         v2_ensure_shadow_sheet(get_sheet_service(), SPREADSHEET_ID)
+        _v2tm("after_ensure_shadow_sheet")
     except Exception as e:
         print(f"[V2-ERR] sheet setup: {e}")
         return f"V2: sheet error {e}"
@@ -11786,6 +11793,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     btc_htf_df = pd.DataFrame(btc_htf_ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     btc_htf = assess_htf_trend(btc_htf_df)
+    _v2tm("after_btc_htf")
 
     # BTC 15m Pct_Change / Vol (AI 特徴量用)
     btc_ret = np.nan
@@ -11813,6 +11821,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     except Exception as e:
         print(f"[V2-WARN] BTC 15m fetch for AI feats failed: {e}")
+    _v2tm("after_btc_15m_features")
 
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
@@ -12258,6 +12267,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 f"NOTE={sig.get('ai_note', '')}"
             )
 
+    _v2tm("after_signal_selection")
     if engine_mode == "v2_live":
         # 特徴量の掛け合わせ条件に一致したものだけ通知する
         feature_only_candidates = []
@@ -12277,11 +12287,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         notify_candidates = feature_only_candidates
 
         sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
+        _v2tm("after_live_discord")
 
         if V2_WATCH_NOTIFY_ENABLE:
             watch_sent_n, watch_runtime_dedup_skipped_n = send_v2_watch_discord_alerts(final_signals)
         else:
             watch_sent_n, watch_runtime_dedup_skipped_n = 0, 0
+        _v2tm("after_watch_discord")
 
         print(
             f"[V2] engine_mode=v2_live "
@@ -12312,6 +12324,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     else:
         print("[V2] shadow write skipped by V2_SHADOW_WRITE_ENABLE=0")
 
+    _v2tm("before_return")
     return f"V2-shadow: final={len(final_signals)} (short_pass={n_short_pass} short_reject={n_short_reject} long_pass={n_long_pass} long_reject={n_long_reject}) raw={len(raw_signals)}"
 
 
