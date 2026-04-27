@@ -2199,9 +2199,16 @@ def _short_repeat_rank_penalty(sig: Dict[str, Any]) -> Tuple[float, int, str]:
         if not sym:
             return 0.0, 0, ""
 
-        repeat_state = _get_v2_short_recent_notified_window_state(datetime.now(JST))
-        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
-        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        pref_recent_n = sig.get("_prefetched_short_repeat_recent_n", None)
+        pref_last_dt = sig.get("_prefetched_short_repeat_last_dt", None)
+
+        if pref_recent_n is None:
+            repeat_state = _get_v2_short_recent_notified_window_state(datetime.now(JST))
+            recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+            last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        else:
+            recent_n = int(pref_recent_n or 0)
+            last_dt = str(pref_last_dt or "")
 
         if recent_n > int(V2_SHORT_REPEAT_PENALTY_MIN_COUNT):
             return float(V2_SHORT_REPEAT_PENALTY_VALUE), recent_n, last_dt
@@ -7703,8 +7710,10 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
     long_raw_rescue = str(sig.get("long_raw_rescue", "")).strip().lower() in ("1", "true", "yes", "on")
     sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
 
+    now_jst = datetime.now(JST)
+
     # 当日LONG緊急ブレーキ
-    fast_brake_state = _resolve_v2_long_fast_brake_runtime(datetime.now(JST))
+    fast_brake_state = _resolve_v2_long_fast_brake_runtime(now_jst)
     if bool(fast_brake_state.get("active", False)):
         return False, (
             f"long_fast_brake "
@@ -7713,9 +7722,16 @@ def defensive_filter_long(sig: Dict[str, Any]) -> Tuple[bool, str]:
 
     # 同一銘柄LONGの連打は、ここでは reject せず rank penalty 側で扱う
     if V2_LONG_REPEAT_BLOCK_ENABLE and sym:
-        repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
-        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
-        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        pref_recent_n = sig.get("_prefetched_long_repeat_recent_n", None)
+        pref_last_dt = sig.get("_prefetched_long_repeat_last_dt", None)
+
+        if pref_recent_n is None:
+            repeat_state = _get_v2_long_recent_notified_window_state(now_jst)
+            recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+            last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        else:
+            recent_n = int(pref_recent_n or 0)
+            last_dt = str(pref_last_dt or "")
 
         sig["long_repeat_recent_n"] = recent_n
         sig["long_repeat_last_dt"] = last_dt
@@ -8734,9 +8750,16 @@ def _long_repeat_rank_penalty(sig: Dict[str, Any]) -> Tuple[float, int, str]:
         if not sym:
             return 0.0, 0, ""
 
-        repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
-        recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
-        last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        pref_recent_n = sig.get("_prefetched_long_repeat_recent_n", None)
+        pref_last_dt = sig.get("_prefetched_long_repeat_last_dt", None)
+
+        if pref_recent_n is None:
+            repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
+            recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+            last_dt = str(((repeat_state.get("last_dt", {}) or {}).get(sym, "")) or "")
+        else:
+            recent_n = int(pref_recent_n or 0)
+            last_dt = str(pref_last_dt or "")
 
         if recent_n > int(V2_LONG_REPEAT_PENALTY_MIN_COUNT):
             return float(V2_LONG_REPEAT_PENALTY_VALUE), recent_n, last_dt
@@ -8948,12 +8971,41 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     _seltm(f"enter n={len(signals)}")
 
+    now_jst = datetime.now(JST)
+
+    pref_long_repeat_state = (
+        _get_v2_long_recent_notified_window_state(now_jst)
+        if V2_LONG_REPEAT_BLOCK_ENABLE or V2_LONG_REPEAT_PENALTY_ENABLE
+        else {"counts": {}, "last_dt": {}}
+    )
+
+    pref_short_repeat_state = (
+        _get_v2_short_recent_notified_window_state(now_jst)
+        if V2_SHORT_REPEAT_PENALTY_ENABLE
+        else {"counts": {}, "last_dt": {}}
+    )
+
     loop_start = time.time()
-    
+
     for i, sig in enumerate(signals, start=1):
         direction = str(sig.get("direction", "")).strip().upper()
         one_start = time.time()
-    
+        sym = str(sig.get("symbol", "")).split("/", 1)[0].strip().upper()
+
+        if sym:
+            sig["_prefetched_long_repeat_recent_n"] = int(
+                ((pref_long_repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0
+            )
+            sig["_prefetched_long_repeat_last_dt"] = str(
+                ((pref_long_repeat_state.get("last_dt", {}) or {}).get(sym, "")) or ""
+            )
+            sig["_prefetched_short_repeat_recent_n"] = int(
+                ((pref_short_repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0
+            )
+            sig["_prefetched_short_repeat_last_dt"] = str(
+                ((pref_short_repeat_state.get("last_dt", {}) or {}).get(sym, "")) or ""
+            )
+
         if direction == "SHORT":
             bypass_profile = _get_feature_bypass_profile(sig)
             if bypass_profile:
@@ -10225,7 +10277,14 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
     これで「通知停止」と「shadow記録停止」を分離する。
     """
     out: List[Dict[str, Any]] = []
-    guard_state = get_v2_guardrail_state(datetime.now(JST))
+    now_jst = datetime.now(JST)
+    guard_state = get_v2_guardrail_state(now_jst)
+
+    pref_long_repeat_state = (
+        _get_v2_long_recent_notified_window_state(now_jst)
+        if V2_LONG_REPEAT_BLOCK_ENABLE
+        else {"counts": {}, "last_dt": {}}
+    )
 
     for sig in signals:
         side = str(sig.get("direction", "")).strip().upper()
@@ -10251,8 +10310,7 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
                 notify_pass = "0"
                 notify_reason = f"short_notify_block_hour:{hour}"
             elif side == "LONG" and V2_LONG_REPEAT_BLOCK_ENABLE and sym:
-                repeat_state = _get_v2_long_recent_notified_window_state(datetime.now(JST))
-                recent_n = int(((repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
+                recent_n = int(((pref_long_repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
                 if recent_n >= int(V2_LONG_REPEAT_MAX_NOTIFIES):
                     notify_pass = "0"
                     notify_reason = (
