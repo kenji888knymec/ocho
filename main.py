@@ -12327,8 +12327,14 @@ def logic_main(force: bool = False):
     now_jst = datetime.now(JST)
     print(f"[RUN] start {now_jst.isoformat()}  VERSION={VERSION} force={force}")
 
+    def _tm(label: str):
+        print(f"[TIMER] logic_main {label} sec={time.time() - start:.2f}")
+
+    _tm("enter")
+
     # self heal
     ok, msg = self_heal_prerequisites()
+    _tm("after_self_heal")
     if not ok:
         send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
         return f"SelfHealFailed: {msg}"
@@ -12343,6 +12349,7 @@ def logic_main(force: bool = False):
     except Exception as e:
         send_discord_message(f"[WARN] get_ai_model failed: {type(e).__name__}: {e}")
         ai_model = None
+    _tm("after_get_ai_model")
 
     # 15分足の確定直後は取引所側の反映遅れがあるため、通常は「各15分の10分以降」に実行する
     # ...以下、BTCデータの取得へ続く
@@ -12353,7 +12360,7 @@ def logic_main(force: bool = False):
         return "Waiting..."
 
     exchange = build_exchange()
-
+    _tm("after_build_exchange")
 
     btc_mode = "Range"
     btc_1h_change = np.nan
@@ -14343,11 +14350,13 @@ def logic_main(force: bool = False):
             print(f"[V2] {v2_result}")
         except Exception as e:
             print(f"[V2-ERR] shadow run crashed: {e}")
+        _tm("after_v2_shadow_run")
 
     elapsed = time.time() - start
     print(f"[RUN] done alerts={count} candidates={len(candidate_rows)} elapsed={elapsed:.2f}s")
     print(f"[DBG] pending_candidates={len(pending_candidates)} pending_alerts={len(pending_alerts)} "
           f"BTC_CALM={BTC_CALM} btc_mode={btc_mode} median_sigma={median_sigma} btc_ok={btc_ok}")
+    _tm("before_return")
     return f"Sent {count} alerts, Logged {len(candidate_rows)} candidates"
 
 # ==========================================
