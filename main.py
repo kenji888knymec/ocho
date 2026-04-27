@@ -12460,15 +12460,58 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
     _v2tm("after_signal_selection")
     if engine_mode == "v2_live":
-        # 特徴量の掛け合わせ条件に一致したものだけ通知する
+        # 特徴量の掛け合わせ条件に一致したものだけを通知候補にする。
+        # ただし、feature_probe_only / rank_exceeded / selected=false は本番通知しない。
+        # 目的:
+        #   - feature profile route は維持する
+        #   - v2_core はまだ本番復活させない
+        #   - probe専用候補やrank落ち候補が notify_sent=1 に混ざるのを防ぐ
+        def _v2_feature_live_guard_reason(sig: Dict[str, Any]) -> str:
+            note_raw = str(sig.get("ai_note", "") or "")
+            note = note_raw.lower().replace(" ", "")
+
+            feature_probe_flag = str(sig.get("feature_probe_only", "") or "").strip().lower()
+            if (
+                "feature_probe_only=1" in note
+                or feature_probe_flag in ("1", "true", "yes", "on")
+            ):
+                return "feature_probe_only"
+
+            if "reason=rank_exceeded" in note or "rank_exceeded" in note:
+                return "rank_exceeded"
+
+            if "selected=false" in note or "selected=0" in note:
+                return "selected_false"
+
+            if "selected=true" not in note and "selected=1" not in note:
+                return "selected_missing"
+
+            return ""
+
         feature_only_candidates = []
+        feature_guard_blocked_n = 0
+
         for x in final_signals:
             is_feature_hit = str(x.get("_feature_bypass", "0")) == "1"
 
             if is_feature_hit:
-                x["_notify_pass"] = "1"
-                x["_notify_reason"] = "feature_profile_only"
-                feature_only_candidates.append(x)
+                guard_reason = _v2_feature_live_guard_reason(x)
+
+                if guard_reason == "":
+                    x["_notify_pass"] = "1"
+                    x["_notify_reason"] = "feature_profile_only_selected"
+                    feature_only_candidates.append(x)
+                else:
+                    feature_guard_blocked_n += 1
+                    x["_notify_pass"] = "0"
+                    x["_notify_reason"] = f"feature_profile_selected_guard:{guard_reason}"
+                    cur_note = str(x.get("ai_note", "") or "")
+                    add_note = (
+                        "notify_sent=0;"
+                        f"notify_send_reason=feature_profile_selected_guard;"
+                        f"selected_guard_reason={guard_reason}"
+                    )
+                    x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
             else:
                 x["_notify_pass"] = "0"
                 cur_note = str(x.get("ai_note", "") or "")
@@ -12476,6 +12519,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
 
         notify_candidates = feature_only_candidates
+
+        print(
+            f"[V2] feature_selected_guard "
+            f"feature_candidates={len(feature_only_candidates)} "
+            f"feature_guard_blocked={feature_guard_blocked_n} "
+            f"final_signals={len(final_signals)}"
+        )
 
         sent_n, runtime_dedup_skipped_n = send_v2_live_discord_alerts(notify_candidates)
         _v2tm("after_live_discord")
