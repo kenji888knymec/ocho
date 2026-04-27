@@ -3063,10 +3063,17 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
     """
     global last_alert_records
 
+    send_start = time.time()
+
+    def _dtm(label: str):
+        print(f"[TIMER] send_v2_live_discord_alerts {label} sec={time.time() - send_start:.2f}")
+
     sent = 0
     runtime_dedup_skipped = 0
     now_ts = int(time.time())
     now_jst_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+    _dtm(f"enter n={len(notify_candidates)}")
 
     try:
         expire_before = now_ts - 86400
@@ -3076,6 +3083,7 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
         }
     except Exception:
         pass
+    _dtm("after_expire_cleanup")
 
     for sig in notify_candidates:
         sig["_notify_sent"] = "0"
@@ -3109,6 +3117,7 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
             continue
 
         ok, send_reason = send_discord_message(msg)
+        _dtm(f"after_send symbol={sig.get('symbol', '')} ok={int(bool(ok))}")
 
         if ok:
             last_alert_records[key] = now_ts
@@ -3140,6 +3149,7 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
                 f"reason={send_reason}"
             )
 
+    _dtm(f"before_return sent={sent} dedup={runtime_dedup_skipped}")
     return sent, runtime_dedup_skipped
 
 
@@ -8924,12 +8934,19 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     REJECT も rank落ちも記録用に残す。
     """
+    sel_start = time.time()
+
+    def _seltm(label: str):
+        print(f"[TIMER] v2_selection_pipeline {label} sec={time.time() - sel_start:.2f}")
+
     if not signals:
         return []
 
     output: List[Dict[str, Any]] = []
     short_passed: List[Dict[str, Any]] = []
     long_passed: List[Dict[str, Any]] = []
+
+    _seltm(f"enter n={len(signals)}")
 
     for sig in signals:
         direction = str(sig.get("direction", "")).strip().upper()
@@ -9281,8 +9298,12 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         sig["ai_note"] = ""
         output.append(sig)
 
+    _seltm(f"after_direction_filters short_passed={len(short_passed)} long_passed={len(long_passed)} output={len(output)}")
+
     ranked_shorts = rank_and_select(short_passed)
+    _seltm(f"after_short_rank short_ranked={len(ranked_shorts)}")
     ranked_longs = rank_and_select_long(long_passed)
+    _seltm(f"after_long_rank long_ranked={len(ranked_longs)}")
 
     output.extend(ranked_shorts)
     output.extend(ranked_longs)
@@ -9311,6 +9332,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     except Exception:
         pass
 
+    _seltm(f"before_return output={len(output)}")
     return output
 
 
