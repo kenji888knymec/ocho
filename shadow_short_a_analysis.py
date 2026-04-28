@@ -114,6 +114,27 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df[f"_n_{col}"] = np.nan
 
+    # BTC_Mode (RANGE判定用)
+    # 優先1: BTC_Mode_RANGE 数値フラグ
+    # 優先2: BTC_Mode 文字列 "RANGE"
+    # 優先3: BTC_HTF_Mode / BTCMode / btc_mode 文字列
+    is_range = pd.Series([np.nan] * len(df), index=df.index, dtype=object)
+    if df["_n_BTC_Mode_RANGE"].notna().any():
+        is_range = (df["_n_BTC_Mode_RANGE"] == 1).where(
+            df["_n_BTC_Mode_RANGE"].notna(), np.nan
+        )
+    else:
+        for cand in ("BTC_Mode", "BTC_HTF_Mode", "BTCMode", "btc_mode"):
+            if cand in df.columns:
+                vals = df[cand].astype(str).str.strip().str.upper()
+                non_empty = vals != ""
+                if non_empty.any():
+                    is_range = vals.where(non_empty, np.nan).map(
+                        lambda v: True if str(v).upper() == "RANGE" else (False if pd.notna(v) else np.nan)
+                    )
+                    break
+    df["_is_range"] = is_range
+
     # WinLose
     if "WinLose" in df.columns:
         df["_win"] = _to_win(df["WinLose"])
@@ -142,10 +163,10 @@ def apply_short_a(df: pd.DataFrame, use_ai_max: bool = True) -> pd.DataFrame:
     # side=SHORT
     mask &= df["_dir"] == "SHORT"
 
-    # mode=RANGE → BTC_Mode_RANGE == 1
-    rng = df["_n_BTC_Mode_RANGE"]
-    has_range = rng.notna()
-    mask &= has_range & (rng == 1)
+    # mode=RANGE → _is_range == True
+    rng = df["_is_range"]
+    has_range = rng.notna() & (rng != "")
+    mask &= has_range & (rng == True)
 
     # rsi_min=50, rsi_max=55 → 50 <= RSI < 55
     rsi = df["_n_RSI"]
@@ -223,16 +244,16 @@ def report_section(label: str, sub: pd.DataFrame, all_days: set):
             print(f"  {band}: {_fmt(_stats(g))}")
 
     # 日別上位10日
-    daily = sub.groupby("_date").apply(lambda g: _stats(g)).reset_index()
-    if len(daily) > 0:
-        print(f"\n【日別件数 (上位10日)】")
+    if len(sub) > 0:
         day_counts = sub.groupby("_date").size().sort_values(ascending=False).head(10)
-        for d, cnt in day_counts.items():
-            g = sub[sub["_date"] == d]
-            st = _stats(g)
-            wr_s = f"{st['wr']*100:.0f}%" if np.isfinite(st["wr"]) else "N/A"
-            pm_s = f"{st['pnl_mean']:+.3f}" if np.isfinite(st["pnl_mean"]) else "N/A"
-            print(f"  {d}  n={cnt:3d}  wr={wr_s}  avg={pm_s}")
+        if len(day_counts) > 0:
+            print(f"\n【日別件数 (上位10日)】")
+            for d, cnt in day_counts.items():
+                g = sub[sub["_date"] == d]
+                st = _stats(g)
+                wr_s = f"{st['wr']*100:.0f}%" if np.isfinite(st["wr"]) else "N/A"
+                pm_s = f"{st['pnl_mean']:+.3f}" if np.isfinite(st["pnl_mean"]) else "N/A"
+                print(f"  {d}  n={cnt:3d}  wr={wr_s}  avg={pm_s}")
 
 
 # ==========================================
@@ -249,12 +270,23 @@ def main():
 
     # 列存在チェック
     checked = ["RSI", "P2_FundingScore", "VolRatio", "AI_Prob_Win",
-               "BTC_Mode_RANGE", "PnL_Pct", "WinLose", "Direction", "Datetime_JST"]
+               "BTC_Mode_RANGE", "BTC_Mode", "BTC_HTF_Mode",
+               "PnL_Pct", "WinLose", "Direction", "Datetime_JST"]
     missing = [c for c in checked if c not in df_raw.columns]
     present = [c for c in checked if c in df_raw.columns]
     print(f"[INFO] 使用列: {present}")
     if missing:
         print(f"[WARN] 欠損列: {missing}")
+
+    # BTC_Mode列候補をスプシ全体から探す
+    btc_cols = [c for c in df_raw.columns if "btc" in c.lower() and "mode" in c.lower()]
+    print(f"[INFO] BTC mode系の列: {btc_cols}")
+
+    # _is_range の判定状況を確認
+    n_range_true = int((df["_is_range"] == True).sum())
+    n_range_false = int((df["_is_range"] == False).sum())
+    n_range_nan = int(df["_is_range"].isna().sum())
+    print(f"[INFO] _is_range: True={n_range_true}, False={n_range_false}, NaN={n_range_nan}")
 
     # 日付フィルタ
     now_jst = datetime.now(JST)
