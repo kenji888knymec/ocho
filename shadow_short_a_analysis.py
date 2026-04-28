@@ -115,24 +115,26 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
             df[f"_n_{col}"] = np.nan
 
     # BTC_Mode (RANGE判定用)
-    # 優先1: BTC_Mode_RANGE 数値フラグ
-    # 優先2: BTC_Mode 文字列 "RANGE"
-    # 優先3: BTC_HTF_Mode / BTCMode / btc_mode 文字列
+    # main.py line 1548: mode=RANGE は BTC_Mode_Compat == "RANGE" に対応
     is_range = pd.Series([np.nan] * len(df), index=df.index, dtype=object)
-    if df["_n_BTC_Mode_RANGE"].notna().any():
-        is_range = (df["_n_BTC_Mode_RANGE"] == 1).where(
-            df["_n_BTC_Mode_RANGE"].notna(), np.nan
-        )
-    else:
-        for cand in ("BTC_Mode", "BTC_HTF_Mode", "BTCMode", "btc_mode"):
-            if cand in df.columns:
-                vals = df[cand].astype(str).str.strip().str.upper()
-                non_empty = vals != ""
-                if non_empty.any():
-                    is_range = vals.where(non_empty, np.nan).map(
-                        lambda v: True if str(v).upper() == "RANGE" else (False if pd.notna(v) else np.nan)
-                    )
-                    break
+    for cand in ("BTC_Mode_Compat", "BTC_Mode_RANGE", "BTC_Mode", "BTC_HTF_Mode", "BTCMode"):
+        if cand not in df.columns:
+            continue
+        col_vals = df[cand].astype(str).str.strip()
+        non_empty = col_vals.replace("nan", "") != ""
+        if not non_empty.any():
+            continue
+        if cand == "BTC_Mode_RANGE":
+            # 数値フラグ: 1=RANGE
+            numeric = _to_num(df[cand])
+            is_range = (numeric == 1).where(numeric.notna(), np.nan)
+        else:
+            # 文字列: "RANGE" かどうか
+            upper = col_vals.str.upper()
+            is_range = upper.where(non_empty, np.nan).apply(
+                lambda v: True if v == "RANGE" else (False if pd.notna(v) and v != "NAN" else np.nan)
+            )
+        break
     df["_is_range"] = is_range
 
     # WinLose
@@ -270,7 +272,7 @@ def main():
 
     # 列存在チェック
     checked = ["RSI", "P2_FundingScore", "VolRatio", "AI_Prob_Win",
-               "BTC_Mode_RANGE", "BTC_Mode", "BTC_HTF_Mode",
+               "BTC_Mode_Compat", "BTC_Mode_RANGE", "BTC_Mode", "BTC_HTF_Mode",
                "PnL_Pct", "WinLose", "Direction", "Datetime_JST"]
     missing = [c for c in checked if c not in df_raw.columns]
     present = [c for c in checked if c in df_raw.columns]
@@ -279,7 +281,7 @@ def main():
         print(f"[WARN] 欠損列: {missing}")
 
     # BTC_Mode列候補をスプシ全体から探す
-    btc_cols = [c for c in df_raw.columns if "btc" in c.lower() and "mode" in c.lower()]
+    btc_cols = [c for c in df_raw.columns if "btc" in c.lower()]
     print(f"[INFO] BTC mode系の列: {btc_cols}")
 
     # _is_range の判定状況を確認
