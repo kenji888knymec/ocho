@@ -98,10 +98,19 @@ def _to_num(series: pd.Series) -> pd.Series:
 
 
 def classify_route(df: pd.DataFrame) -> pd.Series:
-    """AI_Model_Type を主軸にroute分類。AI_Band を補助。"""
-    mt = df["AI_Model_Type"].astype(str).str.strip().str.upper() if "AI_Model_Type" in df.columns else pd.Series([""] * len(df))
-    ab = df["AI_Band"].astype(str).str.strip().str.upper() if "AI_Band" in df.columns else pd.Series([""] * len(df))
-    note = df["AI_Note"].astype(str).str.lower() if "AI_Note" in df.columns else pd.Series([""] * len(df))
+    """
+    route分類。優先順位:
+      1. AI_Note に feature_profile_only_no_match → no_match
+      2. AI_Model_Type が SHORT/LONG_FEATURE_BYPASS → feature_route
+      3. AI_Model_Type が SHORT_AI / SHORT_AI_FALLBACK → AI_route_SHORT
+      4. AI_Model_Type が LONG_AI / LONG_AI_FALLBACK → AI_route_LONG
+      5. その他 → rule_rank / common / other
+    no_match を先に判定する理由: no_match 行でも AI_Model_Type=SHORT_AI/LONG_AI の
+    場合があり、後でチェックすると AI_route に混入する。
+    """
+    mt = df["AI_Model_Type"].astype(str).str.strip().str.upper() if "AI_Model_Type" in df.columns else pd.Series([""] * len(df), index=df.index)
+    ab = df["AI_Band"].astype(str).str.strip().str.upper() if "AI_Band" in df.columns else pd.Series([""] * len(df), index=df.index)
+    note = df["AI_Note"].astype(str).str.lower() if "AI_Note" in df.columns else pd.Series([""] * len(df), index=df.index)
 
     routes = []
     for i in range(len(df)):
@@ -109,14 +118,19 @@ def classify_route(df: pd.DataFrame) -> pd.Series:
         a = ab.iloc[i]
         n = note.iloc[i]
 
-        if m in ("SHORT_FEATURE_BYPASS", "LONG_FEATURE_BYPASS") or a == "FEATURE_PROFILE_BYPASS":
+        # 1. no_match を最優先で判定（AI_Model_Type より先）
+        if "feature_profile_only_no_match" in n:
+            routes.append("no_match")
+        # 2. feature_route
+        elif m in ("SHORT_FEATURE_BYPASS", "LONG_FEATURE_BYPASS") or a == "FEATURE_PROFILE_BYPASS":
             routes.append("feature_route")
+        # 3. AI_route SHORT
         elif m in ("SHORT_AI", "SHORT_AI_FALLBACK"):
             routes.append("AI_route_SHORT")
+        # 4. AI_route LONG
         elif m in ("LONG_AI", "LONG_AI_FALLBACK"):
             routes.append("AI_route_LONG")
-        elif "feature_profile_only_no_match" in n:
-            routes.append("no_match")
+        # 5. その他
         elif m in ("SHORT_RULE_RANK", "LONG_RULE_RANK"):
             routes.append("rule_rank")
         elif m == "COMMON":
@@ -128,11 +142,20 @@ def classify_route(df: pd.DataFrame) -> pd.Series:
 
 
 def is_live_notify(df: pd.DataFrame) -> pd.Series:
-    """AI_Noteに notify_sent=1 が含まれるか"""
-    if "AI_Note" not in df.columns:
-        return pd.Series([False] * len(df), index=df.index)
-    note = df["AI_Note"].astype(str).str.lower()
-    return note.str.contains("notify_sent=1", na=False)
+    """
+    D=実通知判定。
+    優先: notify_sent 列 または _notify_sent 列（値 "1"）。
+    補助: AI_Note 内の "notify_sent=1"（列がない場合のフォールバック）。
+    """
+    # notify_sent 列優先
+    for col in ("notify_sent", "_notify_sent"):
+        if col in df.columns:
+            return df[col].astype(str).str.strip() == "1"
+    # フォールバック: AI_Note 文字列
+    if "AI_Note" in df.columns:
+        note = df["AI_Note"].astype(str).str.lower()
+        return note.str.contains("notify_sent=1", na=False)
+    return pd.Series([False] * len(df), index=df.index)
 
 
 def ai_prob_bin(series: pd.Series) -> pd.Series:
