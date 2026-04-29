@@ -646,6 +646,9 @@ _dedup_cache: Dict[str, Dict[str, Any]] = {}
 _row_count_cache: Dict[str, Dict[str, Any]] = {}
 ROWCOUNT_TTL_SEC = 180
 
+_repeat_state_cache: Dict[str, Dict[str, Any]] = {}
+REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "20")))
+
 JST = timezone(timedelta(hours=9))
 
 http = requests.Session()
@@ -2119,7 +2122,16 @@ def _get_v2_short_recent_notified_window_state(now_jst: datetime) -> Dict[str, A
     直近 window 分の「通知済みSHORT」を銘柄別に集計する。
     LONG側の repeat penalty と同じ考え方で SHORT 側も扱う。
     """
+    cache_key = "short_recent_notified_window_state"
     now_ts = time.time()
+
+    try:
+        cached = _repeat_state_cache.get(cache_key, {})
+        if cached and (now_ts - float(cached.get("ts", 0.0))) <= REPEAT_STATE_TTL_SEC:
+            return dict(cached.get("value", {}) or {})
+    except Exception:
+        pass
+
     out: Dict[str, Any] = {
         "counts": {},
         "last_dt": {},
@@ -2184,6 +2196,13 @@ def _get_v2_short_recent_notified_window_state(now_jst: datetime) -> Dict[str, A
     except Exception as e:
         out["reason"] = f"short_repeat_window_error:{type(e).__name__}:{e}"
 
+    try:
+        _repeat_state_cache[cache_key] = {
+            "ts": now_ts,
+            "value": dict(out or {}),
+        }
+    except Exception:
+        pass
     return out
 
 
