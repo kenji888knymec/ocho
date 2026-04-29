@@ -5384,6 +5384,11 @@ V2_HEADERS = [
     "EvalStatus", "ExitTime", "ExitPrice", "ExitReason", "PnL_Pct", "WinLose", "HoldMin",
     # メタ
     "Version", "Note",
+    # 4レーン分析用メタ（runtime記録）
+    "Runtime_Lane", "Lane_Profile", "Lane_Stage", "Lane_Notify",
+    "Notify_Pass", "Notify_Reason",
+    "Feature_Gate", "Feature_Allow_Hits", "Feature_Reject_Hits",
+    "Feature_Force_Hits", "Feature_Bypass_Profile",
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -9508,6 +9513,7 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
     V2専用ヘッダーの行を構築。
     将来の V2-AI / LONG-AI / SHORT-AI を載せられるように AI列も保持する。
     """
+    fp = _feature_profile_log_parts(sig)
     return [
         "'" + sig["dt"].strftime("%Y-%m-%d %H:%M:%S"),
         sig["symbol"],
@@ -9553,6 +9559,18 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         # メタ
         sig.get("v2_version", "V2-Shadow"),
         sig.get("note", ""),
+        # 4レーン分析用メタ（runtime記録）
+        sig.get("_runtime_lane", sig.get("lane", "")),
+        sig.get("_lane_profile", ""),
+        sig.get("_lane_profile_stage", ""),
+        str(sig.get("_lane_profile_notify", "")),
+        str(sig.get("_notify_pass", "")),
+        str(sig.get("_notify_reason", "") or ""),
+        fp["FEATURE_GATE"],
+        fp["ALLOW_HITS"],
+        fp["REJECT_HITS"],
+        fp["FORCE_HITS"],
+        fp["BYPASS_PROFILE"],
     ]
 
 
@@ -12312,6 +12330,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
                     sig["_lane_profile"] = profile_name
                     sig["_lane_profile_stage"] = profile_stage
+                    sig["_lane_profile_notify"] = profile_notify
 
                     if profile_stage == "reject":
                         sig["ai_pass"] = "0"
