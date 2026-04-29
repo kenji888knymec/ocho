@@ -9495,29 +9495,35 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     output.extend(ranked_shorts)
     output.extend(ranked_longs)
 
-    snapshot = get_v2_regime_health_snapshot(datetime.now(JST))
+    if V2_REGIME_POLICY_ENABLE:
+        snapshot = get_v2_regime_health_snapshot(datetime.now(JST))
+    else:
+        snapshot = {}
+        print("[V2-REGIME-SNAPSHOT-SKIP] policy_disabled")
+
     output = v2_apply_regime_notify_policy(output, snapshot)
 
-    try:
-        print(
-            "[V2-REGIME-SNAPSHOT] "
-            f"SHORT mode={snapshot['SHORT']['target_mode']} "
-            f"enabled={snapshot['SHORT']['enabled']} "
-            f"reason={snapshot['SHORT']['reason']} "
-            f"selected_n={snapshot['SHORT']['selected']['n']} "
-            f"control_n={snapshot['SHORT']['control']['n']} "
-            f"wr_uplift={snapshot['SHORT']['uplift']['win_rate']} "
-            f"pnl_uplift={snapshot['SHORT']['uplift']['avg_pnl']} | "
-            f"LONG mode={snapshot['LONG']['target_mode']} "
-            f"enabled={snapshot['LONG']['enabled']} "
-            f"reason={snapshot['LONG']['reason']} "
-            f"selected_n={snapshot['LONG']['selected']['n']} "
-            f"control_n={snapshot['LONG']['control']['n']} "
-            f"wr_uplift={snapshot['LONG']['uplift']['win_rate']} "
-            f"pnl_uplift={snapshot['LONG']['uplift']['avg_pnl']}"
-        )
-    except Exception:
-        pass
+    if V2_REGIME_POLICY_ENABLE:
+        try:
+            print(
+                "[V2-REGIME-SNAPSHOT] "
+                f"SHORT mode={snapshot['SHORT']['target_mode']} "
+                f"enabled={snapshot['SHORT']['enabled']} "
+                f"reason={snapshot['SHORT']['reason']} "
+                f"selected_n={snapshot['SHORT']['selected']['n']} "
+                f"control_n={snapshot['SHORT']['control']['n']} "
+                f"wr_uplift={snapshot['SHORT']['uplift']['win_rate']} "
+                f"pnl_uplift={snapshot['SHORT']['uplift']['avg_pnl']} | "
+                f"LONG mode={snapshot['LONG']['target_mode']} "
+                f"enabled={snapshot['LONG']['enabled']} "
+                f"reason={snapshot['LONG']['reason']} "
+                f"selected_n={snapshot['LONG']['selected']['n']} "
+                f"control_n={snapshot['LONG']['control']['n']} "
+                f"wr_uplift={snapshot['LONG']['uplift']['win_rate']} "
+                f"pnl_uplift={snapshot['LONG']['uplift']['avg_pnl']}"
+            )
+        except Exception:
+            pass
 
     _seltm(f"before_return output={len(output)}")
     return output
