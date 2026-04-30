@@ -12309,6 +12309,22 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     final_signals = v2_selection_pipeline(raw_signals)
 
     for sig in final_signals:
+        # 記録専用ブロック: 全 final_signals にレーン情報を記録
+        # 通知ロジック・副作用は後段の既存ゲート内ブロックに任せる
+        try:
+            _rec_dir = str(sig.get("direction", "")).strip().upper()
+            if _rec_dir in ("LONG", "SHORT"):
+                _rec_lane = _get_runtime_lane_for_signal(sig, _rec_dir)
+                sig["_runtime_lane"] = _rec_lane
+                _rec_profile = _classify_lane_profile(_rec_dir, _rec_lane, sig)
+                sig["_lane_profile"] = _rec_profile.get("profile", "")
+                sig["_lane_profile_stage"] = _rec_profile.get("stage", "")
+                sig["_lane_profile_notify"] = _rec_profile.get("notify", False)
+        except Exception as _rec_err:
+            logging.warning(
+                f"[LANE-PROFILE-RECORD-ERR] sym={sig.get('symbol','')} err={_rec_err}"
+            )
+
         _apply_feature_profiles(sig)
 
         cur_note = str(sig.get("ai_note", "") or "")
