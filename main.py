@@ -8997,16 +8997,33 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     now_jst = datetime.now(JST)
 
+    t_prefetch_start = time.time()
+
+    t_long_repeat_start = time.time()
     pref_long_repeat_state = (
         _get_v2_long_recent_notified_window_state(now_jst)
         if V2_LONG_REPEAT_BLOCK_ENABLE or V2_LONG_REPEAT_PENALTY_ENABLE
         else {"counts": {}, "last_dt": {}}
     )
+    print(
+        "[TIMER] v2_selection_pipeline "
+        f"prefetch_long_repeat sec={time.time() - t_long_repeat_start:.2f}"
+    )
 
+    t_short_repeat_start = time.time()
     pref_short_repeat_state = (
         _get_v2_short_recent_notified_window_state(now_jst)
         if V2_SHORT_REPEAT_PENALTY_ENABLE
         else {"counts": {}, "last_dt": {}}
+    )
+    print(
+        "[TIMER] v2_selection_pipeline "
+        f"prefetch_short_repeat sec={time.time() - t_short_repeat_start:.2f}"
+    )
+
+    print(
+        "[TIMER] v2_selection_pipeline "
+        f"prefetch_total sec={time.time() - t_prefetch_start:.2f}"
     )
 
     loop_start = time.time()
