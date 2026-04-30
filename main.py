@@ -10321,13 +10321,8 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
     """
     out: List[Dict[str, Any]] = []
     now_jst = datetime.now(JST)
-    guard_state = get_v2_guardrail_state(now_jst)
-
-    pref_long_repeat_state = (
-        _get_v2_long_recent_notified_window_state(now_jst)
-        if V2_LONG_REPEAT_BLOCK_ENABLE
-        else {"counts": {}, "last_dt": {}}
-    )
+    guard_state = None          # lazy: fetched only when regime policy is active
+    pref_long_repeat_state = None  # lazy: fetched only when LONG repeat block fires
 
     for sig in signals:
         side = str(sig.get("direction", "")).strip().upper()
@@ -10353,6 +10348,12 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
                 notify_pass = "0"
                 notify_reason = f"short_notify_block_hour:{hour}"
             elif side == "LONG" and V2_LONG_REPEAT_BLOCK_ENABLE and sym:
+                if pref_long_repeat_state is None:
+                    pref_long_repeat_state = (
+                        _get_v2_long_recent_notified_window_state(now_jst)
+                        if V2_LONG_REPEAT_BLOCK_ENABLE
+                        else {"counts": {}, "last_dt": {}}
+                    )
                 recent_n = int(((pref_long_repeat_state.get("counts", {}) or {}).get(sym, 0)) or 0)
                 if recent_n >= int(V2_LONG_REPEAT_MAX_NOTIFIES):
                     notify_pass = "0"
@@ -10382,6 +10383,8 @@ def v2_apply_regime_notify_policy(signals: List[Dict[str, Any]], snapshot: Dict[
                         rescue_hour = _get_long_sig_hour(sig)
                         blocked_hours = _parse_hour_csv_to_set(V2_LONG_RESCUE_NOTIFY_BLOCK_HOURS)
 
+                        if guard_state is None:
+                            guard_state = get_v2_guardrail_state(now_jst)
                         if guard_state.get("mode") == "STOP":
                             notify_pass = "0"
                             notify_reason = f"guardrail_stop:{guard_state.get('reason', '')}"
