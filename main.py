@@ -9687,6 +9687,18 @@ def v2_write_shadow_rows(rows: List[List[Any]]):
 
 def get_v2_shadow_ai_data() -> pd.DataFrame:
     """v2_shadow_ai シートを全件取得して DataFrame で返す（列名ベース）。"""
+    cache_key = "v2_shadow_ai_data"
+    now_ts = time.time()
+
+    try:
+        cached = _repeat_state_cache.get(cache_key, {})
+        if cached and (now_ts - float(cached.get("ts", 0.0))) <= REPEAT_STATE_TTL_SEC:
+            cached_df = cached.get("value")
+            if isinstance(cached_df, pd.DataFrame):
+                return cached_df.copy()
+    except Exception:
+        pass
+
     service = get_sheet_service()
 
     hdr_res = service.spreadsheets().values().get(
@@ -9697,7 +9709,12 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     headers = _normalize_headers(raw_hdr)
 
     if not headers:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+        try:
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+        except Exception:
+            pass
+        return df
 
     data_res = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -9706,11 +9723,23 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
     rows = data_res.get("values", []) or []
 
     if not rows:
-        return pd.DataFrame(columns=headers)
+        df = pd.DataFrame(columns=headers)
+        try:
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+        except Exception:
+            pass
+        return df
 
     n_cols = len(headers)
     fixed = [r[:n_cols] + [""] * max(0, n_cols - len(r)) for r in rows]
-    return pd.DataFrame(fixed, columns=headers)
+    df = pd.DataFrame(fixed, columns=headers)
+
+    try:
+        _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+    except Exception:
+        pass
+
+    return df
 
 
 def _v2_monitor_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
