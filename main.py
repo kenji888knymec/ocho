@@ -653,6 +653,9 @@ _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
 V2_FUNDING_FETCH_TTL_SEC = int(float(os.environ.get("V2_FUNDING_FETCH_TTL_SEC", "300")))
 
+_TIMER_LOG_ENABLE_RAW = str(os.environ.get("TIMER_LOG_ENABLE", "0")).strip().lower()
+TIMER_LOG_ENABLE: bool = _TIMER_LOG_ENABLE_RAW in ("1", "true", "yes", "on")
+
 JST = timezone(timedelta(hours=9))
 
 http = requests.Session()
@@ -3096,7 +3099,8 @@ def send_v2_live_discord_alerts(notify_candidates: List[Dict[str, Any]]) -> Tupl
     send_start = time.time()
 
     def _dtm(label: str):
-        print(f"[TIMER] send_v2_live_discord_alerts {label} sec={time.time() - send_start:.2f}")
+        if TIMER_LOG_ENABLE:
+            print(f"[TIMER] send_v2_live_discord_alerts {label} sec={time.time() - send_start:.2f}")
 
     sent = 0
     runtime_dedup_skipped = 0
@@ -9016,7 +9020,12 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     sel_start = time.time()
 
     def _seltm(label: str):
-        print(f"[TIMER] v2_selection_pipeline {label} sec={time.time() - sel_start:.2f}")
+        if TIMER_LOG_ENABLE:
+            print(f"[TIMER] v2_selection_pipeline {label} sec={time.time() - sel_start:.2f}")
+
+    def _timlog(msg: str) -> None:
+        if TIMER_LOG_ENABLE:
+            print(msg)
 
     if not signals:
         return []
@@ -9041,11 +9050,12 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if (V2_LONG_REPEAT_BLOCK_ENABLE or V2_LONG_REPEAT_PENALTY_ENABLE) and _has_long_signals
         else {"counts": {}, "last_dt": {}}
     )
-    print(
-        "[TIMER] v2_selection_pipeline "
-        f"prefetch_long_repeat sec={time.time() - t_long_repeat_start:.2f}"
-        f" skipped={not _has_long_signals}"
-    )
+    if TIMER_LOG_ENABLE:
+        print(
+            "[TIMER] v2_selection_pipeline "
+            f"prefetch_long_repeat sec={time.time() - t_long_repeat_start:.2f}"
+            f" skipped={not _has_long_signals}"
+        )
 
     t_short_repeat_start = time.time()
     pref_short_repeat_state = (
@@ -9053,15 +9063,17 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         if V2_SHORT_REPEAT_PENALTY_ENABLE
         else {"counts": {}, "last_dt": {}}
     )
-    print(
-        "[TIMER] v2_selection_pipeline "
-        f"prefetch_short_repeat sec={time.time() - t_short_repeat_start:.2f}"
-    )
+    if TIMER_LOG_ENABLE:
+        print(
+            "[TIMER] v2_selection_pipeline "
+            f"prefetch_short_repeat sec={time.time() - t_short_repeat_start:.2f}"
+        )
 
-    print(
-        "[TIMER] v2_selection_pipeline "
-        f"prefetch_total sec={time.time() - t_prefetch_start:.2f}"
-    )
+    if TIMER_LOG_ENABLE:
+        print(
+            "[TIMER] v2_selection_pipeline "
+            f"prefetch_total sec={time.time() - t_prefetch_start:.2f}"
+        )
 
     loop_start = time.time()
 
@@ -9109,7 +9121,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=SHORT profile={bypass_profile}",
                     flush=True,
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline short_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={time.time() - one_start:.2f} "
@@ -9130,7 +9142,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:{reason}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={reason}")
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline short_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9155,7 +9167,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT "
                     f"reason=qs_below_min qs={qs:.4f} min={V2_SHORT_QS_MIN:.4f}"
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline short_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9193,7 +9205,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={ai_res.get('note', 'ai_reject')}")
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline short_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9219,7 +9231,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             )
     
             short_passed.append(sig)
-            print(
+            _timlog(
                 f"[TIMER] v2_selection_pipeline short_one "
                 f"i={i} symbol={sig.get('symbol','')} "
                 f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9254,7 +9266,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[FEATURE_BYPASS] sym={sig.get('symbol')} side=LONG profile={bypass_profile}",
                     flush=True,
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={time.time() - one_start:.2f} "
@@ -9278,7 +9290,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:{reason};rescued_p1={rescued_p1};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason={reason}")
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9301,7 +9313,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 sig["ai_note"] = f"REJECTED:missing_qs_feature;rescued_p1={rescued_p1};research_tags={research_note}"
                 output.append(sig)
                 print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG reason=missing_qs_feature")
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9310,7 +9322,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"passed=0"
                 )
                 continue
-    
+
             if qs < V2_LONG_QS_MIN:
                 sig["ai_prob_win"] = round(qs, 6)
                 sig["ai_pass"] = "0"
@@ -9327,7 +9339,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason=qs_below_min qs={qs:.4f} min={V2_LONG_QS_MIN:.4f}"
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9336,7 +9348,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"passed=0"
                 )
                 continue
-    
+
             bad_regime = _assess_long_ai_bad_regime(sig)
             sig["_long_bad_regime_mode"] = str(bad_regime.get("mode", "NORMAL") or "NORMAL").upper()
             sig["_long_bad_regime_hits"] = int(bad_regime.get("hit_count", 0) or 0)
@@ -9386,7 +9398,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason=bad_regime_stop;{bad_regime_note}"
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9395,7 +9407,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"passed=0"
                 )
                 continue
-    
+
             ai_res = _predict_v2_ai_score(sig, "LONG", qs)
     
             if sig["_long_bad_regime_mode"] == "CAUTION":
@@ -9448,7 +9460,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason={ai_res.get('note', 'ai_reject')}"
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9457,7 +9469,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"passed=0"
                 )
                 continue
-    
+
             ai_score = float(ai_res["score"])
             sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
@@ -9501,7 +9513,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=LONG "
                     f"reason={gate_reason}"
                 )
-                print(
+                _timlog(
                     f"[TIMER] v2_selection_pipeline long_one "
                     f"i={i} symbol={sig.get('symbol','')} "
                     f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9510,7 +9522,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     f"passed=0"
                 )
                 continue
-    
+
             print(
                 f"[V2-LONG-AI] sym={sig.get('symbol')} "
                 f"ai_prob_win={sig.get('ai_prob_win', '')} "
@@ -9519,7 +9531,7 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             )
     
             long_passed.append(sig)
-            print(
+            _timlog(
                 f"[TIMER] v2_selection_pipeline long_one "
                 f"i={i} symbol={sig.get('symbol','')} "
                 f"filter_sec={t_after_filter - one_start:.2f} "
@@ -9537,7 +9549,8 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         sig["ai_note"] = ""
         output.append(sig)
     
-    print(f"[TIMER] v2_selection_pipeline loop_done sec={time.time() - loop_start:.2f}")
+    if TIMER_LOG_ENABLE:
+        print(f"[TIMER] v2_selection_pipeline loop_done sec={time.time() - loop_start:.2f}")
 
     _seltm(f"after_direction_filters short_passed={len(short_passed)} long_passed={len(long_passed)} output={len(output)}")
 
@@ -12089,7 +12102,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     v2_start = time.time()
 
     def _v2tm(label: str):
-        print(f"[TIMER] v2_shadow_run {label} sec={time.time() - v2_start:.2f}")
+        if TIMER_LOG_ENABLE:
+            print(f"[TIMER] v2_shadow_run {label} sec={time.time() - v2_start:.2f}")
 
     engine_mode = str(SIGNAL_ENGINE).strip().lower()
     _v2tm("enter")
@@ -12751,7 +12765,8 @@ def logic_main(force: bool = False):
     print(f"[RUN] start {now_jst.isoformat()}  VERSION={VERSION} force={force}")
 
     def _tm(label: str):
-        print(f"[TIMER] logic_main {label} sec={time.time() - start:.2f}")
+        if TIMER_LOG_ENABLE:
+            print(f"[TIMER] logic_main {label} sec={time.time() - start:.2f}")
 
     _tm("enter")
 
