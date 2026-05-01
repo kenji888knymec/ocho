@@ -12195,7 +12195,23 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
 
+        # bypass/allow profile に side 定義がある方向だけ probe（無駄な fetch を省く）
+        _bypass_names = V2_FEATURE_BYPASS_PROFILES or V2_FEATURE_ALLOW_PROFILES
+        active_probe_sides: set = set()
+        for _pname in _bypass_names:
+            _praw = str(os.environ.get(_profile_env_name(_pname), "")).strip()
+            _pspec = _parse_profile_spec(_praw)
+            _pside = str(_pspec.get("side", "")).strip().upper()
+            if _pside in ("LONG", "SHORT"):
+                active_probe_sides.add(_pside)
+            elif not _pside:
+                active_probe_sides.update(("LONG", "SHORT"))
+        if not active_probe_sides:
+            active_probe_sides = {"LONG", "SHORT"}
+
         for forced_side in ("LONG", "SHORT"):
+            if forced_side not in active_probe_sides:
+                continue
             probe_sig = None
             try:
                 probe_sig = v2_generate_signal(
