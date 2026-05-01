@@ -654,6 +654,12 @@ _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
 V2_FUNDING_FETCH_TTL_SEC = int(float(os.environ.get("V2_FUNDING_FETCH_TTL_SEC", "300")))
 
+HEALTH_CHECK_TTL_SEC = int(float(os.environ.get("HEALTH_CHECK_TTL_SEC", "600")))
+_health_check_cache: Dict[str, float] = {}
+
+_DEBUG_LOG_ENABLE_RAW = str(os.environ.get("DEBUG_LOG_ENABLE", "0")).strip().lower()
+DEBUG_LOG_ENABLE: bool = _DEBUG_LOG_ENABLE_RAW in ("1", "true", "yes", "on")
+
 _TIMER_LOG_ENABLE_RAW = str(os.environ.get("TIMER_LOG_ENABLE", "0")).strip().lower()
 TIMER_LOG_ENABLE: bool = _TIMER_LOG_ENABLE_RAW in ("1", "true", "yes", "on")
 
@@ -791,7 +797,8 @@ def send_discord_message(text: str) -> Tuple[bool, str]:
     for chunk in chunks:
         try:
             r = http.post(discord_webhook_url, json={"content": chunk}, timeout=10)
-            print(f"[DBG] discord status={r.status_code}")
+            if DEBUG_LOG_ENABLE:
+                print(f"[DBG] discord status={r.status_code}")
             if r.status_code >= 300:
                 print(f"[DBG] discord body={r.text[:200]}")
                 return False, f"http_{r.status_code}"
@@ -817,7 +824,8 @@ def send_daily_discord_message(text: str):
     for chunk in chunks:
         try:
             r = http.post(webhook, json={"content": chunk}, timeout=10)
-            print(f"[DBG] daily discord status={r.status_code}")
+            if DEBUG_LOG_ENABLE:
+                print(f"[DBG] daily discord status={r.status_code}")
             if r.status_code >= 300:
                 print(f"[DBG] daily discord body={r.text[:200]}")
         except Exception as e:
@@ -3218,7 +3226,8 @@ def build_exchange() -> ccxt.Exchange:
             urls = exchange.urls
 
         api = urls.get("api")
-        print(f"[DBG] okx.urls(before)={repr(urls)}")
+        if DEBUG_LOG_ENABLE:
+            print(f"[DBG] okx.urls(before)={repr(urls)}")
 
         # api を dict に寄せる（okx実装の多くはdict前提）
         if not isinstance(api, dict):
@@ -3237,7 +3246,8 @@ def build_exchange() -> ccxt.Exchange:
             if v is None or (isinstance(v, str) and not v.strip()):
                 urls[k] = base
 
-        print(f"[DBG] okx.urls(after)={repr(urls)}")
+        if DEBUG_LOG_ENABLE:
+            print(f"[DBG] okx.urls(after)={repr(urls)}")
 
     except Exception as e:
         import traceback
@@ -12195,13 +12205,19 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     if (not force) and ((now_jst.minute % 15) < 10):
         return "V2: waiting"
 
-    # シート準備
-    try:
-        v2_ensure_shadow_sheet(get_sheet_service(), SPREADSHEET_ID)
+    # シート準備（HEALTH_CHECK_TTL_SEC 以内に成功済みならスキップ）
+    _vs_key = "v2_ensure_shadow_sheet_ok"
+    _vs_last = _health_check_cache.get(_vs_key, 0.0)
+    if time.time() - _vs_last > HEALTH_CHECK_TTL_SEC:
+        try:
+            v2_ensure_shadow_sheet(get_sheet_service(), SPREADSHEET_ID)
+            _health_check_cache[_vs_key] = time.time()
+            _v2tm("after_ensure_shadow_sheet")
+        except Exception as e:
+            print(f"[V2-ERR] sheet setup: {e}")
+            return f"V2: sheet error {e}"
+    else:
         _v2tm("after_ensure_shadow_sheet")
-    except Exception as e:
-        print(f"[V2-ERR] sheet setup: {e}")
-        return f"V2: sheet error {e}"
 
     # BTC 上位足トレンド
     btc_htf_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
@@ -12853,12 +12869,18 @@ def logic_main(force: bool = False):
 
     _tm("enter")
 
-    # self heal
-    ok, msg = self_heal_prerequisites()
-    _tm("after_self_heal")
-    if not ok:
-        send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
-        return f"SelfHealFailed: {msg}"
+    # self heal（HEALTH_CHECK_TTL_SEC 以内に成功済みならスキップ）
+    _hc_key = "self_heal_ok"
+    _hc_last = _health_check_cache.get(_hc_key, 0.0)
+    if time.time() - _hc_last > HEALTH_CHECK_TTL_SEC:
+        ok, msg = self_heal_prerequisites()
+        _tm("after_self_heal")
+        if not ok:
+            send_discord_message(f"[WARN] self_heal_prerequisites failed: {msg}")
+            return f"SelfHealFailed: {msg}"
+        _health_check_cache[_hc_key] = time.time()
+    else:
+        _tm("after_self_heal")
 
     # --- AIモデルを確実に確保（Noneのまま走り続けない） ---
     try:
