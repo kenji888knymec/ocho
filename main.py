@@ -651,6 +651,7 @@ REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "20")))
 
 _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
+V2_FUNDING_FETCH_TTL_SEC = int(float(os.environ.get("V2_FUNDING_FETCH_TTL_SEC", "300")))
 
 JST = timezone(timedelta(hours=9))
 
@@ -5540,7 +5541,14 @@ def detect_btc_regime_conflict(exchange, htf_direction: str) -> Dict[str, Any]:
         return result
 
     try:
-        btc_ltf = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+        _btc15m_key = "BTC/USDT|15m|30"
+        _btc15m_cached = _v2_fetch_cache.get(_btc15m_key)
+        if _btc15m_cached and (time.time() - _btc15m_cached["ts"]) <= V2_FETCH_TTL_SEC:
+            btc_ltf = _btc15m_cached["v"]
+        else:
+            btc_ltf = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+            if btc_ltf is not None:
+                _v2_fetch_cache[_btc15m_key] = {"ts": time.time(), "v": btc_ltf}
         if not btc_ltf or len(btc_ltf) < V2_REGIME_LTF_EMA_SLOW + 3:
             result["reason"] = "btc_ltf_insufficient"
             return result
@@ -6288,7 +6296,7 @@ def v2_generate_signal(
     # ---- Pillar2: ファンディングレート ----
     _fr_key = f"funding|{symbol}"
     _fr_cached = _v2_fetch_cache.get(_fr_key)
-    if _fr_cached and (time.time() - _fr_cached["ts"]) <= V2_FETCH_TTL_SEC:
+    if _fr_cached and (time.time() - _fr_cached["ts"]) <= V2_FUNDING_FETCH_TTL_SEC:
         fr = _fr_cached["v"]
     else:
         fr = fetch_funding_rate_safe(exchange, symbol)
@@ -12113,7 +12121,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_1h_change_v2 = np.nan
     btc_15m_df = None
     try:
-        btc_15m_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+        _btc15m_key = "BTC/USDT|15m|30"
+        _btc15m_cached = _v2_fetch_cache.get(_btc15m_key)
+        if _btc15m_cached and (time.time() - _btc15m_cached["ts"]) <= V2_FETCH_TTL_SEC:
+            btc_15m_ohlcv = _btc15m_cached["v"]
+        else:
+            btc_15m_ohlcv = fetch_ohlcv_safe(exchange, "BTC/USDT", timeframe="15m", limit=30)
+            if btc_15m_ohlcv is not None:
+                _v2_fetch_cache[_btc15m_key] = {"ts": time.time(), "v": btc_15m_ohlcv}
         if btc_15m_ohlcv and len(btc_15m_ohlcv) >= 6:
             btc_15m_df = pd.DataFrame(
                 btc_15m_ohlcv,
