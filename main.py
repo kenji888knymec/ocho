@@ -649,6 +649,9 @@ ROWCOUNT_TTL_SEC = 180
 _repeat_state_cache: Dict[str, Dict[str, Any]] = {}
 REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "20")))
 
+_v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
+V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
+
 JST = timezone(timedelta(hours=9))
 
 http = requests.Session()
@@ -6099,7 +6102,14 @@ def v2_generate_signal(
             "ai_note": f"feature_probe_only=1;probe_reason={probe_reason}",
         }
     # ---- データ取得 ----
-    ltf = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
+    _ltf_key = f"{symbol}|15m|60"
+    _ltf_cached = _v2_fetch_cache.get(_ltf_key)
+    if _ltf_cached and (time.time() - _ltf_cached["ts"]) <= V2_FETCH_TTL_SEC:
+        ltf = _ltf_cached["v"]
+    else:
+        ltf = fetch_ohlcv_safe(exchange, symbol, timeframe="15m", limit=60)
+        if ltf is not None:
+            _v2_fetch_cache[_ltf_key] = {"ts": time.time(), "v": ltf}
     ltf_df = pd.DataFrame(ltf, columns=["Time", "Open", "High", "Low", "Close", "Volume"]) if ltf else pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     if not ltf or len(ltf) < 30:
         _v2_reject("ltf_insufficient", f"len={0 if not ltf else len(ltf)} need=30")
@@ -6117,7 +6127,14 @@ def v2_generate_signal(
         if early_sig is not None:
             return early_sig
         return None
-    htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
+    _htf_key = f"{symbol}|{V2_HTF_TIMEFRAME}|{V2_HTF_LIMIT}"
+    _htf_cached = _v2_fetch_cache.get(_htf_key)
+    if _htf_cached and (time.time() - _htf_cached["ts"]) <= V2_FETCH_TTL_SEC:
+        htf = _htf_cached["v"]
+    else:
+        htf = fetch_ohlcv_safe(exchange, symbol, timeframe=V2_HTF_TIMEFRAME, limit=V2_HTF_LIMIT)
+        if htf is not None:
+            _v2_fetch_cache[_htf_key] = {"ts": time.time(), "v": htf}
     htf_df = pd.DataFrame(htf, columns=["Time", "Open", "High", "Low", "Close", "Volume"]) if htf else pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
     if not htf or len(htf) < V2_EMA_SLOW + 5:
         _v2_reject("htf_insufficient", f"len={0 if not htf else len(htf)} need={V2_EMA_SLOW + 5}")
@@ -6269,7 +6286,14 @@ def v2_generate_signal(
         print(f"[V2-SHORT-RAW-RESCUE] sym={sym} {short_rescue_reason}")
 
     # ---- Pillar2: ファンディングレート ----
-    fr = fetch_funding_rate_safe(exchange, symbol)
+    _fr_key = f"funding|{symbol}"
+    _fr_cached = _v2_fetch_cache.get(_fr_key)
+    if _fr_cached and (time.time() - _fr_cached["ts"]) <= V2_FETCH_TTL_SEC:
+        fr = _fr_cached["v"]
+    else:
+        fr = fetch_funding_rate_safe(exchange, symbol)
+        if fr is not None:
+            _v2_fetch_cache[_fr_key] = {"ts": time.time(), "v": fr}
     p2 = assess_funding(fr, direction)
     p2_score = p2["score"]
 
