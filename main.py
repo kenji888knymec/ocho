@@ -12725,6 +12725,19 @@ def logic_main(force: bool = False):
     exchange = build_exchange()
     _tm("after_build_exchange")
 
+    if SIGNAL_ENGINE in ("v2_live", "v2", "shadow"):
+        try:
+            v2_result = v2_shadow_run(exchange, now_jst, force=force)
+            print(f"[V2] {v2_result}")
+        except Exception as e:
+            print(f"[V2-ERR] shadow run crashed: {e}")
+
+        _tm("after_v2_shadow_run_v2_only")
+
+        elapsed = time.time() - start
+        print(f"[RUN] done alerts=0 candidates=0 elapsed={elapsed:.2f}s")
+        return f"V2OnlyDone: elapsed={elapsed:.2f}s"
+
     btc_mode = "Range"
     btc_1h_change = np.nan
     median_sigma = np.nan
