@@ -648,6 +648,7 @@ ROWCOUNT_TTL_SEC = 180
 
 _repeat_state_cache: Dict[str, Dict[str, Any]] = {}
 REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "20")))
+V2_REPEAT_STATE_LOOKBACK_ROWS = int(float(os.environ.get("V2_REPEAT_STATE_LOOKBACK_ROWS", "2000")))
 
 _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
@@ -1938,7 +1939,7 @@ def _get_v2_long_recent_notified_window_state(now_jst: datetime) -> Dict[str, An
         return out
 
     try:
-        df = get_v2_shadow_ai_data()
+        df = get_v2_shadow_ai_recent_data_for_repeat()
         if df is None or df.empty:
             out["reason"] = "empty"
             _v2_long_repeat_cache["ts"] = now_ts
@@ -2149,7 +2150,7 @@ def _get_v2_short_recent_notified_window_state(now_jst: datetime) -> Dict[str, A
         return out
 
     try:
-        df = get_v2_shadow_ai_data()
+        df = get_v2_shadow_ai_recent_data_for_repeat()
         if df is None or df.empty:
             out["reason"] = "empty"
             return out
@@ -9790,6 +9791,88 @@ def get_v2_shadow_ai_data() -> pd.DataFrame:
         pass
 
     return df
+
+
+def get_v2_shadow_ai_recent_data_for_repeat() -> pd.DataFrame:
+    """repeat state用: v2_shadow_ai の直近 V2_REPEAT_STATE_LOOKBACK_ROWS 行だけを返す。
+    失敗時は get_v2_shadow_ai_data() にフォールバックする。"""
+    cache_key = "v2_shadow_ai_repeat_recent"
+    now_ts = time.time()
+
+    try:
+        cached = _repeat_state_cache.get(cache_key, {})
+        if cached and (now_ts - float(cached.get("ts", 0.0))) <= REPEAT_STATE_TTL_SEC:
+            cached_df = cached.get("value")
+            if isinstance(cached_df, pd.DataFrame):
+                return cached_df.copy()
+    except Exception:
+        pass
+
+    fallback_used = False
+    try:
+        service = get_sheet_service()
+
+        hdr_res = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{V2_SHADOW_SHEET}!A1:{HEADER_COL_END}1",
+        ).execute()
+        raw_hdr = (hdr_res.get("values", [[]]) or [[]])[0]
+        headers = _normalize_headers(raw_hdr)
+
+        if not headers:
+            df = pd.DataFrame()
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+            return df
+
+        col_a_res = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{V2_SHADOW_SHEET}!A:A",
+        ).execute()
+        col_a_values = col_a_res.get("values", []) or []
+        total_rows = len(col_a_values)
+
+        if total_rows <= 1:
+            df = pd.DataFrame(columns=headers)
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+            return df
+
+        lookback = max(1, V2_REPEAT_STATE_LOOKBACK_ROWS)
+        start_row = max(2, total_rows - lookback + 1)
+        end_row = total_rows
+
+        if TIMER_LOG_ENABLE:
+            print(
+                f"[TIMER] repeat_recent_rows "
+                f"start_row={start_row} end_row={end_row} "
+                f"rows={end_row - start_row + 1} fallback=False"
+            )
+
+        data_res = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{V2_SHADOW_SHEET}!A{start_row}:{HEADER_COL_END}{end_row}",
+        ).execute()
+        rows = data_res.get("values", []) or []
+
+        if not rows:
+            df = pd.DataFrame(columns=headers)
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+            return df
+
+        n_cols = len(headers)
+        fixed = [r[:n_cols] + [""] * max(0, n_cols - len(r)) for r in rows]
+        df = pd.DataFrame(fixed, columns=headers)
+
+        _repeat_state_cache[cache_key] = {"ts": now_ts, "value": df.copy()}
+        return df
+
+    except Exception as e:
+        fallback_used = True
+        if TIMER_LOG_ENABLE:
+            print(f"[TIMER] repeat_recent_rows fallback=True err={e}")
+        try:
+            return get_v2_shadow_ai_data()
+        except Exception:
+            return pd.DataFrame()
 
 
 def _v2_monitor_prepare_done(df: pd.DataFrame) -> pd.DataFrame:
