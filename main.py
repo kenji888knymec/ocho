@@ -650,7 +650,7 @@ _repeat_state_cache: Dict[str, Dict[str, Any]] = {}
 REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "120")))
 V2_REPEAT_STATE_LOOKBACK_ROWS = int(float(os.environ.get("V2_REPEAT_STATE_LOOKBACK_ROWS", "2000")))
 V2_REGIME_SNAPSHOT_TTL_SEC = int(float(os.environ.get("V2_REGIME_SNAPSHOT_TTL_SEC", "1200")))
-V2_BRAKE_STATE_TTL_SEC = int(float(os.environ.get("V2_BRAKE_STATE_TTL_SEC", "600")))
+V2_BRAKE_STATE_TTL_SEC = int(float(os.environ.get("V2_BRAKE_STATE_TTL_SEC", "120")))
 
 _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
