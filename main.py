@@ -2286,7 +2286,10 @@ def get_v2_long_fast_brake_state(now_jst: datetime) -> Dict[str, Any]:
         return out
 
     try:
-        df = get_v2_shadow_ai_data()
+        try:
+            df = get_v2_shadow_ai_recent_data_for_repeat()
+        except Exception:
+            df = get_v2_shadow_ai_data()
         if df is None or df.empty:
             out["reason"] = "empty"
             _v2_long_fast_brake_cache["ts"] = now_ts
@@ -9286,11 +9289,20 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 continue
     
+            _t_rt = time.time()
             research_tags = _get_long_research_tags(sig)
             research_note = "|".join(research_tags)
+            if TIMER_LOG_ENABLE:
+                print(f"[TIMER] long_filter_research_tags sym={sig.get('symbol','')} sec={time.time()-_t_rt:.2f}")
+            _t_p1 = time.time()
             rescued_p1 = _allow_long_p1_rescue(sig)
+            if TIMER_LOG_ENABLE:
+                print(f"[TIMER] long_filter_p1_rescue sym={sig.get('symbol','')} sec={time.time()-_t_p1:.2f}")
+            _t_def = time.time()
             ok, reason = defensive_filter_long(sig)
             t_after_filter = time.time()
+            if TIMER_LOG_ENABLE:
+                print(f"[TIMER] long_filter_defensive sym={sig.get('symbol','')} sec={t_after_filter-_t_def:.2f}")
     
             if not ok:
                 sig["ai_prob_win"] = ""
