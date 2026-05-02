@@ -647,8 +647,10 @@ _row_count_cache: Dict[str, Dict[str, Any]] = {}
 ROWCOUNT_TTL_SEC = 180
 
 _repeat_state_cache: Dict[str, Dict[str, Any]] = {}
-REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "20")))
+REPEAT_STATE_TTL_SEC = int(float(os.environ.get("REPEAT_STATE_TTL_SEC", "120")))
 V2_REPEAT_STATE_LOOKBACK_ROWS = int(float(os.environ.get("V2_REPEAT_STATE_LOOKBACK_ROWS", "2000")))
+V2_REGIME_SNAPSHOT_TTL_SEC = int(float(os.environ.get("V2_REGIME_SNAPSHOT_TTL_SEC", "1200")))
+V2_BRAKE_STATE_TTL_SEC = int(float(os.environ.get("V2_BRAKE_STATE_TTL_SEC", "600")))
 
 _v2_fetch_cache: Dict[str, Dict[str, Any]] = {}
 V2_FETCH_TTL_SEC = int(float(os.environ.get("V2_FETCH_TTL_SEC", "10")))
@@ -10218,6 +10220,10 @@ def get_v2_regime_health_snapshot(now_jst: Optional[datetime] = None) -> Dict[st
     v2_shadow_ai から regime内 uplift を計算して、
     LONG/SHORT の通知可否を決めるためのスナップショットを返す。
     """
+    _rsnap_ts = time.time()
+    _rsnap_cached = _repeat_state_cache.get("v2_regime_health_snapshot", {})
+    if _rsnap_cached and (_rsnap_ts - float(_rsnap_cached.get("ts", 0.0))) <= V2_REGIME_SNAPSHOT_TTL_SEC:
+        return dict(_rsnap_cached["v"])
     now_jst = now_jst or datetime.now(JST)
 
     out: Dict[str, Any] = {
@@ -10345,6 +10351,7 @@ def get_v2_regime_health_snapshot(now_jst: Optional[datetime] = None) -> Dict[st
             out[side_u]["enabled"] = True
             out[side_u]["reason"] = "enabled_by_regime_uplift"
 
+        _repeat_state_cache["v2_regime_health_snapshot"] = {"ts": _rsnap_ts, "v": dict(out)}
         return out
 
     except Exception as e:
@@ -11053,6 +11060,10 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
       - CAUTION : TOP_N を絞る（probe 運転）
       - STOP    : 今回の SHORT 選抜は停止し、記録だけ残す
     """
+    _brake_ts = time.time()
+    _brake_cached = _repeat_state_cache.get("v2_short_brake_state", {})
+    if _brake_cached and (_brake_ts - float(_brake_cached.get("ts", 0.0))) <= V2_BRAKE_STATE_TTL_SEC:
+        return dict(_brake_cached["v"])
     base_top_n = max(1, int(V2_SHORT_RANK_TOP_N))
     probe_top_n = max(1, int(V2_SHORT_BRAKE_PROBE_TOP_N))
     default_state = {
@@ -11119,7 +11130,7 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
             mode = "CAUTION"
             effective_top_n = min(base_top_n, probe_top_n)
             reason = "recent_done_not_recovered_yet"
-        return {
+        _brake_result = {
             "enabled": True,
             "mode": mode,
             "base_top_n": base_top_n,
@@ -11131,6 +11142,8 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
             "reason": reason,
             "slots": [pd.Timestamp(s).strftime("%Y-%m-%d %H:%M") for s in slots],
         }
+        _repeat_state_cache["v2_short_brake_state"] = {"ts": _brake_ts, "v": dict(_brake_result)}
+        return _brake_result
     except Exception as e:
         print(f"[V2-SHORT-BRAKE-WARN] evaluation failed: {type(e).__name__}: {e}")
         return {
@@ -11226,6 +11239,10 @@ def get_v2_long_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, Any
       - CAUTION : TOP_N を絞る（probe 運転）
       - STOP    : 今回の LONG 選抜は停止し、記録だけ残す
     """
+    _lbrake_ts = time.time()
+    _lbrake_cached = _repeat_state_cache.get("v2_long_brake_state", {})
+    if _lbrake_cached and (_lbrake_ts - float(_lbrake_cached.get("ts", 0.0))) <= V2_BRAKE_STATE_TTL_SEC:
+        return dict(_lbrake_cached["v"])
     base_top_n = max(1, int(V2_LONG_RANK_TOP_N))
     probe_top_n = max(1, int(V2_LONG_BRAKE_PROBE_TOP_N))
 
@@ -11306,7 +11323,7 @@ def get_v2_long_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, Any
                 effective_top_n = base_top_n
                 reason = "recovered"
 
-        return {
+        _lbrake_result = {
             "enabled": True,
             "mode": mode,
             "base_top_n": base_top_n,
@@ -11318,6 +11335,8 @@ def get_v2_long_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, Any
             "reason": reason,
             "slots": [pd.Timestamp(s).strftime("%Y-%m-%d %H:%M") for s in slots],
         }
+        _repeat_state_cache["v2_long_brake_state"] = {"ts": _lbrake_ts, "v": dict(_lbrake_result)}
+        return _lbrake_result
 
     except Exception as e:
         state = dict(default_state)
