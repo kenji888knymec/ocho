@@ -5,7 +5,8 @@ SHORT_B枠に入れる勝てる代替条件を高速に探索する。
 SHORT_A/Cとの重複チェックと、short_recent_pause/profile no_matchの分離も実施。
 
 現行条件（参考）:
-  SHORT_B: side=SHORT;mode=RANGE;ltf_aligned=0;p2_min=0;rsi_min=40;rsi_max=45
+  SHORT_B: side=SHORT;mode=RANGE;rsi_min=45;rsi_max=55;p2_min=0;p3_min=0.5;
+           volratio_max=1.5;hour_min=8;hour_max=16
   SHORT_A: side=SHORT;mode=RANGE;rsi_min=50;rsi_max=55;p2_min=0;volratio_max=1.2;ai_max=0.6
   SHORT_C: side=SHORT;mode=DOWN;rsi_min=50;rsi_max=60;volratio_min=1.2;volratio_max=2.5;ai_max=0.6
 
@@ -390,9 +391,11 @@ def main():
     )
     short_b_mask = (
         IS_SHORT & RNG
-        & (~df["_ltf"])
+        & (df["_rsi"] >= 45) & (df["_rsi"] < 55)
         & (df["_p2"] >= 0)
-        & (df["_rsi"] >= 40) & (df["_rsi"] < 45)
+        & (df["_p3"] >= 0.5)
+        & (df["_vol"] <= 1.5)
+        & (df["_hour"] >= 8) & (df["_hour"] < 16)
     )
     short_c_mask = (
         IS_SHORT & DOWN
@@ -413,7 +416,8 @@ def main():
         ("SHORT_A (active)", short_a_mask,
          "side=SHORT;mode=RANGE;rsi_min=50;rsi_max=55;p2_min=0;volratio_max=1.2;ai_max=0.6"),
         ("SHORT_B (current)", short_b_mask,
-         "side=SHORT;mode=RANGE;ltf_aligned=0;p2_min=0;rsi_min=40;rsi_max=45"),
+         "side=SHORT;mode=RANGE;rsi_min=45;rsi_max=55;p2_min=0;p3_min=0.5;"
+         "volratio_max=1.5;hour_min=8;hour_max=16"),
         ("SHORT_C (active)", short_c_mask,
          "side=SHORT;mode=DOWN;rsi_min=50;rsi_max=60;volratio_min=1.2;volratio_max=2.5;ai_max=0.6"),
     ]:

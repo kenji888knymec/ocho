@@ -6,7 +6,8 @@ long_d_replacement_search_fast.py — LONG_D枠 代替条件探索（高速版�
 
 現行条件（参考）:
   LONG_D: side=LONG;mode=UP;p1_max=1.0;volratio_min=2.0;volconfirmed=1
-  LONG_E: side=LONG;mode=UP;rsi_min=40;rsi_max=50;p3_min=0.2
+  LONG_E: side=LONG;mode=UP;rsi_min=60;rsi_max=70;p3_min=1.0;p1_min=0.5;p1_max=1.5;
+           volratio_min=1.0;volratio_max=2.5;hour_min=8;hour_max=18
   LONG_F: side=LONG;mode=UP;rsi_min=55;rsi_max=65;p3_min=0.7;p1_min=0.5;p1_max=1.5;
            volratio_min=1.0;volratio_max=2.5;hour_min=6;hour_max=14
 
@@ -367,7 +368,11 @@ def main():
     )
     long_e_mask = (
         (df["_dir"] == "LONG") & (df["_mode"] == "UP")
-        & (df["_rsi"] >= 40) & (df["_rsi"] < 50) & (df["_p3"] >= 0.2)
+        & (df["_rsi"] >= 60) & (df["_rsi"] < 70)
+        & (df["_p3"] >= 1.0)
+        & (df["_p1"] >= 0.5) & (df["_p1"] < 1.5)
+        & (df["_vol"] >= 1.0) & (df["_vol"] < 2.5)
+        & (df["_hour"] >= 8) & (df["_hour"] < 18)
     )
     long_f_mask = (
         (df["_dir"] == "LONG") & (df["_mode"] == "UP")
@@ -390,7 +395,8 @@ def main():
         ("LONG_D (current)", long_d_mask,
          "side=LONG;mode=UP;p1_max=1.0;volratio_min=2.0;volconfirmed=1"),
         ("LONG_E (active)",  long_e_mask,
-         "side=LONG;mode=UP;rsi_min=40;rsi_max=50;p3_min=0.2"),
+         "side=LONG;mode=UP;rsi_min=60;rsi_max=70;p3_min=1.0;p1_min=0.5;p1_max=1.5;"
+         "volratio_min=1.0;volratio_max=2.5;hour_min=8;hour_max=18"),
         ("LONG_F (active)",  long_f_mask,
          "side=LONG;mode=UP;rsi_min=55;rsi_max=65;p3_min=0.7;p1_min=0.5;p1_max=1.5;"
          "volratio_min=1.0;volratio_max=2.5;hour_min=6;hour_max=14"),
