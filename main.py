@@ -12476,6 +12476,20 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     note_suffix="post_reject_fallback",
                 )
 
+                _disabled_fb_routes = {
+                    r.strip().lower()
+                    for r in os.environ.get(
+                        "V2_FEATURE_POST_REJECT_FALLBACK_DISABLED_ROUTES", ""
+                    ).split(",")
+                    if r.strip()
+                }
+                if _disabled_fb_routes:
+                    probe_candidates = [
+                        c for c in probe_candidates
+                        if str(c.get("_feature_bypass_profile", "")).strip().lower()
+                        not in _disabled_fb_routes
+                    ]
+
                 if probe_candidates:
                     sig = probe_candidates[0]
 
