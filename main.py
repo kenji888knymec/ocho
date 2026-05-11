@@ -1668,6 +1668,23 @@ def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
                 return False
             continue
 
+        if k == "hour_in":
+            hour_val = _profile_sig_value(sig, "hour")
+            x = _safe_float_or_nan(hour_val)
+            if not np.isfinite(x):
+                return False
+            try:
+                allowed_hours = {
+                    int(float(h.strip()))
+                    for h in str(exp).split(",")
+                    if h.strip()
+                }
+                if int(x) not in allowed_hours:
+                    return False
+            except (ValueError, TypeError):
+                return False
+            continue
+
         if k in ("ltf_aligned", "volconfirmed", "fr_available"):
             ax = _safe_float_or_nan(actual)
             if not np.isfinite(ax):
