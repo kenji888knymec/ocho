@@ -10415,7 +10415,7 @@ def _get_recent_short_strict_health(now_jst: Optional[datetime] = None) -> Dict[
         return out
 
     try:
-        df = get_v2_shadow_ai_data()
+        df = get_v2_shadow_ai_recent_data_for_repeat()
         if df is None or df.empty:
             out["reason"] = "shadow_empty"
             out["reason_text"] = "shadow_empty"
