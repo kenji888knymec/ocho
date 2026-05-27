@@ -9166,13 +9166,13 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     
             # pause rescue: short_recent_pause発動中でもAI高スコアなら通す
             # V2_SHORT_PAUSE_AI_RESCUE_MIN <= 1.0 のときだけ有効（default 1.1 = 無効）
+            # 注意: defensive_filter内の_is_short_strong_hour_bucketが既存挙動のまま
+            #       AIスコアを参照しないよう、sigには書き込まずローカル変数だけで判定する
             _rescue_th = float(V2_SHORT_PAUSE_AI_RESCUE_MIN)
             _pre_ai_score = float("nan")
             if _rescue_th <= 1.0:
                 _pre_ai_res = _predict_v2_ai_score(sig, "SHORT", float("nan"))
                 _pre_ai_score = float(_pre_ai_res.get("score", float("nan")))
-                if np.isfinite(_pre_ai_score):
-                    sig["ai_proba_used"] = _pre_ai_score
 
             ok, reason = defensive_filter(sig)
             t_after_filter = time.time()
