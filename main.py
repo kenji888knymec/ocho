@@ -5248,6 +5248,7 @@ V2_SHORT_PAUSE_MIN_DONE = int(float(os.environ.get("V2_SHORT_PAUSE_MIN_DONE", "8
 V2_SHORT_PAUSE_STOP_WINRATE = _env_float("V2_SHORT_PAUSE_STOP_WINRATE", 0.40)
 V2_SHORT_PAUSE_STOP_AVGPNL = _env_float("V2_SHORT_PAUSE_STOP_AVGPNL", 0.0)
 V2_SHORT_PAUSE_CACHE_TTL_SEC = int(float(os.environ.get("V2_SHORT_PAUSE_CACHE_TTL_SEC", "300")))
+V2_SHORT_PAUSE_AI_RESCUE_MIN = _env_float("V2_SHORT_PAUSE_AI_RESCUE_MIN", 1.1)
 
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
@@ -9163,27 +9164,57 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 )
                 continue
     
+            # pause rescue: short_recent_pause発動中でもAI高スコアなら通す
+            # V2_SHORT_PAUSE_AI_RESCUE_MIN <= 1.0 のときだけ有効（default 1.1 = 無効）
+            _rescue_th = float(V2_SHORT_PAUSE_AI_RESCUE_MIN)
+            _pre_ai_score = float("nan")
+            if _rescue_th <= 1.0:
+                _pre_ai_res = _predict_v2_ai_score(sig, "SHORT", float("nan"))
+                _pre_ai_score = float(_pre_ai_res.get("score", float("nan")))
+                if np.isfinite(_pre_ai_score):
+                    sig["ai_proba_used"] = _pre_ai_score
+
             ok, reason = defensive_filter(sig)
             t_after_filter = time.time()
-    
+
             if not ok:
-                sig["ai_prob_win"] = ""
-                sig["ai_pass"] = "0"
-                sig["ai_band"] = "REJECTED"
-                sig["ai_model_version"] = "QS_v1"
-                sig["ai_model_type"] = "SHORT_RULE_RANK"
-                sig["ai_note"] = f"REJECTED:{reason}"
-                output.append(sig)
-                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={reason}")
-                _timlog(
-                    f"[TIMER] v2_selection_pipeline short_one "
-                    f"i={i} symbol={sig.get('symbol','')} "
-                    f"filter_sec={t_after_filter - one_start:.2f} "
-                    f"score_sec={time.time() - t_after_filter:.2f} "
-                    f"total_sec={time.time() - one_start:.2f} "
-                    f"passed=0"
+                _is_pause_block = "short_recent_pause" in str(reason)
+                _can_rescue = (
+                    _rescue_th <= 1.0
+                    and _is_pause_block
+                    and np.isfinite(_pre_ai_score)
+                    and _pre_ai_score >= _rescue_th
                 )
-                continue
+                _sym_r = str(sig.get("symbol", ""))
+                if _is_pause_block and _rescue_th <= 1.0 and np.isfinite(_pre_ai_score):
+                    print(
+                        f"[V2-PAUSE-AI-RESCUE] sym={_sym_r} "
+                        f"ai_prob={_pre_ai_score:.4f} th={_rescue_th:.4f} "
+                        f"pause_reason={reason} pass={'1' if _can_rescue else '0'}",
+                        flush=True,
+                    )
+                if _can_rescue:
+                    sig["_short_pause_ai_rescue"] = "1"
+                    ok = True
+                    reason = f"ai_rescue_from_pause;ai_prob={_pre_ai_score:.4f};orig={reason}"
+                else:
+                    sig["ai_prob_win"] = ""
+                    sig["ai_pass"] = "0"
+                    sig["ai_band"] = "REJECTED"
+                    sig["ai_model_version"] = "QS_v1"
+                    sig["ai_model_type"] = "SHORT_RULE_RANK"
+                    sig["ai_note"] = f"REJECTED:{reason}"
+                    output.append(sig)
+                    print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason={reason}")
+                    _timlog(
+                        f"[TIMER] v2_selection_pipeline short_one "
+                        f"i={i} symbol={sig.get('symbol','')} "
+                        f"filter_sec={t_after_filter - one_start:.2f} "
+                        f"score_sec={time.time() - t_after_filter:.2f} "
+                        f"total_sec={time.time() - one_start:.2f} "
+                        f"passed=0"
+                    )
+                    continue
     
             qs = calc_quality_score(sig)
             t_after_score = time.time()
@@ -9251,11 +9282,18 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             ai_score = float(ai_res["score"])
             sig["ai_prob_win"] = round(ai_score, 6)
             sig["ai_pass"] = "1"
-            sig["ai_band"] = "SHORT_AI_SCORE" if not ai_res.get("used_fallback") else "SHORT_AI_FALLBACK_SCORE"
+            sig["ai_band"] = (
+                "SHORT_AI_RESCUE" if sig.get("_short_pause_ai_rescue") == "1"
+                else ("SHORT_AI_SCORE" if not ai_res.get("used_fallback") else "SHORT_AI_FALLBACK_SCORE")
+            )
             sig["ai_model_version"] = str(ai_res.get("model_version", "") or "")
             sig["ai_model_type"] = str(ai_res.get("model_type", "SHORT_AI") or "SHORT_AI")
+            _rescue_note_pfx = (
+                f"pause_ai_rescue=1;rescue_th={_rescue_th:.4f};"
+                if sig.get("_short_pause_ai_rescue") == "1" else ""
+            )
             sig["ai_note"] = (
-                f"{ai_res.get('note', '')};"
+                f"{_rescue_note_pfx}{ai_res.get('note', '')};"
                 f"qs={qs:.4f};"
                 f"p1={_fmt_sig_num_or_blank(sig, 'p1_score')};"
                 f"total={_fmt_sig_num_or_blank(sig, 'total_score')};"
