@@ -16638,6 +16638,232 @@ def v2_retrain_report():
         return jsonify({"ok": False, "error": err, "version": VERSION}), 200
 
 
+# ==========================================
+# /ops_health - 日次接続診断
+# ==========================================
+
+def _ops_health_build(mode: str) -> Dict[str, Any]:
+    now_jst = datetime.now(JST)
+    anomalies: List[str] = []
+    warnings_list: List[str] = []
+
+    # 1. ENV スナップショット
+    env_snap: Dict[str, Any] = {
+        "deploy_sha": os.environ.get("DEPLOY_SHA", ""),
+        "short_model_version_env": SHORT_MODEL_VERSION,
+        "long_model_version_env": LONG_MODEL_VERSION,
+        "short_model_version_runtime": AI_MODEL_VERSION_RUNTIME_SHORT,
+        "long_model_version_runtime": AI_MODEL_VERSION_RUNTIME_LONG,
+        "short_model_gcs_uri": SHORT_MODEL_GCS_URI,
+        "long_model_gcs_uri": LONG_MODEL_GCS_URI,
+        "v2_feature_allow_profiles": list(V2_FEATURE_ALLOW_PROFILES),
+        "v2_feature_bypass_profiles": list(V2_FEATURE_BYPASS_PROFILES),
+        "v2_short_pause_ai_rescue_min": float(V2_SHORT_PAUSE_AI_RESCUE_MIN),
+        "v2_short_rank_top_n": int(V2_SHORT_RANK_TOP_N),
+    }
+
+    # 2. ENV レベル異常チェック
+    if not SHORT_MODEL_VERSION:
+        anomalies.append("SHORT_MODEL_VERSION_empty")
+    if not SHORT_MODEL_GCS_URI:
+        anomalies.append("SHORT_MODEL_GCS_URI_empty")
+    if (
+        SHORT_MODEL_VERSION
+        and AI_MODEL_VERSION_RUNTIME_SHORT
+        and SHORT_MODEL_VERSION != AI_MODEL_VERSION_RUNTIME_SHORT
+    ):
+        anomalies.append(
+            f"model_version_mismatch:env={SHORT_MODEL_VERSION}"
+            f"!=runtime={AI_MODEL_VERSION_RUNTIME_SHORT}"
+        )
+    if float(V2_SHORT_PAUSE_AI_RESCUE_MIN) > 1.0:
+        warnings_list.append(
+            f"rescue_disabled:V2_SHORT_PAUSE_AI_RESCUE_MIN"
+            f"={float(V2_SHORT_PAUSE_AI_RESCUE_MIN):.2f}>1.0"
+        )
+    short_in_bypass = [
+        p for p in list(V2_FEATURE_BYPASS_PROFILES)
+        if str(p).lower().startswith("short_")
+    ]
+    if short_in_bypass:
+        warnings_list.append(f"short_profiles_in_bypass:{short_in_bypass}")
+
+    # 3. v2_shadow_ai ファネル（直近24h）
+    funnel: Dict[str, Any] = {}
+    try:
+        df = get_v2_shadow_ai_data()
+        if df is None or df.empty or "Datetime_JST" not in df.columns:
+            funnel = {"note": "no_data"}
+        else:
+            dt_series = pd.to_datetime(
+                df["Datetime_JST"].astype(str).str.strip(), errors="coerce"
+            )
+            cutoff = now_jst.replace(tzinfo=None) - timedelta(hours=24)
+            df_24h = df[dt_series.notna() & (dt_series >= cutoff)].copy()
+            n_total = int(len(df_24h))
+
+            dir_counts: Dict[str, int] = {}
+            if "Direction" in df_24h.columns:
+                dir_counts = {
+                    str(k): int(v)
+                    for k, v in df_24h["Direction"].astype(str).str.upper()
+                    .value_counts().items()
+                }
+
+            band_counts: Dict[str, int] = {}
+            if "AI_Band" in df_24h.columns:
+                band_counts = {
+                    str(k): int(v)
+                    for k, v in df_24h["AI_Band"].astype(str).str.upper()
+                    .value_counts().items()
+                }
+
+            n_notify_pass = 0
+            if "Notify_Pass" in df_24h.columns:
+                n_notify_pass = int(
+                    (df_24h["Notify_Pass"].astype(str).str.strip() == "1").sum()
+                )
+
+            n_rescue = 0
+            n_short_rank_selected = 0
+            n_short_rank_notified = 0
+            if "AI_Note" in df_24h.columns:
+                note_col = df_24h["AI_Note"].astype(str)
+                n_rescue = int(
+                    note_col.str.contains("pause_ai_rescue=1", na=False).sum()
+                )
+                if "AI_Band" in df_24h.columns and "Notify_Pass" in df_24h.columns:
+                    rank_mask = df_24h["AI_Band"].astype(str).str.upper().isin(
+                        {"SHORT_AI_RANK", "SHORT_AI_FALLBACK_RANK"}
+                    )
+                    sel_mask = note_col.str.contains("selected=true", na=False)
+                    np_mask = df_24h["Notify_Pass"].astype(str).str.strip() == "1"
+                    n_short_rank_selected = int((rank_mask & sel_mask).sum())
+                    n_short_rank_notified = int((rank_mask & sel_mask & np_mask).sum())
+
+            short_model_versions: List[str] = []
+            if "AI_Model_Version" in df_24h.columns and "Direction" in df_24h.columns:
+                short_mask = df_24h["Direction"].astype(str).str.upper() == "SHORT"
+                mv_raw = df_24h.loc[short_mask, "AI_Model_Version"].astype(str).str.strip()
+                short_model_versions = [
+                    v for v in mv_raw.unique().tolist()
+                    if v and v not in ("", "nan")
+                ]
+
+            funnel = {
+                "n_total_24h": n_total,
+                "direction_counts": dir_counts,
+                "band_counts": band_counts,
+                "n_notify_pass_1": n_notify_pass,
+                "n_rescue_24h": n_rescue,
+                "short_ai_rank": {
+                    "selected": n_short_rank_selected,
+                    "notified": n_short_rank_notified,
+                    "not_notified": n_short_rank_selected - n_short_rank_notified,
+                },
+                "short_model_versions_seen": short_model_versions,
+            }
+
+            # ファネル異常チェック
+            if n_short_rank_selected > 0 and n_short_rank_notified == 0:
+                anomalies.append(
+                    f"short_rank_selected_but_zero_notified:"
+                    f"selected={n_short_rank_selected}"
+                )
+            if short_model_versions and SHORT_MODEL_VERSION:
+                unexpected_mv = [
+                    v for v in short_model_versions
+                    if v
+                    and v != SHORT_MODEL_VERSION
+                    and not v.startswith("feature_profile")
+                    and not v.startswith("QS")
+                ]
+                if unexpected_mv:
+                    warnings_list.append(
+                        f"short_model_version_mix_in_24h:{unexpected_mv[:3]}"
+                    )
+    except Exception as _fex:
+        funnel = {"error": f"{type(_fex).__name__}: {_fex}"}
+
+    health = "NG" if anomalies else ("WARN" if warnings_list else "OK")
+    print(
+        f"[OPS-HEALTH] mode={mode} health={health} "
+        f"anomalies={len(anomalies)} warnings={len(warnings_list)}",
+        flush=True,
+    )
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "mode": mode,
+        "ts_jst": now_jst.strftime("%Y-%m-%d %H:%M:%S"),
+        "health": health,
+        "env": env_snap,
+        "funnel_24h": funnel,
+        "anomalies": anomalies,
+        "warnings": warnings_list,
+    }
+
+
+def _ops_health_discord_text(result: Dict[str, Any]) -> str:
+    ts = result.get("ts_jst", "")
+    mode = result.get("mode", "daily")
+    env = result.get("env", {})
+    funnel = result.get("funnel_24h", {})
+    anomalies = result.get("anomalies", [])
+    warnings_r = result.get("warnings", [])
+    health = result.get("health", "?")
+
+    sha = str(env.get("deploy_sha", "") or "")[:8] or "N/A"
+    lines = [
+        f"[ops_health/{mode}] {ts} [{health}]",
+        f"sha={sha}",
+        (
+            f"short: env={env.get('short_model_version_env', '')} "
+            f"runtime={env.get('short_model_version_runtime', '')}"
+        ),
+        (
+            f"rescue_min={env.get('v2_short_pause_ai_rescue_min', '')} "
+            f"top_n={env.get('v2_short_rank_top_n', '')} "
+            f"bypass={env.get('v2_feature_bypass_profiles', [])}"
+        ),
+        (
+            f"24h: total={funnel.get('n_total_24h', 0)} "
+            f"notify={funnel.get('n_notify_pass_1', 0)} "
+            f"rescue={funnel.get('n_rescue_24h', 0)}"
+        ),
+    ]
+    sar = funnel.get("short_ai_rank", {})
+    if sar:
+        lines.append(
+            f"SHORT_AI_RANK: sel={sar.get('selected', 0)} "
+            f"notified={sar.get('notified', 0)} "
+            f"stuck={sar.get('not_notified', 0)}"
+        )
+    if anomalies:
+        lines.append("NG: " + " | ".join(anomalies))
+    if warnings_r:
+        lines.append("WARN: " + " | ".join(warnings_r))
+    if not anomalies and not warnings_r:
+        lines.append("all checks OK")
+    return "\n".join(lines)
+
+
+@app.route("/ops_health", methods=["GET"])
+def ops_health():
+    mode = str(request.args.get("mode", "daily")).strip().lower()
+    do_notify = str(request.args.get("notify", "0")).strip() == "1"
+    try:
+        result = _ops_health_build(mode)
+        if do_notify:
+            send_daily_discord_message(_ops_health_discord_text(result))
+        return jsonify(result), 200
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"[ERR] /ops_health crashed: {err}")
+        return jsonify({"ok": False, "error": err, "version": VERSION}), 200
+
+
 @app.route("/judge_v2", methods=["GET", "POST"])
 def judge_v2_process():
     if not _run_lock.acquire(blocking=False):
