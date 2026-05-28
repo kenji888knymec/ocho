@@ -5249,6 +5249,10 @@ V2_SHORT_PAUSE_STOP_WINRATE = _env_float("V2_SHORT_PAUSE_STOP_WINRATE", 0.40)
 V2_SHORT_PAUSE_STOP_AVGPNL = _env_float("V2_SHORT_PAUSE_STOP_AVGPNL", 0.0)
 V2_SHORT_PAUSE_CACHE_TTL_SEC = int(float(os.environ.get("V2_SHORT_PAUSE_CACHE_TTL_SEC", "300")))
 V2_SHORT_PAUSE_AI_RESCUE_MIN = _env_float("V2_SHORT_PAUSE_AI_RESCUE_MIN", 1.1)
+# SHORT_AI_RANK の selected=true を feature_only_mode の実送信対象に含めるスイッチ。
+# default=0（無効）: env を入れない限り本番通知挙動は変わらない。
+# 1 のときだけ、rank top_n かつ既存ガード通過済みの SHORT_AI_RANK を Discord 送信する。
+V2_SHORT_AI_NOTIFY_ENABLE = str(os.environ.get("V2_SHORT_AI_NOTIFY_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
@@ -12877,6 +12881,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
 
         feature_only_candidates = []
         feature_guard_blocked_n = 0
+        short_ai_candidates_n = 0
 
         for x in final_signals:
             is_feature_hit = str(x.get("_feature_bypass", "0")) == "1"
@@ -12900,10 +12905,54 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     )
                     x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
             else:
-                x["_notify_pass"] = "0"
-                cur_note = str(x.get("ai_note", "") or "")
-                add_note = "notify_sent=0;notify_send_reason=feature_profile_only_no_match"
-                x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                # SHORT AI rank ルート: feature bypass ではないが、
+                # V2_SHORT_AI_NOTIFY_ENABLE=1 のとき、rank top_n かつ既存ガード通過済みの
+                # SHORT_AI_RANK selected=true だけを実送信対象にする。
+                # 初期は SHORT_AI_RANK のみ（SHORT_AI_FALLBACK_RANK は除外）。
+                prev_notify_pass = str(x.get("_notify_pass", "0"))
+                _dir = str(x.get("direction", "")).strip().upper()
+                _band = str(x.get("ai_band", "")).strip().upper()
+                _ai_pass = str(x.get("ai_pass", "")).strip()
+                short_ai_guard = _v2_feature_live_guard_reason(x)
+
+                short_ai_ok = (
+                    V2_SHORT_AI_NOTIFY_ENABLE
+                    and _dir == "SHORT"
+                    and _ai_pass == "1"
+                    and _band == "SHORT_AI_RANK"
+                    and short_ai_guard == ""
+                    and prev_notify_pass == "1"
+                )
+
+                if short_ai_ok:
+                    short_ai_candidates_n += 1
+                    x["_notify_pass"] = "1"
+                    x["_notify_reason"] = "short_ai_rank_selected"
+                    cur_note = str(x.get("ai_note", "") or "")
+                    add_note = f"short_ai_notify=1;short_ai_notify_enable=1;ai_band={_band}"
+                    x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                    feature_only_candidates.append(x)
+                    print(
+                        f"[V2] SHORT_AI_NOTIFY sym={x.get('symbol','')} "
+                        f"band={_band} ai_pass={_ai_pass} "
+                        f"guard={short_ai_guard or 'ok'} "
+                        f"prev_notify_pass={prev_notify_pass} pass=1",
+                        flush=True,
+                    )
+                else:
+                    x["_notify_pass"] = "0"
+                    cur_note = str(x.get("ai_note", "") or "")
+                    if _dir == "SHORT" and _band == "SHORT_AI_RANK":
+                        add_note = (
+                            "notify_sent=0;"
+                            "notify_send_reason=short_ai_notify_blocked;"
+                            f"short_ai_notify_enable={int(V2_SHORT_AI_NOTIFY_ENABLE)};"
+                            f"guard={short_ai_guard or 'ok'};"
+                            f"prev_notify_pass={prev_notify_pass}"
+                        )
+                    else:
+                        add_note = "notify_sent=0;notify_send_reason=feature_profile_only_no_match"
+                    x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
 
         notify_candidates = feature_only_candidates
 
@@ -12911,6 +12960,8 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             f"[V2] feature_selected_guard "
             f"feature_candidates={len(feature_only_candidates)} "
             f"feature_guard_blocked={feature_guard_blocked_n} "
+            f"short_ai_candidates={short_ai_candidates_n} "
+            f"short_ai_notify_enable={int(V2_SHORT_AI_NOTIFY_ENABLE)} "
             f"final_signals={len(final_signals)}"
         )
 
@@ -16660,6 +16711,7 @@ def _ops_health_build(mode: str) -> Dict[str, Any]:
         "v2_feature_bypass_profiles": list(V2_FEATURE_BYPASS_PROFILES),
         "v2_short_pause_ai_rescue_min": float(V2_SHORT_PAUSE_AI_RESCUE_MIN),
         "v2_short_rank_top_n": int(V2_SHORT_RANK_TOP_N),
+        "v2_short_ai_notify_enable": bool(V2_SHORT_AI_NOTIFY_ENABLE),
     }
 
     # 2. ENV レベル異常チェック
@@ -16766,10 +16818,19 @@ def _ops_health_build(mode: str) -> Dict[str, Any]:
 
             # ファネル異常チェック
             if n_short_rank_selected > 0 and n_short_rank_notified == 0:
-                anomalies.append(
-                    f"short_rank_selected_but_zero_notified:"
-                    f"selected={n_short_rank_selected}"
-                )
+                if V2_SHORT_AI_NOTIFY_ENABLE:
+                    # 送信スイッチON なのに届いていない＝真の接続不良
+                    anomalies.append(
+                        f"short_rank_selected_but_zero_notified:"
+                        f"selected={n_short_rank_selected}"
+                    )
+                else:
+                    # 送信スイッチOFF（想定どおり）。選別はできているのでWARNで可視化
+                    warnings_list.append(
+                        f"short_rank_selected_notify_disabled:"
+                        f"selected={n_short_rank_selected};"
+                        f"set V2_SHORT_AI_NOTIFY_ENABLE=1 to send"
+                    )
             if short_model_versions and SHORT_MODEL_VERSION:
                 unexpected_mv = [
                     v for v in short_model_versions
@@ -16825,6 +16886,7 @@ def _ops_health_discord_text(result: Dict[str, Any]) -> str:
         (
             f"rescue_min={env.get('v2_short_pause_ai_rescue_min', '')} "
             f"top_n={env.get('v2_short_rank_top_n', '')} "
+            f"short_ai_notify={int(bool(env.get('v2_short_ai_notify_enable', False)))} "
             f"bypass={env.get('v2_feature_bypass_profiles', [])}"
         ),
         (
