@@ -16846,6 +16846,126 @@ def _ops_health_build(mode: str) -> Dict[str, Any]:
     except Exception as _fex:
         funnel = {"error": f"{type(_fex).__name__}: {_fex}"}
 
+    # 4. shadow vs live 比較（全期間・新モデル固定）
+    # shadow: Direction=SHORT / AI_Model_Version=SHORT_MODEL_VERSION(現ENV) /
+    #         AI_Band=SHORT_AI_RANK / Notify_Pass=1 / EvalStatus=DONE
+    # live:   shadow条件 + AI_Note に "notify_sent=1" を含む
+    shadow_vs_live: Dict[str, Any] = {}
+    try:
+        df_all = get_v2_shadow_ai_data()
+        if df_all is None or df_all.empty:
+            shadow_vs_live = {"note": "no_data"}
+        else:
+            target_mv = str(SHORT_MODEL_VERSION or "")
+            required = {"Direction", "AI_Band", "AI_Note", "Notify_Pass", "EvalStatus",
+                        "WinLose", "PnL_Pct", "Datetime_JST"}
+            missing = required - set(df_all.columns)
+            if missing or not target_mv:
+                shadow_vs_live = {
+                    "note": f"skip:missing_cols={list(missing)}" if missing
+                            else "skip:SHORT_MODEL_VERSION_empty"
+                }
+            else:
+                mv_col   = df_all.get("AI_Model_Version", pd.Series([""] * len(df_all), dtype=str)).astype(str).str.strip()
+                dir_col  = df_all["Direction"].astype(str).str.strip().str.upper()
+                band_col = df_all["AI_Band"].astype(str).str.strip().str.upper()
+                np_col   = df_all["Notify_Pass"].astype(str).str.strip()
+                es_col   = df_all["EvalStatus"].astype(str).str.strip().str.upper()
+                note_col = df_all["AI_Note"].astype(str)
+
+                base_mask = (
+                    (dir_col == "SHORT")
+                    & (mv_col == target_mv)
+                    & (band_col == "SHORT_AI_RANK")
+                    & (np_col == "1")
+                    & (es_col == "DONE")
+                )
+                live_mask = base_mask & note_col.str.contains("notify_sent=1", na=False)
+
+                def _svl_stats(sub: "pd.DataFrame") -> Dict[str, Any]:
+                    n = len(sub)
+                    if n == 0:
+                        return {"n": 0, "wr": None, "avg_pnl": None,
+                                "total_pnl": None, "median_pnl": None,
+                                "active_days": None, "max_per_day": None,
+                                "latest_date": None}
+                    wl = sub["WinLose"].astype(str).str.strip().str.lower()
+                    wins  = int(wl.isin(["win",  "w", "1", "true"]).sum())
+                    loses = int(wl.isin(["lose", "l", "0", "false"]).sum())
+                    wr = (wins / (wins + loses) * 100) if (wins + loses) > 0 else None
+
+                    pnl = pd.to_numeric(
+                        sub["PnL_Pct"].astype(str).str.replace("%", "", regex=False).str.strip(),
+                        errors="coerce",
+                    )
+                    finite_pnl = pnl[np.isfinite(pnl)]
+                    avg_pnl    = float(finite_pnl.mean())    if len(finite_pnl) > 0 else None
+                    total_pnl  = float(finite_pnl.sum())     if len(finite_pnl) > 0 else None
+                    median_pnl = float(finite_pnl.median())  if len(finite_pnl) > 0 else None
+
+                    dt = pd.to_datetime(
+                        sub["Datetime_JST"].astype(str).str.strip(), errors="coerce"
+                    )
+                    dt_valid = dt[dt.notna()]
+                    active_days = int(dt_valid.dt.normalize().nunique()) if len(dt_valid) > 0 else None
+                    max_per_day = int(dt_valid.dt.normalize().value_counts().max()) \
+                                  if len(dt_valid) > 0 else None
+                    latest_date = str(dt_valid.max().date()) if len(dt_valid) > 0 else None
+
+                    return {
+                        "n": n,
+                        "wr": round(wr, 1) if wr is not None else None,
+                        "avg_pnl": round(avg_pnl, 4) if avg_pnl is not None else None,
+                        "total_pnl": round(total_pnl, 3) if total_pnl is not None else None,
+                        "median_pnl": round(median_pnl, 4) if median_pnl is not None else None,
+                        "active_days": active_days,
+                        "max_per_day": max_per_day,
+                        "latest_date": latest_date,
+                    }
+
+                shadow_stats = _svl_stats(df_all[base_mask])
+                live_stats   = _svl_stats(df_all[live_mask])
+
+                # canary 判定
+                live_n   = live_stats["n"]
+                live_wr  = live_stats["wr"]
+                live_pnl = live_stats["total_pnl"]
+                if live_n == 0:
+                    canary_verdict = "waiting_for_live_data"
+                elif live_n < 15:
+                    canary_verdict = f"accumulating({live_n}/15)"
+                elif live_wr is not None and live_wr >= 60 and (live_pnl or 0) > 0:
+                    canary_verdict = "canary_pass_continue"
+                elif live_wr is not None and live_wr >= 40 and (live_pnl or 0) > -5:
+                    canary_verdict = "canary_watch_to30"
+                elif live_wr is not None and (live_wr < 35 or (live_pnl is not None and live_pnl < -3)):
+                    canary_verdict = "canary_STOP_disable_notify"
+                    anomalies.append(
+                        f"canary_stop_criteria_met:"
+                        f"live_n={live_n} live_wr={live_wr} live_pnl={live_pnl}"
+                    )
+                else:
+                    canary_verdict = "canary_watch_continue"
+
+                # shadow vs live の乖離チェック（shadow良好なのにlive悪い）
+                if (shadow_stats["wr"] is not None and live_wr is not None
+                        and live_n >= 15
+                        and shadow_stats["wr"] >= 50
+                        and live_wr < shadow_stats["wr"] - 25):
+                    warnings_list.append(
+                        f"shadow_live_skew:"
+                        f"shadow_wr={shadow_stats['wr']} live_wr={live_wr}"
+                    )
+
+                shadow_vs_live = {
+                    "model_version": target_mv,
+                    "shadow": shadow_stats,
+                    "live": live_stats,
+                    "canary_verdict": canary_verdict,
+                }
+    except Exception as _svl_ex:
+        shadow_vs_live = {"error": f"{type(_svl_ex).__name__}: {_svl_ex}"}
+
     health = "NG" if anomalies else ("WARN" if warnings_list else "OK")
     print(
         f"[OPS-HEALTH] mode={mode} health={health} "
@@ -16861,6 +16981,7 @@ def _ops_health_build(mode: str) -> Dict[str, Any]:
         "health": health,
         "env": env_snap,
         "funnel_24h": funnel,
+        "shadow_vs_live": shadow_vs_live,
         "anomalies": anomalies,
         "warnings": warnings_list,
     }
@@ -16901,6 +17022,22 @@ def _ops_health_discord_text(result: Dict[str, Any]) -> str:
             f"SHORT_AI_RANK: sel={sar.get('selected', 0)} "
             f"notified={sar.get('notified', 0)} "
             f"stuck={sar.get('not_notified', 0)}"
+        )
+    svl = result.get("shadow_vs_live", {})
+    if svl and "shadow" in svl and "live" in svl:
+        sh = svl["shadow"]
+        lv = svl["live"]
+        verdict = svl.get("canary_verdict", "?")
+        lines.append(
+            f"shadow(NP=1/DONE): n={sh.get('n',0)} "
+            f"WR={sh.get('wr','?')}% "
+            f"total={sh.get('total_pnl','?')}"
+        )
+        lines.append(
+            f"live(sent=1/DONE): n={lv.get('n',0)} "
+            f"WR={lv.get('wr','?')}% "
+            f"total={lv.get('total_pnl','?')} "
+            f"[{verdict}]"
         )
     if anomalies:
         lines.append("NG: " + " | ".join(anomalies))
