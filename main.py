@@ -5253,6 +5253,11 @@ V2_SHORT_PAUSE_AI_RESCUE_MIN = _env_float("V2_SHORT_PAUSE_AI_RESCUE_MIN", 1.1)
 # default=0（無効）: env を入れない限り本番通知挙動は変わらない。
 # 1 のときだけ、rank top_n かつ既存ガード通過済みの SHORT_AI_RANK を Discord 送信する。
 V2_SHORT_AI_NOTIFY_ENABLE = str(os.environ.get("V2_SHORT_AI_NOTIFY_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_SHORT_AI_NOTIFY_BLOCK_LANES: set = {
+    item.strip().lower()
+    for item in os.environ.get("V2_SHORT_AI_NOTIFY_BLOCK_LANES", "").split(",")
+    if item.strip()
+}
 
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
@@ -12913,6 +12918,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 _dir = str(x.get("direction", "")).strip().upper()
                 _band = str(x.get("ai_band", "")).strip().upper()
                 _ai_pass = str(x.get("ai_pass", "")).strip()
+                _lane = str(x.get("_runtime_lane", x.get("lane", "")) or "").strip().lower()
                 short_ai_guard = _v2_feature_live_guard_reason(x)
 
                 short_ai_ok = (
@@ -12922,6 +12928,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     and _band == "SHORT_AI_RANK"
                     and short_ai_guard == ""
                     and prev_notify_pass == "1"
+                    and _lane not in V2_SHORT_AI_NOTIFY_BLOCK_LANES
                 )
 
                 if short_ai_ok:
@@ -12929,12 +12936,12 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     x["_notify_pass"] = "1"
                     x["_notify_reason"] = "short_ai_rank_selected"
                     cur_note = str(x.get("ai_note", "") or "")
-                    add_note = f"short_ai_notify=1;short_ai_notify_enable=1;ai_band={_band}"
+                    add_note = f"short_ai_notify=1;short_ai_notify_enable=1;ai_band={_band};lane={_lane}"
                     x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
                     feature_only_candidates.append(x)
                     print(
                         f"[V2] SHORT_AI_NOTIFY sym={x.get('symbol','')} "
-                        f"band={_band} ai_pass={_ai_pass} "
+                        f"band={_band} ai_pass={_ai_pass} lane={_lane} "
                         f"guard={short_ai_guard or 'ok'} "
                         f"prev_notify_pass={prev_notify_pass} pass=1",
                         flush=True,
@@ -12943,11 +12950,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     x["_notify_pass"] = "0"
                     cur_note = str(x.get("ai_note", "") or "")
                     if _dir == "SHORT" and _band == "SHORT_AI_RANK":
+                        _block_reason = f"lane_blocked:{_lane}" if _lane in V2_SHORT_AI_NOTIFY_BLOCK_LANES else ""
                         add_note = (
                             "notify_sent=0;"
                             "notify_send_reason=short_ai_notify_blocked;"
                             f"short_ai_notify_enable={int(V2_SHORT_AI_NOTIFY_ENABLE)};"
                             f"guard={short_ai_guard or 'ok'};"
+                            f"lane={_lane};"
+                            f"block={_block_reason or 'none'};"
                             f"prev_notify_pass={prev_notify_pass}"
                         )
                     else:
