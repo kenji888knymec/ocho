@@ -16869,7 +16869,7 @@ def _ops_health_build(mode: str) -> Dict[str, Any]:
                 mv_col   = df_all.get("AI_Model_Version", pd.Series([""] * len(df_all), dtype=str)).astype(str).str.strip()
                 dir_col  = df_all["Direction"].astype(str).str.strip().str.upper()
                 band_col = df_all["AI_Band"].astype(str).str.strip().str.upper()
-                np_col   = df_all["Notify_Pass"].astype(str).str.strip()
+                np_col   = df_all["Notify_Pass"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                 es_col   = df_all["EvalStatus"].astype(str).str.strip().str.upper()
                 note_col = df_all["AI_Note"].astype(str)
 
