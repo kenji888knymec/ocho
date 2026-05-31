@@ -11174,7 +11174,7 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
         now_jst = datetime.now(JST)
     try:
         current_slot = pd.Timestamp(now_jst.astimezone(JST).replace(tzinfo=None)).floor("15min")
-        df = get_v2_shadow_ai_data()
+        df = get_v2_shadow_ai_recent_data_for_repeat()
         done = _prepare_v2_short_done_for_brake(df)
         if done.empty:
             return default_state
