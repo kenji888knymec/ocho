@@ -7526,8 +7526,24 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     if not short_signals:
         return []
 
+    # --- TIMER (ログのみ。判定/並び/閾値には一切影響しない) ---
+    _rs_start = time.time()
+    _rs_last = [_rs_start]
+
+    def _rstm(label: str) -> None:
+        if TIMER_LOG_ENABLE:
+            _now = time.time()
+            print(
+                f"[TIMER] rank_and_select {label} "
+                f"sec={_now - _rs_last[0]:.2f} total={_now - _rs_start:.2f}"
+            )
+            _rs_last[0] = _now
+
+    _rstm(f"enter n={len(short_signals)}")
+
     for sig in short_signals:
         sig["rule_qs"] = calc_quality_score(sig)
+    _rstm("after_calc_quality_score")
 
     def _short_rank_score(sig: Dict[str, Any]) -> float:
         repeat_penalty, repeat_recent_n, repeat_last_dt = _short_repeat_rank_penalty(sig)
@@ -7547,10 +7563,12 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         ),
         reverse=True,
     )
+    _rstm("after_sorted")
 
     base_top_n = max(1, int(V2_SHORT_RANK_TOP_N))
     probe_top_n = max(1, int(V2_SHORT_BRAKE_PROBE_TOP_N))
     brake = get_v2_short_brake_state(datetime.now(JST))
+    _rstm("after_brake_state")
     brake_mode = str(brake.get("mode", "NORMAL") or "NORMAL").upper()
     effective_top_n = int(brake.get("effective_top_n", base_top_n) or base_top_n)
 
@@ -7567,6 +7585,7 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
                 f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
             )
+        _rstm("rank_disabled_done")
         return ranked
 
     slot_total = len(ranked)
@@ -7622,6 +7641,7 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
             )
 
+    _rstm("annotate_done")
     return ranked
 
 
@@ -11154,7 +11174,7 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
         now_jst = datetime.now(JST)
     try:
         current_slot = pd.Timestamp(now_jst.astimezone(JST).replace(tzinfo=None)).floor("15min")
-        df = get_v2_shadow_ai_data()
+        df = get_v2_shadow_ai_recent_data_for_repeat()
         done = _prepare_v2_short_done_for_brake(df)
         if done.empty:
             return default_state
