@@ -5258,6 +5258,12 @@ V2_SHORT_AI_NOTIFY_BLOCK_LANES: set = {
     for item in os.environ.get("V2_SHORT_AI_NOTIFY_BLOCK_LANES", "").split(",")
     if item.strip()
 }
+# 守りの地合いフィルター（BTC方向ガード）:
+# SHORT_AI 通知を BTC_HTF_Dir が指定方向のときだけ許可する。
+# 空文字なら従来挙動（フィルターなし）。例: "SHORT" で BTC下落時のみ SHORT_AI 通知を許可。
+# 検証(直近14日 SHORT_AI_RANK)で BTC_HTF_Dir=NEUTRAL/LONG の SHORT は WR33/19% で大出血、
+# BTC_HTF_Dir=SHORT のみ WR54%/+70 だったため、逆張りSHORTを避ける地合いガード。
+V2_SHORT_AI_REQUIRE_BTC_HTF_DIR = str(os.environ.get("V2_SHORT_AI_REQUIRE_BTC_HTF_DIR", "")).strip().upper()
 
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
@@ -12919,7 +12925,15 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 _band = str(x.get("ai_band", "")).strip().upper()
                 _ai_pass = str(x.get("ai_pass", "")).strip()
                 _lane = str(x.get("_runtime_lane", x.get("lane", "")) or "").strip().lower()
+                _btc_htf_dir = str(x.get("btc_htf_dir", "")).strip().upper()
                 short_ai_guard = _v2_feature_live_guard_reason(x)
+
+                # 守りの地合いガード: V2_SHORT_AI_REQUIRE_BTC_HTF_DIR が空なら従来挙動、
+                # 指定があれば BTC_HTF_Dir がその方向のときだけ SHORT_AI 通知を許可。
+                _btc_dir_ok = (
+                    V2_SHORT_AI_REQUIRE_BTC_HTF_DIR == ""
+                    or _btc_htf_dir == V2_SHORT_AI_REQUIRE_BTC_HTF_DIR
+                )
 
                 short_ai_ok = (
                     V2_SHORT_AI_NOTIFY_ENABLE
@@ -12929,6 +12943,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     and short_ai_guard == ""
                     and prev_notify_pass == "1"
                     and _lane not in V2_SHORT_AI_NOTIFY_BLOCK_LANES
+                    and _btc_dir_ok
                 )
 
                 if short_ai_ok:
@@ -12950,13 +12965,21 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     x["_notify_pass"] = "0"
                     cur_note = str(x.get("ai_note", "") or "")
                     if _dir == "SHORT" and _band == "SHORT_AI_RANK":
-                        _block_reason = f"lane_blocked:{_lane}" if _lane in V2_SHORT_AI_NOTIFY_BLOCK_LANES else ""
+                        _block_parts = []
+                        if _lane in V2_SHORT_AI_NOTIFY_BLOCK_LANES:
+                            _block_parts.append(f"lane_blocked:{_lane}")
+                        if not _btc_dir_ok:
+                            _block_parts.append(
+                                f"btc_htf_dir_not_{V2_SHORT_AI_REQUIRE_BTC_HTF_DIR.lower()}"
+                            )
+                        _block_reason = ",".join(_block_parts)
                         add_note = (
                             "notify_sent=0;"
                             "notify_send_reason=short_ai_notify_blocked;"
                             f"short_ai_notify_enable={int(V2_SHORT_AI_NOTIFY_ENABLE)};"
                             f"guard={short_ai_guard or 'ok'};"
                             f"lane={_lane};"
+                            f"btc_htf_dir={_btc_htf_dir};"
                             f"block={_block_reason or 'none'};"
                             f"prev_notify_pass={prev_notify_pass}"
                         )
