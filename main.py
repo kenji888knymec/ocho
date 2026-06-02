@@ -5445,8 +5445,6 @@ V2_HEADERS = [
     "TotalScore", "P1_TrendScore", "P2_FundingScore", "P3_VolumeScore",
     # Pillar1 詳細
     "SymHTF_Dir", "SymHTF_Strength", "BTC_HTF_Dir", "BTC_HTF_Strength",
-    # Regime特徴量（AI学習用 - BTC地合い判定）
-    "BTC_EMA_Slope_1h", "BTC_4h_Ret", "BTC_Vol_1h", "BTC_Down_Streak",
     "LTF_Aligned", "LTF_Reasons",
     # Pillar2 詳細
     "FundingRate", "FR_Available",
@@ -5467,6 +5465,8 @@ V2_HEADERS = [
     "Notify_Pass", "Notify_Reason",
     "Feature_Gate", "Feature_Allow_Hits", "Feature_Reject_Hits",
     "Feature_Force_Hits", "Feature_Bypass_Profile",
+    # Regime特徴量（末尾追加: 既存列のindexを動かさないため。AI学習用 - BTC地合い判定）
+    "BTC_EMA_Slope_1h", "BTC_4h_Ret", "BTC_Vol_1h", "BTC_Down_Streak",
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -9738,11 +9738,6 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         float(sig["sym_htf_strength"]),
         sig["btc_htf_dir"],
         float(sig["btc_htf_strength"]),
-        # Regime特徴量（NaNは空文字でスプレッドシートに書く）
-        _safe_float_or_nan(sig.get("btc_ema_slope_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_ema_slope_1h"))) else "",
-        _safe_float_or_nan(sig.get("btc_4h_ret")) if np.isfinite(_safe_float_or_nan(sig.get("btc_4h_ret"))) else "",
-        _safe_float_or_nan(sig.get("btc_vol_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_vol_1h"))) else "",
-        _safe_float_or_nan(sig.get("btc_down_streak")) if np.isfinite(_safe_float_or_nan(sig.get("btc_down_streak"))) else "",
         sig["ltf_aligned"],
         json.dumps(sig["ltf_reasons"], ensure_ascii=False) if sig["ltf_reasons"] else "",
         # Pillar2 詳細
@@ -9785,6 +9780,11 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         fp["REJECT_HITS"],
         fp["FORCE_HITS"],
         fp["BYPASS_PROFILE"],
+        # Regime特徴量（末尾追加。NaNは空文字でスプレッドシートに書く＝補完しない）
+        _safe_float_or_nan(sig.get("btc_ema_slope_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_ema_slope_1h"))) else "",
+        _safe_float_or_nan(sig.get("btc_4h_ret")) if np.isfinite(_safe_float_or_nan(sig.get("btc_4h_ret"))) else "",
+        _safe_float_or_nan(sig.get("btc_vol_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_vol_1h"))) else "",
+        _safe_float_or_nan(sig.get("btc_down_streak")) if np.isfinite(_safe_float_or_nan(sig.get("btc_down_streak"))) else "",
     ]
 
 
@@ -12397,7 +12397,12 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     btc_vol_1h = np.nan
     btc_down_streak = np.nan
     try:
-        btc_ema_slope_1h = _safe_float_or_nan(btc_htf.get("slope"))
+        # EMA傾きは生の価格差分だとBTC価格水準に依存し時期で非定常になるため、
+        # ema_fast で正規化して相対モメンタム(2本分の変化率)にする。補完はしない。
+        _slope_raw = _safe_float_or_nan(btc_htf.get("slope"))
+        _ema_fast = _safe_float_or_nan(btc_htf.get("ema_fast"))
+        if np.isfinite(_slope_raw) and np.isfinite(_ema_fast) and abs(_ema_fast) > 1e-9:
+            btc_ema_slope_1h = _slope_raw / _ema_fast
         if btc_15m_df is not None and len(btc_15m_df) >= 18:
             _closes = pd.to_numeric(btc_15m_df["Close"], errors="coerce")
             _pcts = _closes.pct_change(fill_method=None)
