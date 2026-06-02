@@ -5445,6 +5445,8 @@ V2_HEADERS = [
     "TotalScore", "P1_TrendScore", "P2_FundingScore", "P3_VolumeScore",
     # Pillar1 詳細
     "SymHTF_Dir", "SymHTF_Strength", "BTC_HTF_Dir", "BTC_HTF_Strength",
+    # Regime特徴量（AI学習用 - BTC地合い判定）
+    "BTC_EMA_Slope_1h", "BTC_4h_Ret", "BTC_Vol_1h", "BTC_Down_Streak",
     "LTF_Aligned", "LTF_Reasons",
     # Pillar2 詳細
     "FundingRate", "FR_Available",
@@ -9736,6 +9738,11 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         float(sig["sym_htf_strength"]),
         sig["btc_htf_dir"],
         float(sig["btc_htf_strength"]),
+        # Regime特徴量（NaNは空文字でスプレッドシートに書く）
+        _safe_float_or_nan(sig.get("btc_ema_slope_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_ema_slope_1h"))) else "",
+        _safe_float_or_nan(sig.get("btc_4h_ret")) if np.isfinite(_safe_float_or_nan(sig.get("btc_4h_ret"))) else "",
+        _safe_float_or_nan(sig.get("btc_vol_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_vol_1h"))) else "",
+        _safe_float_or_nan(sig.get("btc_down_streak")) if np.isfinite(_safe_float_or_nan(sig.get("btc_down_streak"))) else "",
         sig["ltf_aligned"],
         json.dumps(sig["ltf_reasons"], ensure_ascii=False) if sig["ltf_reasons"] else "",
         # Pillar2 詳細
@@ -12384,6 +12391,36 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         print(f"[V2-WARN] BTC 15m fetch for AI feats failed: {e}")
     _v2tm("after_btc_15m_features")
 
+    # Regime特徴量: btc_htf と btc_15m_df から計算（AI学習用）
+    btc_ema_slope_1h = np.nan
+    btc_4h_ret = np.nan
+    btc_vol_1h = np.nan
+    btc_down_streak = np.nan
+    try:
+        btc_ema_slope_1h = _safe_float_or_nan(btc_htf.get("slope"))
+        if btc_15m_df is not None and len(btc_15m_df) >= 18:
+            _closes = pd.to_numeric(btc_15m_df["Close"], errors="coerce")
+            _pcts = _closes.pct_change(fill_method=None)
+            _c_now = float(_closes.iloc[-2])
+            _c_4h = float(_closes.iloc[-18])
+            if np.isfinite(_c_now) and np.isfinite(_c_4h) and abs(_c_4h) > 1e-12:
+                btc_4h_ret = (_c_now - _c_4h) / _c_4h
+            _last4 = _pcts.iloc[-5:-1]
+            if _last4.notna().sum() >= 3:
+                btc_vol_1h = float(_last4.std())
+            _streak = 0.0
+            for _idx in range(len(_closes) - 2, max(0, len(_closes) - 12), -1):
+                _ci = float(_closes.iloc[_idx])
+                _cp = float(_closes.iloc[_idx - 1])
+                if np.isfinite(_ci) and np.isfinite(_cp):
+                    if _ci < _cp:
+                        _streak += 1.0
+                    else:
+                        break
+            btc_down_streak = _streak
+    except Exception as _e:
+        print(f"[V2-WARN] regime features failed: {_e}")
+
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
     short_conflict = bool(regime.get("short_conflict", False))
@@ -12539,6 +12576,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 probe_sig["btc_vol"] = _safe_float_or_nan(btc_vol)
             except Exception:
                 pass
+            try:
+                probe_sig["btc_ema_slope_1h"] = _safe_float_or_nan(btc_ema_slope_1h)
+                probe_sig["btc_4h_ret"] = _safe_float_or_nan(btc_4h_ret)
+                probe_sig["btc_vol_1h"] = _safe_float_or_nan(btc_vol_1h)
+                probe_sig["btc_down_streak"] = _safe_float_or_nan(btc_down_streak)
+            except Exception:
+                pass
 
             out.append(probe_sig)
 
@@ -12599,6 +12643,10 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 sig["note"] = ""
                 sig["btc_ret"] = _safe_float_or_nan(btc_ret)
                 sig["btc_vol"] = _safe_float_or_nan(btc_vol)
+                sig["btc_ema_slope_1h"] = _safe_float_or_nan(btc_ema_slope_1h)
+                sig["btc_4h_ret"] = _safe_float_or_nan(btc_4h_ret)
+                sig["btc_vol_1h"] = _safe_float_or_nan(btc_vol_1h)
+                sig["btc_down_streak"] = _safe_float_or_nan(btc_down_streak)
 
                 raw_signals.append(sig)
 
