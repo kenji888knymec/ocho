@@ -6005,10 +6005,13 @@ def assess_volume(ltf_df: pd.DataFrame, direction: str) -> Dict[str, Any]:
 # 動的TP/SL（ATRベース）
 # ==========================================
 
-def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_score: float) -> Dict:
-    atr_val = _safe_float(_atr(ltf_df).iloc[-2], abs(entry * 0.005))
-    if atr_val <= 0:
-        atr_val = abs(entry * 0.005)
+def calc_atr_tp_sl(ltf_df: pd.DataFrame, direction: str, entry: float, total_score: float) -> Optional[Dict]:
+    atr_series = _atr(ltf_df)
+    atr_val = _safe_float_or_nan(atr_series.iloc[-2]) if len(atr_series) >= 2 else np.nan
+    # ATRが欠損/非有限/非正のときは entry*0.005 などの推定値で代用せず、sizing 不能として
+    # None を返す（呼び出し側でシグナルを見送る / fail-closed）。
+    if (not np.isfinite(atr_val)) or atr_val <= 0:
+        return None
 
     sl_mult = 1.5
     if V2_TP_SCORE_DEPENDENT:
@@ -6370,6 +6373,13 @@ def v2_generate_signal(
     # ---- TP/SL ----
     entry = float(ltf_df["Close"].iloc[-2])
     tpsl = calc_atr_tp_sl(ltf_df, direction, entry, total)
+    if tpsl is None:
+        # ATR欠損 → TP/SLを推定値で作らず、このシグナルは見送る（reason=atr_missing）
+        _v2_reject("atr_missing", f"sym={sym} direction={direction} entry={entry}")
+        early_sig = _build_early_feature_probe_sig("atr_missing", forced_direction=direction)
+        if early_sig is not None:
+            return early_sig
+        return None
 
     btc_mode_compat = {"LONG": "Up", "SHORT": "Down", "NEUTRAL": "Range"}.get(btc_dir, "Range")
 
@@ -7472,26 +7482,24 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     volconf_raw = sig.get("vol_confirmed", None)
     volconf = 1.0 if str(volconf_raw).strip().lower() in ("1", "true", "yes", "on") else 0.0
 
-    if not np.isfinite(p1):
-        p1 = 0.0
-    if not np.isfinite(total):
-        total = 0.0
-    if not np.isfinite(p2):
-        p2 = 0.0
-    if not np.isfinite(p3):
-        p3 = 0.0
-    if not np.isfinite(btcstr):
-        btcstr = 0.0
+    # core(p1/total)が欠損なら評価不能 → NaN を返して呼び出し側で見送る。
+    # 0.0 補完はしない（欠損を有利に働かせない / fail-closed）。calc_long_quality_score と同方針。
+    if not np.isfinite(p1) or not np.isfinite(total):
+        return float("nan")
 
     rsi_zone_bonus = _calc_rsi_zone_bonus(rsi)
 
     other_score = total - p1
     other_score = max(-1.5, min(other_score, 1.5))
 
+    # 各項は finite のときだけ効かせる。欠損を 0 補完して加点を得たり減点を回避したりしない。
+    p3_term = (p3 * 0.20) if np.isfinite(p3) else 0.0
+    btcstr_term = (btcstr * 0.05) if np.isfinite(btcstr) else 0.0
+
     btc_over_penalty = -0.30 if (np.isfinite(btcstr) and btcstr > 0.90) else 0.0
-    p2_neg_penalty = V2_SHORT_QS_W_P2_NEG if p2 < 0.0 else 0.0
-    p1_high_penalty = V2_SHORT_QS_W_P1_GE2 if p1 >= 2.0 else 0.0
-    p3_flat_bonus = V2_SHORT_QS_W_P3_FLAT if (0.0 <= p3 <= 0.5) else 0.0
+    p2_neg_penalty = V2_SHORT_QS_W_P2_NEG if (np.isfinite(p2) and p2 < 0.0) else 0.0
+    p1_high_penalty = V2_SHORT_QS_W_P1_GE2 if (np.isfinite(p1) and p1 >= 2.0) else 0.0
+    p3_flat_bonus = V2_SHORT_QS_W_P3_FLAT if (np.isfinite(p3) and 0.0 <= p3 <= 0.5) else 0.0
 
     dump_penalty = _short_incident_dump_penalty(sig)
     vol_shock_penalty = _short_incident_vol_shock_penalty(sig)
@@ -7502,8 +7510,8 @@ def calc_quality_score(sig: Dict[str, Any]) -> float:
     qs = (
         (p1 * 0.20) +
         (other_score * 0.30) +
-        (p3 * 0.20) +
-        (btcstr * 0.05) +
+        (p3_term) +
+        (btcstr_term) +
         (rsi_zone_bonus * 0.15) +
         (volconf * 0.20) +
         (p3_flat_bonus) +
@@ -7554,8 +7562,11 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         sig["short_repeat_last_dt"] = str(repeat_last_dt or "")
         sig["short_repeat_penalty"] = float(repeat_penalty)
 
-        base_rule_qs = float(sig.get("rule_qs", 0.0) or 0.0)
-        return float(base_rule_qs - repeat_penalty)
+        raw_rule_qs = _safe_float_or_nan(sig.get("rule_qs"))
+        if not np.isfinite(raw_rule_qs):
+            # QS評価不能（core欠損等）の候補はタイブレークで最下位へ（fail-closed）。
+            return float("-inf")
+        return float(raw_rule_qs - repeat_penalty)
 
     ranked = sorted(
         short_signals,
@@ -9256,6 +9267,25 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             qs = calc_quality_score(sig)
             t_after_score = time.time()
     
+            if not np.isfinite(qs):
+                sig["ai_prob_win"] = ""
+                sig["ai_pass"] = "0"
+                sig["ai_band"] = "REJECTED"
+                sig["ai_model_version"] = "QS_v1"
+                sig["ai_model_type"] = "SHORT_RULE_RANK"
+                sig["ai_note"] = "REJECTED:missing_qs_feature"
+                output.append(sig)
+                print(f"[V2-SELECT-REJECT] sym={sig.get('symbol')} side=SHORT reason=missing_qs_feature")
+                _timlog(
+                    f"[TIMER] v2_selection_pipeline short_one "
+                    f"i={i} symbol={sig.get('symbol','')} "
+                    f"filter_sec={t_after_filter - one_start:.2f} "
+                    f"score_sec={t_after_score - t_after_filter:.2f} "
+                    f"total_sec={t_after_score - one_start:.2f} "
+                    f"passed=0"
+                )
+                continue
+
             if qs < V2_SHORT_QS_MIN:
                 sig["ai_prob_win"] = round(qs, 6)
                 sig["ai_pass"] = "0"
