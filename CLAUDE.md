@@ -577,11 +577,19 @@ V2_SHORT_PAUSE_AI_RESCUE_MIN 変更
 **進行順序：**
 ```
 1. SHORT live通知OFF維持
-2. LONG_E をまだ止めていないなら停止（要確認）
+2. LONG_E 停止【実施済み 2026-06-12】（V2_FEATURE_PROFILE_LONG_E=side=LONG;rsi_min=101）
 3. 最新EntryRecord再取得（6/12全日＋6/13以降、最新DONE日時を確認）
 4. 上記5項目を新データで確認
 5. 良ければ Step 3A としてオフライン再学習・shadow比較
 6. upload=1 / hot_reload=1 / live通知ON はまだしない
+```
+
+**LONG_E停止後の固定観察ルール（2026-06-12開始）：**
+```
+- 観察期間: 原則7日間、他のprofile・ENV・閾値は一切触らない
+- 例外（即見直し）: 実通知8件以上 かつ WR35%未満 かつ 平均PnL大幅マイナスが複数日継続した場合のみ
+- 毎回確認: Bot全体の通知件数/日（1件/日を下回ったらprofile議論よりシステム横断分析を優先）
+- 確認項目: long_eがnotify_sent=1から消えたか / LONG全体avgPnL・medPnL改善 / LONG_F単独の件数・WR / zero_days
 ```
 
 **注意：** 同一ファイルの再アップロードに注意。分析前にMD5/サイズ/最新DONE日時で「新しいデータか」を必ず確認する（2026-06-12にバイト同一ファイルを2回分析した実例あり）。
