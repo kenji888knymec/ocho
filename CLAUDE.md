@@ -524,6 +524,70 @@ bot本体・環境変数・通知設定への変更は一切なし
 
 ---
 
+### 【2026-06-12 合意】現モデルの診断確定と Step 3A 方針
+
+**6/2〜6/12の11日・12,068行（SHORT DONE w/ regime）の分析で以下を確定扱いとする：**
+
+```
+現SHORTモデル（AI_Prob_Win）は逆方向に機能している。
+- Walk-forward AUC 平均 0.376（6/11=0.114、6/12=0.097）
+- Top20% WR 57.4% < Bottom80% WR 69.7%（逆転）
+→ SHORT live通知を戻してはいけない
+→ 現 AI_Prob_Win / SHORT_AI_RANK を信用してはいけない
+```
+
+**G2ゲート（ルール型危険日ゲート）が現時点の主役候補：**
+```
+G2条件: BTC_EMA_Slope_1h > -0.002 AND BTC_4h_Ret > -0.005 AND BTC_Vol_1h < 0.0025 → BLOCK
+実績: PASSED WR=57.7%/+0.429 vs BLOCKED WR=40.0%/-0.023（baseline 54.6%/+0.351）
+限界: 6/7は599件ブロック成功（block WR 8%）だが、6/8型はpass側が素通り（WR 6%）で防げない
+→ AI再学習そのものより、G2のような危険日ゲートを先に評価する
+```
+
+**次の最新EntryRecord（6/12全日＋6/13以降）で確認する5項目：**
+```
+1. 新規日でも Walk-forward AUC 逆転（<0.5）が続くか
+2. G2 gate が PASSED > BLOCKED を維持するか
+3. 危険日に G2 で pass 件数が減るか
+4. G2 + Top20% が Bottom / Rejected より良いか
+5. selected=true の WR / avgPnL が実運用可能水準か
+```
+
+**Step 3 は「Step 3A（オフライン/branch限定）」に分割する。本番実装と混ぜない：**
+
+OKなもの（Step 3A）:
+```
+ローカル/branchで検証
+/train_v2_short?upload=0&hot_reload=0
+G2ゲートのオフライン評価
+regime4列＋変化量特徴量の検証
+現モデル vs 新モデル vs G2 の比較
+```
+
+まだNGなもの（明示禁止）:
+```
+本番Cloud Runへpushして推論経路を変える
+upload=1
+hot_reload=1
+SHORT live通知ON
+V2_SHORT_RANK_TOP_N 変更
+V2_SHORT_PAUSE_AI_RESCUE_MIN 変更
+```
+
+**進行順序：**
+```
+1. SHORT live通知OFF維持
+2. LONG_E をまだ止めていないなら停止（要確認）
+3. 最新EntryRecord再取得（6/12全日＋6/13以降、最新DONE日時を確認）
+4. 上記5項目を新データで確認
+5. 良ければ Step 3A としてオフライン再学習・shadow比較
+6. upload=1 / hot_reload=1 / live通知ON はまだしない
+```
+
+**注意：** 同一ファイルの再アップロードに注意。分析前にMD5/サイズ/最新DONE日時で「新しいデータか」を必ず確認する（2026-06-12にバイト同一ファイルを2回分析した実例あり）。
+
+---
+
 ### このフレーム切り替えを忘れないために
 
 次セッションで「ランキング改善」「AUCが上がったので再学習」のフレームに戻りそうになったら、この節を再読すること。
