@@ -5035,6 +5035,15 @@ V2_BTC_CONFLICT_STRONG_TH  = _env_float("V2_BTC_CONFLICT_STRONG_TH", 0.8)
 V2_TP_MULT_FIXED           = _env_float("V2_TP_MULT_FIXED", 2.0)
 V2_TP_SCORE_DEPENDENT      = str(os.environ.get("V2_TP_SCORE_DEPENDENT", "0")).strip().lower() in ("1", "true", "yes", "on")
 
+# --- P0: Net PnL計測 / G2危険日ゲート仮想評価 / Daily cap仮想評価 ---
+# これらはBotの通知挙動を変えない。計測とshadow記録のみ。
+V2_COST_BPS           = _env_float("V2_COST_BPS", 15.0)        # 往復想定コスト（bps）
+V2_G2_SLOPE_TH        = _env_float("V2_G2_SLOPE_TH", -0.002)   # G2: BTC_EMA_Slope_1hの閾値
+V2_G2_RET4H_TH        = _env_float("V2_G2_RET4H_TH", -0.005)   # G2: BTC_4h_Retの閾値
+V2_G2_VOL1H_TH        = _env_float("V2_G2_VOL1H_TH", 0.0025)   # G2: BTC_Vol_1hの閾値
+V2_DAILY_CAP_SHORT_WB = int(float(os.environ.get("V2_DAILY_CAP_SHORT_WB", "3")))  # SHORT日次上限仮想値
+V2_DAILY_CAP_LONG_WB  = int(float(os.environ.get("V2_DAILY_CAP_LONG_WB",  "3")))  # LONG日次上限仮想値
+
 # --- 合計スコア ---
 V2_MIN_SCORE                    = _env_float("V2_MIN_SCORE", 1.3)
 V2_JUDGE_MAX_BARS               = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
@@ -5467,6 +5476,12 @@ V2_HEADERS = [
     "Feature_Force_Hits", "Feature_Bypass_Profile",
     # Regime特徴量（末尾追加: 既存列のindexを動かさないため。AI学習用 - BTC地合い判定）
     "BTC_EMA_Slope_1h", "BTC_4h_Ret", "BTC_Vol_1h", "BTC_Down_Streak",
+    # P0: Net PnL評価（PnL_Gross/PnL_Net は judge が後から埋める。Cost_Bps は生成時に書く）
+    "PnL_Gross", "PnL_Net", "Cost_Bps",
+    # P0: G2危険日ゲート仮想評価（signal生成時に記録。実通知は変えない）
+    "G2_Gate",
+    # P0: Daily cap 仮想評価（signal生成時に記録。実通知は変えない）
+    "DailyCap_WouldBlock",
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -9747,6 +9762,37 @@ def v2_selection_pipeline(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 # V2 Shadow シートへの書き込み
 # ==========================================
 
+def _compute_g2_gate(sig: Dict[str, Any]) -> str:
+    """G2危険日ゲートの仮想評価。実通知は変えない（would_blockとしてshadowに記録するのみ）。
+    条件: slope > V2_G2_SLOPE_TH AND 4h_ret > V2_G2_RET4H_TH AND vol1h < V2_G2_VOL1H_TH → BLOCK。
+    regime特徴量が欠損の場合は "" を返す（欠損を補完しない）。"""
+    slope = _safe_float_or_nan(sig.get("btc_ema_slope_1h"))
+    ret4h = _safe_float_or_nan(sig.get("btc_4h_ret"))
+    vol1h = _safe_float_or_nan(sig.get("btc_vol_1h"))
+    if not (np.isfinite(slope) and np.isfinite(ret4h) and np.isfinite(vol1h)):
+        return ""
+    if slope > V2_G2_SLOPE_TH and ret4h > V2_G2_RET4H_TH and vol1h < V2_G2_VOL1H_TH:
+        return "BLOCK"
+    return "PASS"
+
+
+def _compute_daily_cap_would_block(sig: Dict[str, Any]) -> str:
+    """Daily cap 仮想評価。ai_note 内の rank=X からバッチ内順位を読み、
+    上限（V2_DAILY_CAP_SHORT_WB / V2_DAILY_CAP_LONG_WB）を超えるなら "1"、以内なら "0"。
+    rank情報がない場合は "" を返す。実通知は変えない。"""
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    cap = V2_DAILY_CAP_SHORT_WB if direction == "SHORT" else V2_DAILY_CAP_LONG_WB
+    note = str(sig.get("ai_note", "") or "")
+    m = re.search(r"rank=(\d+)", note)
+    if not m:
+        return ""
+    try:
+        rank = int(m.group(1))
+    except (ValueError, TypeError):
+        return ""
+    return "1" if rank > cap else "0"
+
+
 def v2_build_shadow_row(sig: Dict) -> List[Any]:
     """
     V2専用ヘッダーの行を構築。
@@ -9815,6 +9861,12 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         _safe_float_or_nan(sig.get("btc_4h_ret")) if np.isfinite(_safe_float_or_nan(sig.get("btc_4h_ret"))) else "",
         _safe_float_or_nan(sig.get("btc_vol_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_vol_1h"))) else "",
         _safe_float_or_nan(sig.get("btc_down_streak")) if np.isfinite(_safe_float_or_nan(sig.get("btc_down_streak"))) else "",
+        # P0: PnL_Gross / PnL_Net は judge が後から埋める。Cost_Bps だけ今書く
+        "", "", float(V2_COST_BPS),
+        # P0: G2 gate仮想評価（regime特徴量が揃っていれば PASS/BLOCK、欠損なら空）
+        _compute_g2_gate(sig),
+        # P0: Daily cap 仮想評価（ai_note の rank= から読む）
+        _compute_daily_cap_would_block(sig),
     ]
 
 
@@ -16470,6 +16522,10 @@ def judge_v2_sheet(
     col_pnl = _resolve_col_idx(hm, "PnL_Pct")
     col_winlose = _resolve_col_idx(hm, "WinLose")
     col_holdmin = _resolve_col_idx(hm, "HoldMin")
+    # P0: Net PnL列（新規列。-1でも既存行が壊れない）
+    col_pnl_gross = _resolve_col_idx(hm, "PnL_Gross")
+    col_pnl_net   = _resolve_col_idx(hm, "PnL_Net")
+    col_cost_bps  = _resolve_col_idx(hm, "Cost_Bps")
 
     must = [
         col_symbol, col_time, col_entry, col_dir, col_tp, col_sl,
@@ -16741,6 +16797,12 @@ def judge_v2_sheet(
         put_one(sheet_row_idx, col_pnl, pnl_pct)
         put_one(sheet_row_idx, col_winlose, res_win)
         put_one(sheet_row_idx, col_holdmin, hold_min)
+        # P0: DONE時のみ PnL_Gross / PnL_Net / Cost_Bps を書く（既存行は col=-1 で空振り）
+        if res_status == "DONE" and pnl_pct != "":
+            _cost_frac = float(V2_COST_BPS) / 100.0
+            put_one(sheet_row_idx, col_pnl_gross, float(pnl_pct))
+            put_one(sheet_row_idx, col_pnl_net, round(float(pnl_pct) - _cost_frac, 6))
+            put_one(sheet_row_idx, col_cost_bps, float(V2_COST_BPS))
 
         judged += 1
         time.sleep(0.12)
