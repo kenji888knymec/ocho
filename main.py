@@ -1615,6 +1615,10 @@ def _profile_sig_value(sig: Dict[str, Any], key: str):
         if s in ("0", "false", "no", "off"):
             return 0.0
         return np.nan
+    if k == "btc_htf_dir":
+        return str(sig.get("btc_htf_dir", "") or "").strip().upper()
+    if k == "btc_htf_strength":
+        return _safe_float_or_nan(sig.get("btc_htf_strength"))
     sig["_feature_unknown_keys"] = list(
         sorted(set((sig.get("_feature_unknown_keys", []) or []) + [k]))
     )
@@ -1693,8 +1697,13 @@ def _match_feature_profile(sig: Dict[str, Any], profile_name: str) -> bool:
                 return False
             continue
 
+        if k == "btc_htf_dir":
+            if str(actual or "").strip().upper() != exp.upper():
+                return False
+            continue
+
     # numeric range match
-    for base in ("p1", "p2", "p3", "rsi", "volratio", "ai", "hour", "bandwidth", "bw_change", "vol_change", "btc_ret", "btc_vol"):
+    for base in ("p1", "p2", "p3", "rsi", "volratio", "ai", "hour", "bandwidth", "bw_change", "vol_change", "btc_ret", "btc_vol", "btc_htf_strength"):
         min_v = spec.get(f"{base}_min", "")
         max_v = spec.get(f"{base}_max", "")
         if str(min_v).strip() == "" and str(max_v).strip() == "":
@@ -5078,6 +5087,7 @@ V2_SHORT_DEF_REQUIRE_VOLCONF    = str(os.environ.get("V2_SHORT_DEF_REQUIRE_VOLCO
 
 V2_SHORT_RANK_ENABLE            = str(os.environ.get("V2_SHORT_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_RANK_TOP_N             = int(float(os.environ.get("V2_SHORT_RANK_TOP_N", "2")))
+V2_SHORT_BYPASS_RANK_TOP_N      = int(float(os.environ.get("V2_SHORT_BYPASS_RANK_TOP_N", "3")))
 V2_SHORT_QS_MIN                 = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 
 V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
@@ -7617,8 +7627,57 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         return ranked
 
     slot_total = len(ranked)
+    bypass_cap = max(0, int(V2_SHORT_BYPASS_RANK_TOP_N))
 
-    for rank_idx, sig in enumerate(ranked, start=1):
+    # Bypass signals: sorted by rule_qs only (independent of inverted AI model)
+    bypass_sorted = sorted(
+        [s for s in ranked if str(s.get("_feature_bypass", "")) == "1"],
+        key=lambda x: _short_rank_score(x),
+        reverse=True,
+    )
+    non_bypass = [s for s in ranked if str(s.get("_feature_bypass", "")) != "1"]
+
+    for bp_idx, sig in enumerate(bypass_sorted, start=1):
+        current_note = str(sig.get("ai_note", "") or "")
+        rank_score = _short_rank_score(sig)
+
+        if brake_mode == "STOP":
+            sig["ai_pass"] = "0"
+            sig["ai_band"] = "BRAKE_STOP_OBSERVE"
+            sig["ai_note"] = (
+                f"{current_note};bypass_rank={bp_idx};slot_total={slot_total};"
+                f"bypass_cap={bypass_cap};selected=false;brake_mode=STOP;observe_only=true;"
+                f"rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
+            )
+            continue
+
+        if bp_idx <= bypass_cap:
+            sig["ai_pass"] = "1"
+            sig["ai_band"] = _v2_rank_selected_band(sig)
+            sig["ai_note"] = (
+                f"{current_note};bypass_rank={bp_idx};slot_total={slot_total};"
+                f"bypass_cap={bypass_cap};selected=true;brake_mode={brake_mode};"
+                f"rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
+            )
+        else:
+            sig["ai_pass"] = "0"
+            sig["ai_band"] = _v2_rank_reject_band(sig)
+            sig["ai_note"] = (
+                f"{current_note};bypass_rank={bp_idx};slot_total={slot_total};"
+                f"bypass_cap={bypass_cap};selected=false;reason=bypass_cap_exceeded;brake_mode={brake_mode};"
+                f"rank_score={rank_score:.6f};"
+                f"repeat_recent_n={int(sig.get('short_repeat_recent_n', 0) or 0)};"
+                f"repeat_penalty={float(sig.get('short_repeat_penalty', 0.0) or 0.0):.6f};"
+                f"repeat_last_dt={str(sig.get('short_repeat_last_dt', '') or '')}"
+            )
+
+    for rank_idx, sig in enumerate(non_bypass, start=1):
         current_note = str(sig.get("ai_note", "") or "")
         rank_score = _short_rank_score(sig)
 
@@ -7670,7 +7729,7 @@ def rank_and_select(short_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             )
 
     _rstm("annotate_done")
-    return ranked
+    return bypass_sorted + non_bypass
 
 
 def _allow_long_p1_rescue(sig: Dict[str, Any]) -> bool:
