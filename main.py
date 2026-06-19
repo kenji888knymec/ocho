@@ -5290,6 +5290,12 @@ V2_SHORT_AI_NOTIFY_BLOCK_LANES: set = {
 # BTC_HTF_Dir=SHORT のみ WR54%/+70 だったため、逆張りSHORTを避ける地合いガード。
 V2_SHORT_AI_REQUIRE_BTC_HTF_DIR = str(os.environ.get("V2_SHORT_AI_REQUIRE_BTC_HTF_DIR", "")).strip().upper()
 
+# SHORT feature bypass 専用安全スイッチ（V2_SHORT_AI_NOTIFY_ENABLE とは別管理）。
+# default=0: SHORT feature bypass 候補は実送信候補に入らない。
+# 1 のときだけ SHORT feature bypass（short_a/b/c等）からの実通知を許可する。
+# LONG_E/F などの LONG bypass には影響しない。
+V2_SHORT_FEATURE_NOTIFY_ENABLE = str(os.environ.get("V2_SHORT_FEATURE_NOTIFY_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
+
 # --- V2 Trainer ---
 V2_CLASSIFIER_TYPE                 = str(os.environ.get("V2_CLASSIFIER_TYPE", "HGB")).strip().upper()
 # --- V2 SHORT Brake / Recovery ---
@@ -13329,6 +13335,17 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                         continue
 
                 guard_reason = _v2_feature_live_guard_reason(x)
+
+                # SHORT feature bypass 専用安全スイッチ: V2_SHORT_FEATURE_NOTIFY_ENABLE=0 のとき
+                # SHORT bypass 候補は実送信候補に入れない（LONG bypass は影響なし）。
+                if is_short_bypass and not V2_SHORT_FEATURE_NOTIFY_ENABLE:
+                    feature_guard_blocked_n += 1
+                    x["_notify_pass"] = "0"
+                    x["_notify_reason"] = "short_feature_notify_disabled"
+                    cur_note = str(x.get("ai_note", "") or "")
+                    add_note = "notify_sent=0;notify_send_reason=short_feature_notify_disabled"
+                    x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                    continue
 
                 if guard_reason == "":
                     x["_notify_pass"] = "1"
