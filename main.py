@@ -5088,6 +5088,9 @@ V2_SHORT_DEF_REQUIRE_VOLCONF    = str(os.environ.get("V2_SHORT_DEF_REQUIRE_VOLCO
 V2_SHORT_RANK_ENABLE            = str(os.environ.get("V2_SHORT_RANK_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_SHORT_RANK_TOP_N             = int(float(os.environ.get("V2_SHORT_RANK_TOP_N", "2")))
 V2_SHORT_BYPASS_RANK_TOP_N      = int(float(os.environ.get("V2_SHORT_BYPASS_RANK_TOP_N", "3")))
+V2_SHORT_DAILY_NOTIFY_CAP       = int(float(os.environ.get("V2_SHORT_DAILY_NOTIFY_CAP", "999")))
+V2_SHORT_DAILY_NET_LOSS_STOP    = _env_float("V2_SHORT_DAILY_NET_LOSS_STOP", float("-inf"))
+V2_SHORT_CUM_NET_LOSS_STOP      = _env_float("V2_SHORT_CUM_NET_LOSS_STOP", float("-inf"))
 V2_SHORT_QS_MIN                 = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 
 V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
@@ -11398,6 +11401,83 @@ def get_v2_short_brake_state(now_jst: Optional[datetime] = None) -> Dict[str, An
         }
 
 
+def get_v2_short_bypass_daily_state(now_jst: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    今日（JST日付）の SHORT bypass 通知実績を返す。
+    daily_count: 今日 notify_sent=1 の bypass SHORT 件数
+    daily_pnl_net: 今日 DONE の bypass SHORT PnL_Net 合計（未DONE分は含まない）
+    cum_pnl_net: 全期間 DONE の bypass SHORT PnL_Net 合計
+    値が取れない場合は float("nan") を返す（欠損補完なし）。
+    """
+    cache_key = "v2_short_bypass_daily_state"
+    now_ts = time.time()
+    _cached = _repeat_state_cache.get(cache_key, {})
+    if _cached and (now_ts - float(_cached.get("ts", 0.0))) <= V2_BRAKE_STATE_TTL_SEC:
+        return dict(_cached.get("v", {}))
+
+    default: Dict[str, Any] = {
+        "daily_count": 0,
+        "daily_pnl_net": float("nan"),
+        "cum_pnl_net": float("nan"),
+    }
+    if now_jst is None:
+        now_jst = datetime.now(JST)
+    today_str = now_jst.strftime("%Y-%m-%d")
+
+    try:
+        df = get_v2_shadow_ai_recent_data_for_repeat()
+        if df is None or df.empty:
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "v": dict(default)}
+            return dict(default)
+
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # bypass SHORT notify_sent=1: Notify_Pass="1" + Direction=SHORT + Feature_Bypass_Profile非空
+        bypass_sent_mask = (
+            (df.get("Notify_Pass", pd.Series(dtype=str)).astype(str).str.strip() == "1")
+            & (df.get("Direction", pd.Series(dtype=str)).astype(str).str.strip().str.upper() == "SHORT")
+            & (df.get("Feature_Bypass_Profile", pd.Series(dtype=str)).astype(str).str.strip() != "")
+            & (df.get("Feature_Bypass_Profile", pd.Series(dtype=str)).notna())
+        )
+        bypass_sent = df[bypass_sent_mask].copy()
+
+        if bypass_sent.empty:
+            _repeat_state_cache[cache_key] = {"ts": now_ts, "v": dict(default)}
+            return dict(default)
+
+        bypass_sent["_dt"] = pd.to_datetime(bypass_sent["Datetime_JST"], errors="coerce")
+        today_mask = bypass_sent["_dt"].dt.strftime("%Y-%m-%d") == today_str
+        daily_count = int(today_mask.sum())
+
+        # PnL_Net: DONE のみ（欠損は np.nan のまま sum に含めない）
+        done_mask = bypass_sent["EvalStatus"].astype(str).str.upper() == "DONE"
+        bypass_done = bypass_sent[done_mask].copy()
+        bypass_done["_pnl_net"] = pd.to_numeric(bypass_done["PnL_Net"], errors="coerce")
+
+        today_done = bypass_done[bypass_done["_dt"].dt.strftime("%Y-%m-%d") == today_str]
+        if today_done["_pnl_net"].notna().any():
+            daily_pnl_net = float(today_done["_pnl_net"].sum(min_count=1))
+        else:
+            daily_pnl_net = float("nan")
+
+        if bypass_done["_pnl_net"].notna().any():
+            cum_pnl_net = float(bypass_done["_pnl_net"].sum(min_count=1))
+        else:
+            cum_pnl_net = float("nan")
+
+        result: Dict[str, Any] = {
+            "daily_count": daily_count,
+            "daily_pnl_net": daily_pnl_net,
+            "cum_pnl_net": cum_pnl_net,
+        }
+        _repeat_state_cache[cache_key] = {"ts": now_ts, "v": dict(result)}
+        return result
+    except Exception as e:
+        print(f"[V2-SHORT-BYPASS-DAILY-WARN] {type(e).__name__}: {e}")
+        _repeat_state_cache[cache_key] = {"ts": now_ts, "v": dict(default)}
+        return dict(default)
+
+
 def _prepare_v2_long_done_for_brake(df: pd.DataFrame) -> pd.DataFrame:
     """
     v2_shadow_ai 全件から、LONG / DONE のうち
@@ -13108,15 +13188,62 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
         feature_guard_blocked_n = 0
         short_ai_candidates_n = 0
 
+        # Daily cap / loss stop state for SHORT bypass
+        _bypass_daily = get_v2_short_bypass_daily_state(datetime.now(JST))
+        _daily_short_bypass_count = int(_bypass_daily.get("daily_count", 0))
+        _daily_short_bypass_pnl = float(_bypass_daily.get("daily_pnl_net", float("nan")))
+        _cum_short_bypass_pnl = float(_bypass_daily.get("cum_pnl_net", float("nan")))
+        _in_scan_short_bypass_n = 0  # this scan の bypass SHORT 通過数
+
         for x in final_signals:
             is_feature_hit = str(x.get("_feature_bypass", "0")) == "1"
 
             if is_feature_hit:
+                is_short_bypass = str(x.get("direction", "")).strip().upper() == "SHORT"
+
+                # Daily cap / loss stop チェック（SHORT bypass のみ）
+                if is_short_bypass:
+                    _cap_block_reason = ""
+                    _total_today = _daily_short_bypass_count + _in_scan_short_bypass_n
+                    if _total_today >= V2_SHORT_DAILY_NOTIFY_CAP:
+                        _cap_block_reason = "daily_cap_blocked"
+                    elif np.isfinite(_daily_short_bypass_pnl) and _daily_short_bypass_pnl < V2_SHORT_DAILY_NET_LOSS_STOP:
+                        _cap_block_reason = "daily_loss_stop_triggered"
+                    elif np.isfinite(_cum_short_bypass_pnl) and _cum_short_bypass_pnl < V2_SHORT_CUM_NET_LOSS_STOP:
+                        _cap_block_reason = "cum_loss_stop_triggered"
+
+                    if _cap_block_reason:
+                        feature_guard_blocked_n += 1
+                        x["_notify_pass"] = "0"
+                        x["_notify_reason"] = _cap_block_reason
+                        cur_note = str(x.get("ai_note", "") or "")
+                        add_note = (
+                            f"notify_sent=0;"
+                            f"notify_send_reason={_cap_block_reason};"
+                            f"daily_cap={V2_SHORT_DAILY_NOTIFY_CAP};"
+                            f"daily_short_notify_count={_total_today};"
+                            f"daily_cap_remaining={max(0, V2_SHORT_DAILY_NOTIFY_CAP - _total_today)};"
+                            f"daily_net={_daily_short_bypass_pnl if np.isfinite(_daily_short_bypass_pnl) else ''};"
+                            f"cum_net={_cum_short_bypass_pnl if np.isfinite(_cum_short_bypass_pnl) else ''}"
+                        )
+                        x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+                        continue
+
                 guard_reason = _v2_feature_live_guard_reason(x)
 
                 if guard_reason == "":
                     x["_notify_pass"] = "1"
                     x["_notify_reason"] = "feature_profile_only_selected"
+                    if is_short_bypass:
+                        _in_scan_short_bypass_n += 1
+                        _total_after = _daily_short_bypass_count + _in_scan_short_bypass_n
+                        cur_note = str(x.get("ai_note", "") or "")
+                        add_note = (
+                            f"daily_short_notify_count={_total_after};"
+                            f"daily_cap={V2_SHORT_DAILY_NOTIFY_CAP};"
+                            f"daily_cap_remaining={max(0, V2_SHORT_DAILY_NOTIFY_CAP - _total_after)}"
+                        )
+                        x["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
                     feature_only_candidates.append(x)
                 else:
                     feature_guard_blocked_n += 1
