@@ -5495,6 +5495,10 @@ V2_HEADERS = [
     "G2_Gate",
     # P0: Daily cap 仮想評価（signal生成時に記録。実通知は変えない）
     "DailyCap_WouldBlock",
+    # P1: 反転系特徴量（shadow記録のみ。将来の危険日ゲート検証用。実通知には使わない）
+    "BTC_RSI_15m",
+    "BTC_Rebound_From_Low_1h",
+    "BTC_HTF_Green_Candle_Flag",
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -9929,6 +9933,10 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         _compute_g2_gate(sig),
         # P0: Daily cap 仮想評価（ai_note の rank= から読む）
         _compute_daily_cap_would_block(sig),
+        # P1: 反転系特徴量（shadow記録のみ。NaNは空文字）
+        _safe_float_or_nan(sig.get("btc_rsi_15m")) if np.isfinite(_safe_float_or_nan(sig.get("btc_rsi_15m"))) else "",
+        _safe_float_or_nan(sig.get("btc_rebound_from_low_1h")) if np.isfinite(_safe_float_or_nan(sig.get("btc_rebound_from_low_1h"))) else "",
+        _safe_float_or_nan(sig.get("btc_htf_green_candle")) if np.isfinite(_safe_float_or_nan(sig.get("btc_htf_green_candle"))) else "",
     ]
 
 
@@ -12647,6 +12655,40 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     except Exception as _e:
         print(f"[V2-WARN] regime features failed: {_e}")
 
+    # 反転系特徴量（shadow記録のみ。実通知・ランキング・フィルターには一切使わない）
+    btc_rsi_15m = np.nan
+    btc_rebound_from_low_1h = np.nan
+    btc_htf_green_candle = np.nan
+    try:
+        if btc_15m_df is not None and len(btc_15m_df) >= 16:
+            _closes_15m = pd.to_numeric(btc_15m_df["Close"], errors="coerce")
+            _rsi_series = _rsi(_closes_15m, period=14)
+            _rsi_val = _rsi_series.iloc[-2]
+            if np.isfinite(float(_rsi_val)):
+                btc_rsi_15m = float(_rsi_val)
+    except Exception as _e:
+        print(f"[V2-WARN] btc_rsi_15m failed: {_e}")
+    try:
+        if btc_15m_df is not None and len(btc_15m_df) >= 6:
+            _closes_15m = pd.to_numeric(btc_15m_df["Close"], errors="coerce")
+            _lows_15m = pd.to_numeric(btc_15m_df["Low"], errors="coerce")
+            _close_now = float(_closes_15m.iloc[-2])
+            _low_1h = float(_lows_15m.iloc[-5:-1].min())
+            if np.isfinite(_close_now) and np.isfinite(_low_1h) and abs(_close_now) > 1e-9:
+                btc_rebound_from_low_1h = (_close_now - _low_1h) / _close_now
+    except Exception as _e:
+        print(f"[V2-WARN] btc_rebound_from_low_1h failed: {_e}")
+    try:
+        if btc_htf_df is not None and len(btc_htf_df) >= 2:
+            _htf_close = pd.to_numeric(btc_htf_df["Close"], errors="coerce")
+            _htf_open = pd.to_numeric(btc_htf_df["Open"], errors="coerce")
+            _c = float(_htf_close.iloc[-2])
+            _o = float(_htf_open.iloc[-2])
+            if np.isfinite(_c) and np.isfinite(_o):
+                btc_htf_green_candle = 1.0 if _c > _o else 0.0
+    except Exception as _e:
+        print(f"[V2-WARN] btc_htf_green_candle failed: {_e}")
+
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
     short_conflict = bool(regime.get("short_conflict", False))
@@ -12807,6 +12849,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 probe_sig["btc_4h_ret"] = _safe_float_or_nan(btc_4h_ret)
                 probe_sig["btc_vol_1h"] = _safe_float_or_nan(btc_vol_1h)
                 probe_sig["btc_down_streak"] = _safe_float_or_nan(btc_down_streak)
+                probe_sig["btc_rsi_15m"] = _safe_float_or_nan(btc_rsi_15m)
+                probe_sig["btc_rebound_from_low_1h"] = _safe_float_or_nan(btc_rebound_from_low_1h)
+                probe_sig["btc_htf_green_candle"] = _safe_float_or_nan(btc_htf_green_candle)
             except Exception:
                 pass
 
@@ -12873,6 +12918,9 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 sig["btc_4h_ret"] = _safe_float_or_nan(btc_4h_ret)
                 sig["btc_vol_1h"] = _safe_float_or_nan(btc_vol_1h)
                 sig["btc_down_streak"] = _safe_float_or_nan(btc_down_streak)
+                sig["btc_rsi_15m"] = _safe_float_or_nan(btc_rsi_15m)
+                sig["btc_rebound_from_low_1h"] = _safe_float_or_nan(btc_rebound_from_low_1h)
+                sig["btc_htf_green_candle"] = _safe_float_or_nan(btc_htf_green_candle)
 
                 raw_signals.append(sig)
 
