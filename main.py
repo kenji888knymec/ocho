@@ -5091,6 +5091,9 @@ V2_SHORT_BYPASS_RANK_TOP_N      = int(float(os.environ.get("V2_SHORT_BYPASS_RANK
 V2_SHORT_DAILY_NOTIFY_CAP       = int(float(os.environ.get("V2_SHORT_DAILY_NOTIFY_CAP", "999")))
 V2_SHORT_DAILY_NET_LOSS_STOP    = _env_float("V2_SHORT_DAILY_NET_LOSS_STOP", float("-inf"))
 V2_SHORT_CUM_NET_LOSS_STOP      = _env_float("V2_SHORT_CUM_NET_LOSS_STOP", float("-inf"))
+# P2: 逆張りLONG flip shadow（shadow記録のみ。実通知・Discord送信なし）
+V2_FLIP_SHADOW_ENABLE           = str(os.environ.get("V2_FLIP_SHADOW_ENABLE", "0")).strip() in ("1", "true", "yes")
+V2_FLIP_SHADOW_TOP_N_PER_SCAN   = int(float(os.environ.get("V2_FLIP_SHADOW_TOP_N_PER_SCAN", "3")))
 V2_SHORT_QS_MIN                 = _env_float("V2_SHORT_QS_MIN", float("-inf"))
 
 V2_SHORT_RSI_SWEET_MIN          = _env_float("V2_SHORT_RSI_SWEET_MIN", 40.0)
@@ -9940,6 +9943,54 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
     ]
 
 
+def v2_build_flip_shadow_row(sig: Dict) -> Optional[List[Any]]:
+    """
+    SHORT信号を逆張りLONG仮想エントリーに変換してshadow行を構築。
+    Direction=LONG_FLIP で書く（judge_v2_sheet は "SHORT" が含まれなければLONG評価）。
+    notify_sent=0 固定・daily cap / loss stop 集計外・Discord送信なし。
+    TP/SL は SHORT の SL/TP を裏返した価格水準。
+    """
+    if sig.get("direction", "").upper() != "SHORT":
+        return None
+    entry = sig.get("entry_price")
+    tp_pct = sig.get("tp_pct")
+    sl_pct = sig.get("sl_pct")
+    if entry is None or tp_pct is None or sl_pct is None:
+        return None
+    entry_f = float(entry)
+    if entry_f <= 0:
+        return None
+    tp_pct_f = float(tp_pct)
+    sl_pct_f = float(sl_pct)
+    if not (np.isfinite(tp_pct_f) and np.isfinite(sl_pct_f)):
+        return None
+    # 逆張りLONGのTP/SL:
+    #   SHORTのSL（価格上昇）→ LONGのTP（同じ幅で上昇したら勝ち）
+    #   SHORTのTP（価格下落）→ LONGのSL（同じ幅で下落したら負け）
+    flip_tp_price = entry_f * (1.0 + sl_pct_f / 100.0)
+    flip_sl_price = entry_f * (1.0 - tp_pct_f / 100.0)
+    flip_sig = dict(sig)
+    flip_sig["direction"] = "LONG_FLIP"
+    flip_sig["tp"] = flip_tp_price
+    flip_sig["sl"] = flip_sl_price
+    flip_sig["tp_pct"] = sl_pct_f
+    flip_sig["sl_pct"] = tp_pct_f
+    flip_sig["ai_note"] = (
+        f"flip_shadow=1;source_direction=SHORT;test_direction=LONG;notify_sent=0;"
+        f"source_total_score={float(sig.get('total_score', float('nan'))):.4f}"
+    )
+    flip_sig["v2_version"] = "V2-FlipShadow"
+    flip_sig["note"] = "short_flip_shadow"
+    flip_sig["_notify_pass"] = "0"
+    flip_sig["_notify_reason"] = "flip_shadow_only"
+    flip_sig["_notify_sent"] = "0"
+    flip_sig["_runtime_lane"] = "flip_shadow"
+    flip_sig["_lane_profile"] = "short_flip_shadow"
+    flip_sig["_lane_profile_stage"] = "shadow"
+    flip_sig["_lane_profile_notify"] = "0"
+    return v2_build_shadow_row(flip_sig)
+
+
 def v2_ensure_shadow_sheet(svc, spreadsheet_id: str):
     """v2_shadow シートが無ければ作成し、ヘッダーを書く。"""
     ensure_sheet_exists(V2_SHADOW_SHEET, min_rows=5000, min_cols=len(V2_HEADERS) + 5)
@@ -13421,6 +13472,24 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     # 重要: 送信結果を ai_note に反映したあとで書く
     if V2_SHADOW_WRITE_ENABLE:
         rows = [v2_build_shadow_row(sig) for sig in final_signals]
+        # P2: 逆張りLONG flip shadow行を追加（V2_FLIP_SHADOW_ENABLE=1 のとき）
+        # SHORT信号をTotalScore上位N件に絞り、LONG_FLIPとして仮想エントリーを記録する。
+        # notify_sent=0固定・実通知なし・daily cap集計外。judge_v2_sheetが通常通り評価する。
+        if V2_FLIP_SHADOW_ENABLE:
+            short_sigs = [s for s in final_signals if s.get("direction", "").upper() == "SHORT"]
+            short_sigs_sorted = sorted(
+                short_sigs,
+                key=lambda s: float(s.get("total_score", float("-inf"))),
+                reverse=True,
+            )
+            flip_rows = []
+            for s in short_sigs_sorted[:V2_FLIP_SHADOW_TOP_N_PER_SCAN]:
+                fr = v2_build_flip_shadow_row(s)
+                if fr is not None:
+                    flip_rows.append(fr)
+            if flip_rows:
+                print(f"[V2-FLIP] flip_shadow rows={len(flip_rows)} (short_pool={len(short_sigs)})")
+            rows = rows + flip_rows
         v2_write_shadow_rows(rows)
     else:
         print("[V2] shadow write skipped by V2_SHADOW_WRITE_ENABLE=0")
