@@ -810,3 +810,55 @@ ENV（新規・shadow専用スイッチ。実通知に無影響）:
 ### 次のステップ
 - デプロイ後、前向きに溜まったrv_chg shadow列で long_f の rv_chg<5% 優位が継続するかを観察
 - 継続確認できても gate化はGO条件（leave-one-week-out / 閾値安定 / 方向別）を満たすまで行わない
+
+---
+
+## 【2026-06-20 rv_chg shadow 配線確認合格】前向き観察フェーズ開始
+
+**確認内容（1タイミング分・勝敗判断ではなく配線確認）：**
+
+```
+BTC_RV_Chg              = -0.003150023466
+BTC_RV_Chg_Bucket       = neg
+RV_Chg_Shadow_Pass      = PASS
+RV_Chg_Shadow_Reason    = rv_chg=-0.0032<0.05
+Directional_RV_Chg_Shadow:
+  LONG行  = PASS
+  SHORT行 = NA_REVERSED
+```
+
+SHORT行の確認：
+```
+Short_Danger_Gate_Shadow = BLOCK
+Directional_RV_Chg_Shadow = NA_REVERSED
+notify_sent=0 / short_ai_notify_enable=0
+```
+
+**判定：**
+
+| 確認項目 | 結果 |
+|---|---|
+| rv_chg列の記録 | ✅ OK |
+| 値の計算 | ✅ OK（neg=ボラ平穏、as-of） |
+| LONG側: Directional = PASS/BLOCK | ✅ OK |
+| SHORT側: Directional = NA_REVERSED | ✅ OK（共通ゲート誤適用なし） |
+| SHORT通知停止の継続 | ✅ OK（notify_sent=0継続） |
+
+**現在の観察ルール（変更なし）：**
+
+```
+rv_chg gate化しない
+LONG_Fを止めない
+SHORTを再開しない
+QSを修正しない
+```
+
+**次の確認タイミング：**
+
+| 時期 | 目的 |
+|---|---|
+| 2〜3日後 | 初期確認（記録が継続しているか） |
+| 7日後 | 軽い傾向確認 |
+| 10日/20日/30日後 | 本格判断（leave-one-week-out相当） |
+
+次に EntryRecord を貼るのは2〜3日後。ただし Discord警告・`Output length invalid` 再発時はその時点で即確認。
