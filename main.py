@@ -5111,6 +5111,47 @@ V2_SHORT_DANGER_GATE_SLOPE_CHG1_TH = _env_float("V2_SHORT_DANGER_GATE_SLOPE_CHG1
 V2_RV_CHG_SHADOW_ENABLE = str(os.environ.get("V2_RV_CHG_SHADOW_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_RV_CHG_SHADOW_TH     = _env_float("V2_RV_CHG_SHADOW_TH", 0.05)   # ボラ急増比の閾値（これ以上=急増→LONG側はBLOCK扱い）
 
+# --- クロスセクション・モメンタム（市場ニュートラル）shadow（前向き観察用・記録のみ） ---
+# 2026-06-20 発見: 28銘柄を過去7日(168h)リターンでランクし、上位n=LONG/下位n=SHORTを
+#   2日(48h)ごとにリバランスする市場ニュートラル・バスケット。BTC方向に賭けないため暴落非依存。
+#   S4を殺した全検証を通過(train/test両+/leave-one-month全月+/最大DD-4.8%/mom>0>rev一貫)。
+# これは「単発の銘柄通知」ではなく「バスケット1セット」として扱う。実通知・notify_sent・
+#   ランキング・QS・route選別・SHORT再開には一切影響しない。別シート(cs_mom_shadow)に記録のみ。
+# 注意(オフライン診断との差): 本番はランク足の確定closeでバスケットを決め、評価は将来足で行う(as-of)。
+#   funding/スリッページは未モデル(記録のみ・後段の評価で別途加味する)。欠損は補完しない。
+# デフォルトOFF。賢治さんが差分確認後にCloud RunでENを有効化する想定。
+V2_CS_MOM_SHADOW_ENABLE = str(os.environ.get("V2_CS_MOM_SHADOW_ENABLE", "0")).strip().lower() in ("1", "true", "yes", "on")
+V2_CS_MOM_LOOKBACK_H    = int(float(os.environ.get("V2_CS_MOM_LOOKBACK_H", "168")))  # 7日
+V2_CS_MOM_HOLD_H        = int(float(os.environ.get("V2_CS_MOM_HOLD_H", "48")))       # 2日（リバランス間隔）
+V2_CS_MOM_N             = int(float(os.environ.get("V2_CS_MOM_N", "5")))             # 各サイド銘柄数
+V2_CS_MOM_COST_PCT      = _env_float("V2_CS_MOM_COST_PCT", 0.15)                     # 片レッグ往復コスト%
+V2_CS_MOM_SHEET         = os.environ.get("V2_CS_MOM_SHEET", "cs_mom_shadow")
+# ランク母集団から除外する銘柄（カンマ区切り。デフォルト空=全28銘柄。BTC/ETHを除く運用も可）
+V2_CS_MOM_EXCLUDE       = {s.strip().upper() for s in os.environ.get("V2_CS_MOM_EXCLUDE", "").split(",") if s.strip()}
+
+# cs_mom_shadow シートのヘッダ（バスケット1リバランス=1行）
+V2_CS_MOM_HEADERS = [
+    "run_time_jst",          # Cloud Run 実行時刻（JST）
+    "rank_candle_time_jst",  # ランク計算に使った最後の確定1h足timestamp（JST）
+    "lookback_h",           # 168
+    "hold_h",               # 48
+    "n_per_side",           # 5
+    "cost_pct_per_leg",     # 0.15
+    "universe_count",       # ランクに使えた有効銘柄数
+    "long_symbols",         # 上位n（カンマ区切り）
+    "short_symbols",        # 下位n（カンマ区切り）
+    "long_7d_rets",         # 上位nの7日リターン%（カンマ区切り）
+    "short_7d_rets",        # 下位nの7日リターン%
+    "long_ref_prices",      # エントリー参照価格=ランク確定足close（カンマ区切り）
+    "short_ref_prices",
+    "expected_eval_time_jst",  # rank_candle_time + hold_h
+    "eval_status",          # OPEN（評価は後段/オフライン）
+    "long_leg_pnl_net",     # 評価後に埋める（記録時は空）
+    "short_leg_pnl_net",
+    "spread_pnl_net",
+    "note",
+]
+
 # --- 合計スコア ---
 V2_MIN_SCORE                    = _env_float("V2_MIN_SCORE", 1.3)
 V2_JUDGE_MAX_BARS               = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
@@ -12743,6 +12784,157 @@ def call_claude_for_analysis_daily(daily_report_text: str) -> str:
 
 
 # ==========================================
+# クロスセクション・モメンタム shadow（記録のみ・市場ニュートラル・バスケット単位）
+# ==========================================
+
+_CS_MOM_EPOCH_UTC = datetime(2024, 1, 1, 0, 0, 0)  # 固定48hグリッドの基準点（UTC）
+
+
+def _cs_mom_grid_slot(dt_utc: datetime, hold_h: int) -> int:
+    """固定グリッドのスロット番号。epoch起点のhold_h単位で切り捨て。デプロイ時刻に依存しない。"""
+    return int((dt_utc - _CS_MOM_EPOCH_UTC).total_seconds() / (hold_h * 3600))
+
+
+def _cs_mom_last_rebalance_jst() -> Optional[datetime]:
+    """cs_mom_shadow シートの最新 rank_candle_time_jst を返す（なければ None）。
+    固定グリッドスロット判定（列B）に使う。"""
+    try:
+        service = get_sheet_service()
+        res = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{V2_CS_MOM_SHEET}!B2:B",
+        ).execute()
+        rows = res.get("values", []) or []
+        if not rows:
+            return None
+        last = ""
+        for r in rows:
+            if r and str(r[0]).strip():
+                last = str(r[0]).strip()
+        if not last:
+            return None
+        # 記録は "%Y-%m-%d %H:%M:%S"（JST naive）で書く
+        return datetime.strptime(last[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"[CS-MOM] last rebalance read failed: {e}")
+        return None
+
+
+def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> None:
+    """クロスセクション・モメンタムのバスケット選抜を cs_mom_shadow に記録する（記録のみ）。
+    実通知・notify_sent・ランキング・QS・route選別には一切影響しない。
+    as-of厳守: 各銘柄の1h完了足のみで7日リターンを計算（未確定足iloc[-1]を除外）。
+    欠損補完なし: データ不足/欠損の銘柄はランク母集団から除外する。
+    バスケット単位で1行記録（単発の銘柄通知には変換しない）。
+    """
+    if not V2_CS_MOM_SHADOW_ENABLE:
+        return
+    try:
+        L = V2_CS_MOM_LOOKBACK_H
+        H = V2_CS_MOM_HOLD_H
+        n = V2_CS_MOM_N
+        cost = V2_CS_MOM_COST_PCT
+
+        now_naive = now_jst.replace(tzinfo=None) if now_jst.tzinfo else now_jst
+
+        # 各銘柄の as-of 7日リターンと参照価格を集める（欠損は補完せず除外）
+        rets: Dict[str, float] = {}
+        refpx: Dict[str, float] = {}
+        rank_candle_ts_utc: Optional[datetime] = None  # 最初の有効銘柄から取得する確定足UTC時刻
+        for symbol in symbols:
+            base = str(symbol).split("/")[0].strip().upper()
+            if base in V2_CS_MOM_EXCLUDE:
+                continue
+            try:
+                ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="1h", limit=L + 8)
+                if not ohlcv or len(ohlcv) < L + 2:
+                    continue
+                df_ohlcv = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+                closes = pd.to_numeric(df_ohlcv["Close"], errors="coerce").iloc[:-1]  # 未確定足を除外（as-of）
+                if len(closes) < L + 1:
+                    continue
+                c_now = float(closes.iloc[-1])
+                c_past = float(closes.iloc[-1 - L])
+                if not (np.isfinite(c_now) and np.isfinite(c_past)) or abs(c_past) <= 1e-12:
+                    continue
+                rets[base] = (c_now - c_past) / c_past * 100.0
+                refpx[base] = c_now
+                # 最初の有効銘柄から確定足timestamp（Time列のiloc[-2] = 最後の確定1h足）を取得
+                if rank_candle_ts_utc is None:
+                    try:
+                        ts_ms = float(df_ohlcv["Time"].iloc[-2])
+                        rank_candle_ts_utc = datetime.utcfromtimestamp(ts_ms / 1000.0)
+                    except Exception:
+                        pass
+            except Exception as _e:
+                print(f"[CS-MOM] {symbol} fetch/calc skip: {_e}")
+                continue
+
+        # タイムスタンプ取得できなかった場合: now_jstから近似（UTC換算・1h切り捨て）
+        if rank_candle_ts_utc is None:
+            utc_approx = now_naive - timedelta(hours=9)
+            rank_candle_ts_utc = utc_approx.replace(minute=0, second=0, microsecond=0)
+
+        # 固定48hグリッド判定（デプロイ時刻依存しない）
+        cur_slot = _cs_mom_grid_slot(rank_candle_ts_utc, H)
+        last_rb = _cs_mom_last_rebalance_jst()
+        if last_rb is not None:
+            last_rb_utc = last_rb - timedelta(hours=9)  # JST naive → UTC
+            last_slot = _cs_mom_grid_slot(last_rb_utc, H)
+            if cur_slot == last_slot:
+                return  # 同一グリッドスロット内は記録済み
+
+        if len(rets) < 2 * n + 2:
+            print(f"[CS-MOM] universe不足 valid={len(rets)} < {2*n+2}・記録スキップ")
+            return
+
+        ranked = sorted(rets.items(), key=lambda kv: kv[1])  # 弱い順
+        shorts = ranked[:n]          # 下位n=SHORT（弱い銘柄を空売り＝エッジ側）
+        longs = ranked[-n:][::-1]    # 上位n=LONG（強い順に並べる）
+
+        rank_candle_jst = rank_candle_ts_utc + timedelta(hours=9)
+        expected_eval = rank_candle_jst + timedelta(hours=H)
+        row_map = {
+            "run_time_jst": now_naive.strftime("%Y-%m-%d %H:%M:%S"),
+            "rank_candle_time_jst": rank_candle_jst.strftime("%Y-%m-%d %H:%M:%S"),
+            "lookback_h": L,
+            "hold_h": H,
+            "n_per_side": n,
+            "cost_pct_per_leg": cost,
+            "universe_count": len(rets),
+            "long_symbols": ",".join(s for s, _ in longs),
+            "short_symbols": ",".join(s for s, _ in shorts),
+            "long_7d_rets": ",".join(f"{v:.3f}" for _, v in longs),
+            "short_7d_rets": ",".join(f"{v:.3f}" for _, v in shorts),
+            "long_ref_prices": ",".join(f"{refpx[s]:.8g}" for s, _ in longs),
+            "short_ref_prices": ",".join(f"{refpx[s]:.8g}" for s, _ in shorts),
+            "expected_eval_time_jst": expected_eval.strftime("%Y-%m-%d %H:%M:%S"),
+            "eval_status": "OPEN",
+            "long_leg_pnl_net": "",
+            "short_leg_pnl_net": "",
+            "spread_pnl_net": "",
+            "note": "cs_mom_shadow record-only (market-neutral basket)",
+        }
+
+        ensure_sheet_exists(V2_CS_MOM_SHEET, min_rows=2000, min_cols=len(V2_CS_MOM_HEADERS) + 2)
+        cur_hdr = read_header_row(V2_CS_MOM_SHEET)
+        if cur_hdr != V2_CS_MOM_HEADERS:
+            write_header_row(V2_CS_MOM_SHEET, V2_CS_MOM_HEADERS)
+
+        out_row = [row_map.get(h, "") for h in V2_CS_MOM_HEADERS]
+        append_rows_to_sheet(V2_CS_MOM_SHEET, [out_row], V2_CS_MOM_HEADERS)
+        print(
+            f"[CS-MOM] recorded basket @ rank_candle={row_map['rank_candle_time_jst']} "
+            f"run={row_map['run_time_jst']} "
+            f"LONG=[{row_map['long_symbols']}] SHORT=[{row_map['short_symbols']}] "
+            f"universe={len(rets)}"
+        )
+    except Exception as e:
+        # 記録のみ。失敗しても本体ループに一切影響させない。
+        print(f"[CS-MOM] record_cs_mom_shadow failed (ignored): {e}")
+
+
+# ==========================================
 # Shadow Mode メインループ
 # ==========================================
 
@@ -13182,6 +13374,14 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                     )
         except Exception as e:
             print(f"[V2-ERR] {symbol}: {e}")
+
+    # クロスセクション・モメンタム shadow（記録のみ・市場ニュートラル・バスケット単位）
+    # 実通知・notify_sent・ランキング・QS・route選別・SHORT再開には一切影響しない。
+    # ENVデフォルトOFF。失敗しても本体に影響しないよう関数内でtry/except済み。
+    try:
+        record_cs_mom_shadow(exchange, symbols, now_jst)
+    except Exception as _cs_e:
+        print(f"[CS-MOM] call site error (ignored): {_cs_e}")
 
     # Selection Pipeline: フィルター → スコア → ランキング
     # REJECTされたSHORTも ai_pass="0" で含まれる
