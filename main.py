@@ -7,6 +7,7 @@ import re
 import json
 import math
 import logging
+import traceback
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import joblib
@@ -1351,6 +1352,46 @@ def _make_aligned_row(headers: List[str], out_len: int, fields: List[str], row_v
             out[col] = v
     return out
 
+def _append_diag(sheet_name: str, headers: List[str], colcount: Optional[int],
+                 fields: List[str], rows_values: List[List[Any]],
+                 out_len: Optional[int]) -> str:
+    """append skip 時の原因特定用の詳細を1行に組み立てる（どのrowが列数不一致かを特定する）。
+    記録・診断専用。売買・通知・選別には一切影響しない。"""
+    try:
+        # 呼び出し元（append_rows_to_sheet を呼んだ行）
+        stack = traceback.extract_stack()
+        caller = ""
+        for fr in reversed(stack[:-1]):
+            if fr.name not in ("_append_diag", "append_rows_to_sheet"):
+                caller = f"{fr.name}:{fr.lineno}"
+                break
+        hm = _build_headers_map(headers)
+        idxs = [_resolve_col_idx(hm, f) for f in fields]
+        missing = [f for f, c in zip(fields, idxs) if c < 0]
+        max_idx = max([c for c in idxs if c >= 0], default=-1)
+        expected = _expected_header_len(sheet_name)
+        # 各 row の実長分布
+        row_lens = [len(r) for r in rows_values]
+        len_counts: Dict[int, int] = {}
+        for n in row_lens:
+            len_counts[n] = len_counts.get(n, 0) + 1
+        first_row = rows_values[0] if rows_values else []
+        head_cells = [str(c)[:18] for c in first_row[:3]]
+        tail_cells = [str(c)[:18] for c in first_row[-3:]]
+        return (
+            f"sheet={sheet_name} caller={caller or '?'} "
+            f"out_len={out_len} colcount={colcount} "
+            f"len(headers)={len(headers)} expected_header_len={expected} "
+            f"len(fields)={len(fields)} resolved_max_idx={max_idx} "
+            f"need_len={max(max(len(headers), expected, 1), (max_idx + 1) if max_idx >= 0 else 0)} "
+            f"n_rows={len(rows_values)} row_len_counts={len_counts} "
+            f"missing_fields={missing[:6]}{'...' if len(missing) > 6 else ''} "
+            f"first_row_head={head_cells} first_row_tail={tail_cells}"
+        )
+    except Exception as _e:
+        return f"sheet={sheet_name} diag_failed={_e}"
+
+
 def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: List[str]):
     if V1_DISABLE and sheet_name in (LEARN_SHEET_NAME, MAIN_SHEET_NAME):
         print(f"[V1-DISABLED] skip append_rows_to_sheet sheet={sheet_name}")
@@ -1376,15 +1417,17 @@ def append_rows_to_sheet(sheet_name: str, rows_values: List[List[Any]], fields: 
         out_len = _compute_out_len(sheet_name, headers, colcount, fields)
 
     if not out_len or out_len <= 0:
-        msg = f"[WARN] Output length invalid. Skip append. sheet={sheet_name}"
+        diag = _append_diag(sheet_name, headers, colcount, fields, rows_values, out_len)
+        msg = f"[WARN] Output length invalid. Skip append. {diag}"
         print(msg)
-        send_discord_message(msg)
+        send_discord_message(msg[:1800])
         return
 
     if colcount is not None and out_len > colcount:
-        msg = f"[WARN] Output length cannot fit sheet columnCount. Skip append. sheet={sheet_name}"
+        diag = _append_diag(sheet_name, headers, colcount, fields, rows_values, out_len)
+        msg = f"[WARN] Output length cannot fit sheet columnCount. Skip append. {diag}"
         print(msg)
-        send_discord_message(msg)
+        send_discord_message(msg[:1800])
         return
 
     try:
