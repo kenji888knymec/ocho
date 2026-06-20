@@ -1892,3 +1892,56 @@ SPREAD（市場ニュートラル）: WR60.5% avg+0.329% med+0.335% → BTC控�
 TP/SL変更なし/QS修正なし/ENV変更なし/LONG_F停止なし）。
 クロスセクションも shadow記録のみ・gate化や実通知化はGO条件確認まで行わない。
 ```
+
+---
+
+## 【2026-06-20 cs_mom_shadow Phase 1 配線確認合格】前向き観察フェーズ開始
+
+**確認日: 2026-06-20。コミット: `594d5b5`（fix: run/rank_candle分離 + 固定48hグリッド）。**
+
+### 確認結果
+
+| 確認項目 | 結果 |
+|---|---|
+| cs_mom_shadow 初回記録 | ✅ 成功（rank_candle=2026-06-20 21:00:00 JST） |
+| 2回目以降・同一48hスロット重複記録なし | ✅ OK（`recorded basket` が増えていない） |
+| notify_candidates=0 / discord_sent=0 | ✅ 実通知なし維持 |
+| AI-TRACE notify=1 の扱い | ✅ 内部trace表示のみ。Discord送信なし（想定通り） |
+| SHORT通知停止の継続 | ✅ OK |
+
+### 記録内容（初回）
+
+```
+rank_candle_time_jst = 2026-06-20 21:00:00
+expected_eval_time_jst = 2026-06-22 21:00:00 相当
+run_time_jst = Cloud Run実行時刻（別カラムで記録）
+```
+
+### 次の確認タイミング
+
+| 時期 | 目的 |
+|---|---|
+| **6/22 21:00 JST以降** | cs_mom_shadowシートに2本目が1行だけ追加されているか確認 |
+| 7日後（〜6/27） | 軽い傾向確認（バスケット3〜4回分） |
+| 30日後 | 本格判断（leave-one-week-out相当・GO条件チェック） |
+
+**それまでの間、何度Botが走っても `recorded basket` が増えないのが正常。**
+
+### 現在の観察ルール（変更なし）
+
+```
+cs_mom_shadow は record-only・gate化しない
+V2_CS_MOM_SHADOW_ENABLE=1（賢治さんがENVでON済み）
+SHORT再開なし / SHORT_AI_RANK再開なし / rv_chg gate化なし
+TP/SL変更なし / QS修正なし / LONG_F停止なし / 追加ENV変更なし
+```
+
+### GO条件（gate化・実通知化の前に必ず満たすこと）
+
+```
+1. leave-one-week-out で SPREAD avg+ が残る（単一週依存でない）
+2. 全週でSPREAD medianプラスを維持
+3. momentum-crash regimeで崩れていないか（6月弱含みが継続しないか）
+4. 暴落依存でない（top3日集中度が過大でない）
+→ これらが揃うまでは gate化・実通知化をしない
+```
