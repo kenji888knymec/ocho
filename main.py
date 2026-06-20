@@ -5131,7 +5131,8 @@ V2_CS_MOM_EXCLUDE       = {s.strip().upper() for s in os.environ.get("V2_CS_MOM_
 
 # cs_mom_shadow シートのヘッダ（バスケット1リバランス=1行）
 V2_CS_MOM_HEADERS = [
-    "rebalance_time_jst",   # ランク確定足の時刻（JST）
+    "run_time_jst",          # Cloud Run 実行時刻（JST）
+    "rank_candle_time_jst",  # ランク計算に使った最後の確定1h足timestamp（JST）
     "lookback_h",           # 168
     "hold_h",               # 48
     "n_per_side",           # 5
@@ -5143,7 +5144,7 @@ V2_CS_MOM_HEADERS = [
     "short_7d_rets",        # 下位nの7日リターン%
     "long_ref_prices",      # エントリー参照価格=ランク確定足close（カンマ区切り）
     "short_ref_prices",
-    "expected_eval_time_jst",  # rebalance + hold_h
+    "expected_eval_time_jst",  # rank_candle_time + hold_h
     "eval_status",          # OPEN（評価は後段/オフライン）
     "long_leg_pnl_net",     # 評価後に埋める（記録時は空）
     "short_leg_pnl_net",
@@ -12786,14 +12787,22 @@ def call_claude_for_analysis_daily(daily_report_text: str) -> str:
 # クロスセクション・モメンタム shadow（記録のみ・市場ニュートラル・バスケット単位）
 # ==========================================
 
+_CS_MOM_EPOCH_UTC = datetime(2024, 1, 1, 0, 0, 0)  # 固定48hグリッドの基準点（UTC）
+
+
+def _cs_mom_grid_slot(dt_utc: datetime, hold_h: int) -> int:
+    """固定グリッドのスロット番号。epoch起点のhold_h単位で切り捨て。デプロイ時刻に依存しない。"""
+    return int((dt_utc - _CS_MOM_EPOCH_UTC).total_seconds() / (hold_h * 3600))
+
+
 def _cs_mom_last_rebalance_jst() -> Optional[datetime]:
-    """cs_mom_shadow シートの最新 rebalance_time_jst を返す（なければ None）。
-    リバランス間隔ガード（hold_h未満なら新規記録しない）に使う。"""
+    """cs_mom_shadow シートの最新 rank_candle_time_jst を返す（なければ None）。
+    固定グリッドスロット判定（列B）に使う。"""
     try:
         service = get_sheet_service()
         res = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{V2_CS_MOM_SHEET}!A2:A",
+            range=f"{V2_CS_MOM_SHEET}!B2:B",
         ).execute()
         rows = res.get("values", []) or []
         if not rows:
@@ -12826,18 +12835,12 @@ def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> Non
         n = V2_CS_MOM_N
         cost = V2_CS_MOM_COST_PCT
 
-        # リバランス間隔ガード（前回記録から hold_h 未満ならスキップ）
         now_naive = now_jst.replace(tzinfo=None) if now_jst.tzinfo else now_jst
-        last_rb = _cs_mom_last_rebalance_jst()
-        if last_rb is not None:
-            elapsed_h = (now_naive - last_rb).total_seconds() / 3600.0
-            if elapsed_h < H:
-                # まだリバランス時刻でない（高頻度実行でも48hに1回だけ記録）
-                return
 
         # 各銘柄の as-of 7日リターンと参照価格を集める（欠損は補完せず除外）
         rets: Dict[str, float] = {}
         refpx: Dict[str, float] = {}
+        rank_candle_ts_utc: Optional[datetime] = None  # 最初の有効銘柄から取得する確定足UTC時刻
         for symbol in symbols:
             base = str(symbol).split("/")[0].strip().upper()
             if base in V2_CS_MOM_EXCLUDE:
@@ -12846,10 +12849,8 @@ def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> Non
                 ohlcv = fetch_ohlcv_safe(exchange, symbol, timeframe="1h", limit=L + 8)
                 if not ohlcv or len(ohlcv) < L + 2:
                     continue
-                closes = pd.to_numeric(
-                    pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])["Close"],
-                    errors="coerce",
-                ).iloc[:-1]  # 未確定足を除外（as-of）
+                df_ohlcv = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+                closes = pd.to_numeric(df_ohlcv["Close"], errors="coerce").iloc[:-1]  # 未確定足を除外（as-of）
                 if len(closes) < L + 1:
                     continue
                 c_now = float(closes.iloc[-1])
@@ -12858,9 +12859,30 @@ def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> Non
                     continue
                 rets[base] = (c_now - c_past) / c_past * 100.0
                 refpx[base] = c_now
+                # 最初の有効銘柄から確定足timestamp（Time列のiloc[-2] = 最後の確定1h足）を取得
+                if rank_candle_ts_utc is None:
+                    try:
+                        ts_ms = float(df_ohlcv["Time"].iloc[-2])
+                        rank_candle_ts_utc = datetime.utcfromtimestamp(ts_ms / 1000.0)
+                    except Exception:
+                        pass
             except Exception as _e:
                 print(f"[CS-MOM] {symbol} fetch/calc skip: {_e}")
                 continue
+
+        # タイムスタンプ取得できなかった場合: now_jstから近似（UTC換算・1h切り捨て）
+        if rank_candle_ts_utc is None:
+            utc_approx = now_naive - timedelta(hours=9)
+            rank_candle_ts_utc = utc_approx.replace(minute=0, second=0, microsecond=0)
+
+        # 固定48hグリッド判定（デプロイ時刻依存しない）
+        cur_slot = _cs_mom_grid_slot(rank_candle_ts_utc, H)
+        last_rb = _cs_mom_last_rebalance_jst()
+        if last_rb is not None:
+            last_rb_utc = last_rb - timedelta(hours=9)  # JST naive → UTC
+            last_slot = _cs_mom_grid_slot(last_rb_utc, H)
+            if cur_slot == last_slot:
+                return  # 同一グリッドスロット内は記録済み
 
         if len(rets) < 2 * n + 2:
             print(f"[CS-MOM] universe不足 valid={len(rets)} < {2*n+2}・記録スキップ")
@@ -12870,9 +12892,11 @@ def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> Non
         shorts = ranked[:n]          # 下位n=SHORT（弱い銘柄を空売り＝エッジ側）
         longs = ranked[-n:][::-1]    # 上位n=LONG（強い順に並べる）
 
-        expected_eval = now_naive + timedelta(hours=H)
+        rank_candle_jst = rank_candle_ts_utc + timedelta(hours=9)
+        expected_eval = rank_candle_jst + timedelta(hours=H)
         row_map = {
-            "rebalance_time_jst": now_naive.strftime("%Y-%m-%d %H:%M:%S"),
+            "run_time_jst": now_naive.strftime("%Y-%m-%d %H:%M:%S"),
+            "rank_candle_time_jst": rank_candle_jst.strftime("%Y-%m-%d %H:%M:%S"),
             "lookback_h": L,
             "hold_h": H,
             "n_per_side": n,
@@ -12900,7 +12924,8 @@ def record_cs_mom_shadow(exchange, symbols: List[str], now_jst: datetime) -> Non
         out_row = [row_map.get(h, "") for h in V2_CS_MOM_HEADERS]
         append_rows_to_sheet(V2_CS_MOM_SHEET, [out_row], V2_CS_MOM_HEADERS)
         print(
-            f"[CS-MOM] recorded basket @ {row_map['rebalance_time_jst']} "
+            f"[CS-MOM] recorded basket @ rank_candle={row_map['rank_candle_time_jst']} "
+            f"run={row_map['run_time_jst']} "
             f"LONG=[{row_map['long_symbols']}] SHORT=[{row_map['short_symbols']}] "
             f"universe={len(rets)}"
         )
