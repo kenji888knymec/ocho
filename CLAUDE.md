@@ -709,3 +709,104 @@ rv_chg（BTCボラ急増・方向別）= 危険日検知の本命仮説として
 - 新条件探索の継続（今増やすと6月専用の過学習がほぼ確実）
 - rv_chgの本番gate化 / 共通ゲート化
 - SHORT再開・LONG本番採用・ENV変更・gate化・QS修正
+
+---
+
+## 【2026-06-20 rv_chg 再検証】長期データ（1/1〜6/19）でGO条件チェック
+
+**データ：** 28銘柄 15m/1h OHLCV 2026-01-01〜06-19（前回3/1〜の延長版）。BTC暴落日（<-2%）が全5ヶ月に合計29日あり、独立エピソードが十分に揃った。train=1/1〜4/30（120日）、test=5/1〜6/19（50日）。as-of厳守。
+
+### GO条件チェック結果
+
+| GO条件 | 判定 | 詳細 |
+|---|---|---|
+| **1. leave-one-week-out でPASS+が残る** | ❌ クリアせず | 6/1〜7週除外でTEST PASS avg -0.267%に転落。6/5依存が残存 |
+| **2. 閾値3〜7%で符号安定** | ❌ クリアせず | 7%超でマイナス転落（5%=+0.079%、7%=-0.151%）。狭帯依存解消されず |
+| **3. 別月の暴落日でBLOCK率集中** | ✅ **クリア** | 1月(1/25 100%、1/29 100%、1/31 100%)、2月(2/3 100%、2/23 83%)、3月(3/6 100%、3/18 100%)、5月(5/15 100%)、6月(6/2 100%、6/5 71%)——複数月で一貫して暴落日をブロック |
+| **4. LONG/SHORT方向別に上記を満たす** | ❌ クリアせず | SHORT方向は全閾値でPASS<BLOCK（逆効果）。方向別ゲートとして設計必須 |
+
+**4条件中1条件のみクリア（条件3のみ）。**
+
+### 前進した点・解消されない点
+
+**前進：** GO条件3が初めて確定的にクリア。rv_chgの危険日検知ロジックは6月専用の過学習ではなく、1〜6月の複数月・複数エピソードで一貫してBTC暴落日をブロックしていることが確認された。
+
+**解消されない点：** train(1〜4月)ではLONG-PASS側がavg -0.379%のまま（全LONGもavg -0.267%で赤字）。train/test符号逆転の主因は「現在のLONGシグナル設計が1〜4月の穏やかな相場でほとんど機能しない」こと——rv_chg以前に母集団自体がtrain期間と合っていない。新しい条件探索をすると1〜6月相場への過学習になるため、LONGシグナルの改良はしない。
+
+### 現在の扱い（変更なし）
+
+```
+rv_chg（BTCボラ急増・方向別）= 危険日検知の本命仮説として保持継続
+- 本番gate化しない（GO条件3のみクリア、PnL証明は不足）
+- 新条件探索もしない（過学習リスク）
+- 次のステップ: 実EntryRecord母集団でrv_chgの影響を診断
+  → notify_sent=1 / LONG_E / LONG_F / SHORT候補 / SHORT_AI_RANK /
+    feature route / v2_core / no_match の各ルートで
+    「rv_chg高低が実通知成績の悪化日と対応するか」を確認
+  → 良ければ shadow列としての記録設計を検討（gate化は別）
+```
+
+### やらないこと（確定）
+- LONGシグナル設計の改良（1〜6月相場への過学習になる）
+- rv_chgの本番gate化 / 共通ゲート化
+- SHORT再開・LONG本番採用・ENV変更・gate化・QS修正
+
+---
+
+## 【2026-06-20 実EntryRecord診断＋shadow列実装】rv_chg を観察記録に追加（gate化はしない）
+
+**データ：** EntryRecord_3.xlsx（DONE 83,426行、5/1〜6/19）に、BTC 1h からas-of計算した rv_chg を merge_asof で割り当てて各ルート別に診断。日別WRバグ（`WinLose=='WIN'` 大文字判定→実値は `'Win'`）を修正し、日次WRは `PnL_Pct>0` に統一。
+
+### 診断結果（実通知ルート母集団・thr=5%）
+
+| ルート | PASS(rv<5%) avg | BLOCK(rv≥5%) avg | rv_chg方向 | 備考 |
+|---|---|---|---|---|
+| **long_f** | **+0.135%** (n=262) | -0.167% (n=85) | ✅ 正常 | 最良日(6/16)除外後もPASS +0.096%。閾値3〜10%全幅でPASS+。**最も明確** |
+| short_bypass_abc | +0.069% (n=994) | -0.021% (n=855) | ✅ 正常 | 最良日(6/18)除外でPASS -0.121%に崩れる→6/18依存 |
+| feature_force | +0.050% (n=1350) | +0.003% (n=1081) | ✅ 正常 | 差が薄い |
+| notify_sent(実通知) | -0.100% (n=237) | -0.362% (n=84) | ✅ 正常 | 方向は正しいが**両方マイナス**＝rv_chg以前に選別上流が弱い。leave-one-week-out全週で均一マイナス |
+| short_ai_rank | -0.167% (n=141) | -0.622% (n=40) | ✅ 正常 | 両方ひどい（逆AI選別の問題） |
+| **short_trend_all** | +0.084% (n=10945) | **+0.303%** (n=6771) | ❌ **逆転** | SHORT本来特性（急落局面でSHORT有利）。共通ゲート不成立を実データで再確認 |
+| **long_e**(停止済) | -0.380% (n=94) | **+0.249%** (n=141) | ❌ **逆転** | リバウンド型の性質。6/12停止は正しい |
+| long_recovery | -0.296% | -0.212% | △ | long_recovery自体が根本的に弱い |
+
+### 確定見解
+
+```
+1. B診断・長期再検証の「LONG/SHORT方向別設計が必要・共通ゲート不成立」を実EntryRecord母集団で独立に裏付け
+2. long_f に限り rv_chg<5% ゲートがPnLを明確に分離（最良日除外後も安定、6/18依存のshort_bypassより堅牢）
+3. SHORTのrv_chg方向は逆（=SHORT本来特性と整合）。方向別設計必須
+4. notify_sentが弱いのはrv_chgより上の選別問題（QS・逆AI）が先
+→ ただし後付け診断。前向きに同傾向が続くかを観察するため shadow記録を開始する
+```
+
+### 実装（shadow記録のみ・本番gate化ではない）
+
+main.py に rv_chg を **shadow列として記録だけ**追加（branch: `claude/crypto-bot-assistant-QlA5G`）。
+**実通知・notify_sent・ランキング・QS・route選別・Discord送信には一切影響しない。**
+
+```
+ENV（新規・shadow専用スイッチ。実通知に無影響）:
+  V2_RV_CHG_SHADOW_ENABLE (default 1)   # shadow記録のON/OFFのみ
+  V2_RV_CHG_SHADOW_TH     (default 0.05)
+
+計算（as-of厳守）:
+  BTC 1h(btc_htf_df)の未確定足iloc[-1]を除外し完了足のみ。
+  rv12 = pct_change(1).rolling(12).std(); rv_chg = rv12/rv12[4本前]-1
+  → オフライン診断と30チェックポイントで数値完全一致を検証済み。欠損は補完せず空欄。
+
+記録列（v2_shadow末尾に6列追加。既存列indexは不変・74列）:
+  BTC_RV_Chg / BTC_RV_Chg_Bucket(neg/lo/mid/hi/xhi) /
+  RV_Chg_Shadow_Pass(PASS/BLOCK) / RV_Chg_Shadow_Reason /
+  LongF_RV_Chg_Shadow(long_f bypass行のみ) /
+  Directional_RV_Chg_Shadow(LONG系=PASS/BLOCK, SHORT=NA_REVERSED)
+```
+
+### やらないこと（確定・変更なし）
+- rv_chgの本番gate化 / 共通ゲート化 / 通知可否変更 / LONG_F停止 / route選別変更
+- SHORT再開・LONG本番採用・QS修正
+- ENV変更（Cloud Run）・デプロイは賢治さんの差分確認後に判断（コードはbranch pushのみ）
+
+### 次のステップ
+- デプロイ後、前向きに溜まったrv_chg shadow列で long_f の rv_chg<5% 優位が継続するかを観察
+- 継続確認できても gate化はGO条件（leave-one-week-out / 閾値安定 / 方向別）を満たすまで行わない

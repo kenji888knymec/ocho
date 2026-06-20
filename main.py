@@ -5060,6 +5060,14 @@ V2_SHORT_DANGER_GATE_SHADOW_ENABLE = str(os.environ.get("V2_SHORT_DANGER_GATE_SH
 V2_SHORT_DANGER_GATE_SLOPE_TH      = _env_float("V2_SHORT_DANGER_GATE_SLOPE_TH", -0.002)   # slope閾値（これより大きい=下落弱い→BLOCK）
 V2_SHORT_DANGER_GATE_SLOPE_CHG1_TH = _env_float("V2_SHORT_DANGER_GATE_SLOPE_CHG1_TH", 0.0002)  # slope 1h変化量閾値（下落減速→BLOCK）
 
+# --- rv_chg（BTC 1h実現ボラ急増比）shadow（前向き観察用。実通知・notify_sent・ランキング・QSには一切影響しない） ---
+# rv_chg = BTC 1h実現ボラ(pct_change(1)の12本std)の「4本前比」増加率。完了足のみ（as-of）。
+# 2026-06-20 実EntryRecord診断で long_f に限り rv_chg<5% がPnLを明確に分離（PASS +0.135% vs BLOCK -0.167%、最良日除外後もプラス）。
+# 方向別: LONGは高rv_chg=危険(BLOCK側)、SHORTは診断で逆効果のため方向別ゲート非適用(NA_REVERSED)。
+# これは本番gate化ではなく shadow 記録のみ。欠損は補完せず空文字で記録する。
+V2_RV_CHG_SHADOW_ENABLE = str(os.environ.get("V2_RV_CHG_SHADOW_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
+V2_RV_CHG_SHADOW_TH     = _env_float("V2_RV_CHG_SHADOW_TH", 0.05)   # ボラ急増比の閾値（これ以上=急増→LONG側はBLOCK扱い）
+
 # --- 合計スコア ---
 V2_MIN_SCORE                    = _env_float("V2_MIN_SCORE", 1.3)
 V2_JUDGE_MAX_BARS               = int(float(os.environ.get("V2_JUDGE_MAX_BARS", "96")))
@@ -5520,6 +5528,13 @@ V2_HEADERS = [
     "Short_Danger_Gate_Shadow",
     "Short_Danger_Gate_Reason",
     "Short_Danger_Gate_Th",
+    # rv_chg（BTC実現ボラ急増比）shadow（前向き観察用。実通知・notify_sent・ランキングには一切影響しない）
+    "BTC_RV_Chg",                # 生値（欠損は空欄）
+    "BTC_RV_Chg_Bucket",         # neg/lo/mid/hi/xhi（後で集計しやすい固定区分）
+    "RV_Chg_Shadow_Pass",        # 方向非依存: PASS(rv<th)/BLOCK(rv>=th)
+    "RV_Chg_Shadow_Reason",      # 説明文字列（rv_chg=...<th 等）
+    "LongF_RV_Chg_Shadow",       # long_f bypass行のみ PASS/BLOCK（それ以外は空）
+    "Directional_RV_Chg_Shadow", # LONG系:PASS/BLOCK、SHORT:NA_REVERSED（逆効果のため）
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -9892,6 +9907,42 @@ def _compute_short_danger_gate_shadow(sig: Dict[str, Any]) -> Tuple[str, str]:
     return "", ""
 
 
+def _compute_rv_chg_shadow(sig: Dict[str, Any]) -> Tuple[Any, str, str, str, str]:
+    """rv_chg（BTC 1h実現ボラ急増比）の shadow 仮想評価（前向き観察用）。
+    実通知・notify_sent・ランキング・Discord送信・QSには一切影響しない（記録のみ）。
+    閾値: rv_chg >= V2_RV_CHG_SHADOW_TH を「ボラ急増」とみなす。
+    欠損は補完しない（NaNは評価不能として空文字を返す）。
+    戻り値: (rv_chg, bucket, generic_pass, reason, directional)
+      rv_chg:       float または ""（欠損）
+      bucket:       "neg"/"lo"/"mid"/"hi"/"xhi"/""
+      generic_pass: "PASS"(rv<th)/"BLOCK"(rv>=th)/""（方向非依存）
+      reason:       説明文字列
+      directional:  LONG系=PASS/BLOCK、SHORT系=NA_REVERSED（診断で逆効果）、欠損=""
+    """
+    if not V2_RV_CHG_SHADOW_ENABLE:
+        return "", "", "", "", ""
+    rv = _safe_float_or_nan(sig.get("btc_rv_chg"))
+    if not np.isfinite(rv):
+        return "", "", "", "rv_chg_nan", ""
+    th = V2_RV_CHG_SHADOW_TH
+    if rv < 0.0:
+        bucket = "neg"
+    elif rv < 0.03:
+        bucket = "lo"
+    elif rv < th:
+        bucket = "mid"
+    elif rv < 0.10:
+        bucket = "hi"
+    else:
+        bucket = "xhi"
+    generic_pass = "PASS" if rv < th else "BLOCK"
+    reason = f"rv_chg={rv:.4f}{'<' if rv < th else '>='}{th:g}"
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    # SHORTは診断でrv_chg逆効果（高rvでSHORT有利）のため方向別ゲートを当てない。
+    directional = "NA_REVERSED" if direction.startswith("SHORT") else generic_pass
+    return rv, bucket, generic_pass, reason, directional
+
+
 def _compute_daily_cap_would_block(sig: Dict[str, Any]) -> str:
     """Daily cap 仮想評価。ai_note 内の rank=X からバッチ内順位を読み、
     上限（V2_DAILY_CAP_SHORT_WB / V2_DAILY_CAP_LONG_WB）を超えるなら "1"、以内なら "0"。
@@ -9916,6 +9967,9 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
     """
     fp = _feature_profile_log_parts(sig)
     _sdg_shadow, _sdg_reason = _compute_short_danger_gate_shadow(sig)
+    _rv_val, _rv_bucket, _rv_pass, _rv_reason, _rv_dir = _compute_rv_chg_shadow(sig)
+    # long_f bypass 経路の行だけ long_f 専用 shadow を立てる（それ以外は空）。診断で long_f が最も明確だったため。
+    _longf_rv = _rv_pass if (str(fp["BYPASS_PROFILE"]).strip().lower() == "long_f" and _rv_pass) else ""
     return [
         "'" + sig["dt"].strftime("%Y-%m-%d %H:%M:%S"),
         sig["symbol"],
@@ -9995,6 +10049,13 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         (f"slope>{V2_SHORT_DANGER_GATE_SLOPE_TH:g};chg1>{V2_SHORT_DANGER_GATE_SLOPE_CHG1_TH:g}"
          if (V2_SHORT_DANGER_GATE_SHADOW_ENABLE
              and str(sig.get("direction", "") or "").strip().upper() == "SHORT") else ""),
+        # rv_chg shadow（前向き観察用。NaNは空文字＝補完しない。実通知には一切使わない）
+        (float(_rv_val) if isinstance(_rv_val, (int, float)) and np.isfinite(_rv_val) else ""),
+        _rv_bucket,
+        _rv_pass,
+        _rv_reason,
+        _longf_rv,
+        _rv_dir,
     ]
 
 
@@ -12814,6 +12875,22 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
     except Exception as _e:
         print(f"[V2-WARN] btc_slope_chg1 failed: {_e}")
 
+    # rv_chg: BTC 1h実現ボラ急増比（shadow記録のみ。実通知・ランキング・フィルターには一切使わない）
+    # rv12 = pct_change(1)の12本std、rv_chg = rv12 / rv12[4本前] - 1。
+    # 未確定足(iloc[-1])を除外し完了足のみで計算（as-of）。欠損は補完しない。
+    btc_rv_chg = np.nan
+    try:
+        if btc_htf_df is not None and len(btc_htf_df) >= 18:
+            _hc_done = pd.to_numeric(btc_htf_df["Close"], errors="coerce").iloc[:-1]
+            _ret1 = _hc_done.pct_change(fill_method=None)
+            _rv12 = _ret1.rolling(12).std()
+            _rv_now = float(_rv12.iloc[-1])
+            _rv_prev4 = float(_rv12.iloc[-5])
+            if np.isfinite(_rv_now) and np.isfinite(_rv_prev4) and abs(_rv_prev4) > 1e-12:
+                btc_rv_chg = _rv_now / _rv_prev4 - 1.0
+    except Exception as _e:
+        print(f"[V2-WARN] btc_rv_chg failed: {_e}")
+
     # レジーム転換検出
     regime = detect_btc_regime_conflict(exchange, btc_htf["direction"])
     short_conflict = bool(regime.get("short_conflict", False))
@@ -12978,6 +13055,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 probe_sig["btc_rebound_from_low_1h"] = _safe_float_or_nan(btc_rebound_from_low_1h)
                 probe_sig["btc_htf_green_candle"] = _safe_float_or_nan(btc_htf_green_candle)
                 probe_sig["btc_slope_chg1"] = _safe_float_or_nan(btc_slope_chg1)
+                probe_sig["btc_rv_chg"] = _safe_float_or_nan(btc_rv_chg)
             except Exception:
                 pass
 
@@ -13048,6 +13126,7 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
                 sig["btc_rebound_from_low_1h"] = _safe_float_or_nan(btc_rebound_from_low_1h)
                 sig["btc_htf_green_candle"] = _safe_float_or_nan(btc_htf_green_candle)
                 sig["btc_slope_chg1"] = _safe_float_or_nan(btc_slope_chg1)
+                sig["btc_rv_chg"] = _safe_float_or_nan(btc_rv_chg)
 
                 raw_signals.append(sig)
 
