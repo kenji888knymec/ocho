@@ -1482,3 +1482,56 @@ SHORT_AI_RANK再開・SHORT再開
 AI_Prob_Win Q3（中位帯 0.4-0.6）の短期成績が次のEntryRecord でも維持されるか
 BTC_HTF_Strength 別のSHORT成績（高BTC_HTF_StrengthでSHORT有利か）
 ```
+
+---
+
+## 【2026-06-20 合意・前向き観察フレーム確定】SHORTの到達点と次の観察タグ
+
+**賢治さん合意の現状認識（断定を避けた最終整理）：**
+
+```
+SHORT入口プール：手動運用基準には未達（候補全体 median=-0.486%・暴落日依存）
+SHORT selected崩壊：active_days=5（5/29-6/1）に集中。AIの逆選別か相場時期かは分離不可
+SHORT_AI_RANK_REJECTのプラス：暴落日集中（top3集中+217%、週23除外でavg-0.173%）→採用不可
+AI_Prob_Win Q3中位帯：相対的に良い（WR50.6%/avg+0.105%/med+0.159%）が手動基準未達
+本番変更：なし
+```
+
+**前回までの「断定しすぎ」を2段階で修正した記録：**
+```
+段階1（誤）: 入口ロジックが主犯
+段階2（誤）: SHORT_AI_RANKが完全に逆選別している（証拠A・Bで主張）
+段階3（現）: selectedの崩壊は日数不足(d=5)で相場時期と分離不能。
+            REJECT側の優位も暴落日依存。逆選別と断定できない。
+            ただしAI_Prob_Win Q3中位 > Q5高スコア の構造は研究価値あり
+```
+
+### 次の観察タグ（次回EntryRecordから本格化・gate化しない）
+
+| タグ | 現状のデータ状況 | 観察で確認すること |
+|---|---|---|
+| AI_Prob_Win Q3中位帯(0.4-0.6) | 既存データで最良・med+0.159% | 別日・別相場でも med>0 を維持するか。Q5高スコアより安定か |
+| BTC_HTF_Strength 高/低 | 既存: 高→SHORT WR51.4% | 高BTCstrのSHORTが暴落日以外でもPnL_Netプラスか |
+| rv_chg (BTC_RV_Chg等) | **EntryRecord_3に列なし**。次回から | long_f の rv_chg<5% PASS優位が前向きに継続するか |
+| Short_Danger_Gate_Shadow | 同上（次回から） | 危険日BLOCKが暴落日に集中するか |
+| 3反転列(BTC_RSI_15m他) | 6/19のみ150件＝初日 | 日数が溜まったら危険日ゲートのOOS検証 |
+| G2_Gate | 6/12-6/19入っている | PASS>BLOCKを維持するか（既存検証では test で逆） |
+
+### 確認の合言葉（次にデータが来たとき）
+
+```
+「暴落日依存ではなく、安定してPnL_Netが残るか」
+  - top3日集中度が過大でないか（暴落日に利益が偏っていないか）
+  - leave-one-week-out で符号が安定するか
+  - median がプラスを維持するか
+  - active_days が十分か（d<5は参考値）
+→ これらを満たさない限り、Q3中位帯もrv_chgも本番gate化しない
+```
+
+### やらないこと（再確認・変更なし）
+
+```
+REST側採用 / rank反転 / AI閾値変更 / SHORT再開 / SHORT_AI_RANK再開
+LONG_F停止 / rv_chg gate化 / TP/SL変更 / QS修正 / ENV変更
+新条件の乱発探索（同一データへの過学習）
+```
