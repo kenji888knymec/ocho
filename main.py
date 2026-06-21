@@ -42,6 +42,14 @@ except Exception as _e:
     SKLEARN_OK = False
     print(f"[WARN] scikit-learn import failed (train disabled): {_e}")
 
+try:
+    import lightgbm as lgb
+    _SHORT_ML_LGB_OK = True
+except Exception as _lgb_ex:
+    lgb = None  # type: ignore
+    _SHORT_ML_LGB_OK = False
+    print(f"[WARN] lightgbm not available – SHORT ML shadow disabled: {_lgb_ex}")
+
 
 # ==========================================
 # Flask設定（Buildpacks標準：main.py の app を起動）
@@ -5110,6 +5118,7 @@ V2_SHORT_DANGER_GATE_SLOPE_CHG1_TH = _env_float("V2_SHORT_DANGER_GATE_SLOPE_CHG1
 # これは本番gate化ではなく shadow 記録のみ。欠損は補完せず空文字で記録する。
 V2_RV_CHG_SHADOW_ENABLE = str(os.environ.get("V2_RV_CHG_SHADOW_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 V2_RV_CHG_SHADOW_TH     = _env_float("V2_RV_CHG_SHADOW_TH", 0.05)   # ボラ急増比の閾値（これ以上=急増→LONG側はBLOCK扱い）
+V2_SHORT_ML_SHADOW_ENABLE = str(os.environ.get("V2_SHORT_ML_SHADOW_ENABLE", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # --- クロスセクション・モメンタム（市場ニュートラル）shadow（前向き観察用・記録のみ） ---
 # 2026-06-20 発見: 28銘柄を過去7日(168h)リターンでランクし、上位n=LONG/下位n=SHORTを
@@ -5619,6 +5628,17 @@ V2_HEADERS = [
     "RV_Chg_Shadow_Reason",      # 説明文字列（rv_chg=...<th 等）
     "LongF_RV_Chg_Shadow",       # long_f bypass行のみ PASS/BLOCK（それ以外は空）
     "Directional_RV_Chg_Shadow", # LONG系:PASS/BLOCK、SHORT:NA_REVERSED（逆効果のため）
+    # SHORT ML shadow（record-only・実通知なし・前向き観察用。実通知経路・notify_sent・QSには一切影響しない）
+    "Short_ML_Score",            # モデルスコア（0-1）。空=未評価
+    "Short_ML_Threshold",        # train期間98パーセンタイル閾値
+    "Short_ML_Selected",         # 閾値超過 & no-overlap通過: 1/0/空
+    "Short_ML_Model_Version",    # モデルバージョン
+    "Short_ML_Feature_Version",  # 特徴量バージョン
+    "Short_ML_TP",               # 固定TP%（1.2）
+    "Short_ML_SL",               # 固定SL%（1.0）
+    "Short_ML_Hold_H",           # 保有時間上限（48h）
+    "Short_ML_No_Overlap_Reason",# 48h重複ブロック理由（空=ブロックなし）
+    "Short_ML_Reason",           # スコア・閾値・選抜理由の詳細
 ]
 
 print(f"[V2-CFG] HTF={V2_HTF_TIMEFRAME} "
@@ -10027,6 +10047,418 @@ def _compute_rv_chg_shadow(sig: Dict[str, Any]) -> Tuple[Any, str, str, str, str
     return rv, bucket, generic_pass, reason, directional
 
 
+# ─── SHORT ML shadow ─────────────────────────────────────────────────────
+# record-only. 実通知・notify_sent・Discord・QS・route選別に一切影響しない。
+_short_ml_state: Dict[str, Any] = {
+    "model":     None,
+    "threshold": None,
+    "yearmonth": None,
+    "feat_cols": [],
+    "infer_ts":  0.0,
+    "close_1h":  {},
+    "high_1h":   {},
+    "low_1h":    {},
+    "vol_1h":    {},
+    "cur_feats": {},
+    "no_overlap":{},
+    "training":  False,
+}
+_SHORT_ML_SYMS = [
+    "AAVE","ADA","APT","ARB","ATOM","AVAX","BNB","BONK","BTC","DOGE",
+    "DOT","ETH","FET","HBAR","INJ","LINK","LTC","NEAR","POL","SEI",
+    "SHIB","SOL","STX","SUI","TRX","UNI","XLM","XRP",
+]
+_SHORT_ML_SYM_IDX = {s: i for i, s in enumerate(_SHORT_ML_SYMS)}
+_SHORT_ML_TP      = 1.2
+_SHORT_ML_SL      = 1.0
+_SHORT_ML_HOLD    = 48
+_SHORT_ML_PCT     = 98
+_SHORT_ML_TRAIN_M = 12
+_SHORT_ML_INFER_L = 500
+_SHORT_ML_INFER_TTL = 3600.0
+_SHORT_ML_MODEL_V = "SHORT_ML_v0"
+_SHORT_ML_FEAT_V  = "37f_v0"
+_SHORT_ML_NONFEAT = frozenset(["label", "pnl", "symbol", "dt", "month"])
+
+
+def _sml_rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    d  = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
+
+
+def _sml_build_feats(sym: str, close_df: pd.DataFrame, high_df: pd.DataFrame,
+                     low_df: pd.DataFrame, vol_df: pd.DataFrame) -> pd.DataFrame:
+    """37 features matching build_v2.py for SHORT shadow scoring."""
+    c = close_df[sym]; h = high_df[sym]; l = low_df[sym]; v = vol_df[sym]
+    r1 = c.pct_change(1)
+    btc      = close_df["BTC"]
+    btc_r1   = btc.pct_change(1)
+    btc_r4   = btc.pct_change(4)
+    btc_r24  = btc.pct_change(24)
+    btc_r72  = btc.pct_change(72)
+    btc_vol  = btc_r1.rolling(24).std()
+    btc_rsi  = _sml_rsi(btc, 14)
+    btc_rv12 = btc_r1.rolling(12).std()
+    btc_rvchg   = btc_rv12 / btc_rv12.shift(4) - 1
+    btc_ma50    = btc.rolling(50).mean()
+    btc_ma200   = btc.rolling(200).mean()
+    btc_trend   = btc / btc_ma50.replace(0, np.nan) - 1
+    btc_trend_l = btc / btc_ma200.replace(0, np.nan) - 1
+    btc_dist_hi = btc / btc.rolling(168).max() - 1
+    avail = [s2 for s2 in _SHORT_ML_SYMS if s2 in close_df.columns]
+    cs_close = close_df[avail]
+    cs24  = cs_close.pct_change(24).rank(axis=1, pct=True)
+    cs72  = cs_close.pct_change(72).rank(axis=1, pct=True)
+    cs168 = cs_close.pct_change(168).rank(axis=1, pct=True)
+    cs24s  = cs24[sym]  if sym in cs24.columns  else pd.Series(np.nan, index=close_df.index)
+    cs72s  = cs72[sym]  if sym in cs72.columns  else pd.Series(np.nan, index=close_df.index)
+    cs168s = cs168[sym] if sym in cs168.columns else pd.Series(np.nan, index=close_df.index)
+    atr = (h - l).rolling(24).mean() / c.replace(0, np.nan)
+    f = pd.DataFrame(index=close_df.index)
+    f["ret_1h"]      = c.pct_change(1)
+    f["ret_4h"]      = c.pct_change(4)
+    f["ret_24h"]     = c.pct_change(24)
+    f["ret_72h"]     = c.pct_change(72)
+    f["ret_168h"]    = c.pct_change(168)
+    f["ret_336h"]    = c.pct_change(336)
+    f["rsi_14"]      = _sml_rsi(c, 14)
+    f["rsi_4"]       = _sml_rsi(c, 4)
+    f["vol_24h"]     = r1.rolling(24).std()
+    f["vol_chg"]     = r1.rolling(12).std() / r1.rolling(12).std().shift(4) - 1
+    f["volvol"]      = r1.rolling(24).std().rolling(48).std()
+    f["dist_hi_24"]  = c / h.rolling(24).max() - 1
+    f["dist_lo_24"]  = c / l.rolling(24).min() - 1
+    f["dist_hi_168"] = c / h.rolling(168).max() - 1
+    f["dist_lo_168"] = c / l.rolling(168).min() - 1
+    f["atr"]         = atr
+    f["dist_hi_atr"] = (c / h.rolling(24).max() - 1) / atr.replace(0, np.nan)
+    f["vol_z"]       = (v - v.rolling(48).mean()) / v.rolling(48).std().replace(0, np.nan)
+    f["vol_trend"]   = v.rolling(24).mean() / v.rolling(168).mean().replace(0, np.nan) - 1
+    f["rel_str_24"]  = c.pct_change(24) - btc_r24
+    f["rel_str_72"]  = c.pct_change(72) - btc_r72
+    f["cs_rank_24"]  = cs24s
+    f["cs_rank_72"]  = cs72s
+    f["cs_rank_168"] = cs168s
+    f["btc_ret1"]    = btc_r1
+    f["btc_ret4"]    = btc_r4
+    f["btc_ret24"]   = btc_r24
+    f["btc_ret72"]   = btc_r72
+    f["btc_vol"]     = btc_vol
+    f["btc_rsi"]     = btc_rsi
+    f["btc_rvchg"]   = btc_rvchg
+    f["btc_trend"]   = btc_trend
+    f["btc_trend_l"] = btc_trend_l
+    f["btc_dist_hi"] = btc_dist_hi
+    f["hour"]        = close_df.index.hour
+    f["dow"]         = close_df.index.dayofweek
+    f["sym_id"]      = _SHORT_ML_SYM_IDX.get(sym, -1)
+    return f
+
+
+def _sml_compute_labels(close_df: pd.DataFrame, high_df: pd.DataFrame,
+                         low_df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """SHORT TP先着=1/SL先着=0 labels matching build_v2.py (SHORT direction)."""
+    TP_F = _SHORT_ML_TP / 100.0
+    SL_F = _SHORT_ML_SL / 100.0
+    H    = _SHORT_ML_HOLD
+    labels = {}
+    for sym in _SHORT_ML_SYMS:
+        if sym not in close_df.columns:
+            continue
+        ep = close_df[sym].values
+        hi = high_df[sym].values
+        lo = low_df[sym].values
+        n  = len(ep)
+        ftp = np.full(n, H + 1, dtype=float)
+        fsl = np.full(n, H + 1, dtype=float)
+        tpl = ep * (1.0 - TP_F)
+        sll = ep * (1.0 + SL_F)
+        for j in range(1, H + 1):
+            lj = np.roll(lo, -j); lj[-j:] = np.nan
+            hj = np.roll(hi, -j); hj[-j:] = np.nan
+            ftp[(lj <= tpl) & (ftp > H)] = j
+            fsl[(hj >= sll) & (fsl > H)] = j
+        lab = np.full(n, np.nan)
+        lab[ftp < fsl]  = 1.0
+        lab[fsl <= ftp] = 0.0
+        lab[n - H:] = np.nan
+        labels[sym] = pd.Series(lab, index=close_df.index)
+    return labels
+
+
+def _sml_df_from_raw(bars: list) -> pd.DataFrame:
+    df = pd.DataFrame(bars, columns=["ts","open","high","low","close","volume"])
+    df["dt"] = pd.to_datetime(df["ts"], unit="ms").dt.tz_localize(None)
+    df = df.set_index("dt").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _sml_fetch_training_ohlcv(exchange, sym_str: str, now_utc: datetime) -> Optional[pd.DataFrame]:
+    """Fetch ~12 months of 1h OHLCV via paginated API calls."""
+    LIMIT = 1000
+    N_BARS = _SHORT_ML_TRAIN_M * 31 * 24 + 500
+    start_ms = int((now_utc - timedelta(hours=N_BARS)).timestamp() * 1000)
+    now_ms   = int(now_utc.timestamp() * 1000)
+    all_bars: list = []
+    since = start_ms
+    while True:
+        chunk = fetch_ohlcv_safe(exchange, sym_str, "1h", LIMIT, since=since)
+        if not chunk:
+            break
+        last_ts = all_bars[-1][0] if all_bars else -1
+        new_bars = [b for b in chunk if b[0] > last_ts]
+        all_bars.extend(new_bars)
+        if len(chunk) < LIMIT or not new_bars:
+            break
+        since = all_bars[-1][0] + 3_600_000
+        if since >= now_ms:
+            break
+    if not all_bars:
+        return None
+    return _sml_df_from_raw(all_bars)
+
+
+def _sml_fetch_inference_ohlcv(exchange, sym_str: str) -> Optional[pd.DataFrame]:
+    bars = fetch_ohlcv_safe(exchange, sym_str, "1h", _SHORT_ML_INFER_L)
+    if not bars:
+        return None
+    return _sml_df_from_raw(bars)
+
+
+def _short_ml_train(exchange, now_jst: datetime) -> None:
+    """Fetch 12M OHLCV, train LightGBM, store model+threshold. No live impact."""
+    global _short_ml_state
+    if not _SHORT_ML_LGB_OK or _short_ml_state.get("training"):
+        return
+    _short_ml_state["training"] = True
+    try:
+        ym = now_jst.strftime("%Y-%m")
+        now_utc = now_jst.astimezone(timezone.utc).replace(tzinfo=None)
+        print(f"[SHORT-ML] Training start ym={ym} (fetching 28 symbols × ~12 calls)…")
+        t0 = time.time()
+        raw: Dict[str, pd.DataFrame] = {}
+        for sym in _SHORT_ML_SYMS:
+            try:
+                df = _sml_fetch_training_ohlcv(exchange, f"{sym}/USDT", now_utc)
+                if df is not None and len(df) >= 500:
+                    raw[sym] = df
+            except Exception as _fe:
+                print(f"[SHORT-ML] fetch {sym}: {_fe}")
+        if "BTC" not in raw or len(raw) < 10:
+            print(f"[SHORT-ML] Training aborted: only {len(raw)} syms")
+            return
+        avail = [s for s in _SHORT_ML_SYMS if s in raw]
+        all_idx = raw[avail[0]].index
+        for s in avail[1:]:
+            all_idx = all_idx.union(raw[s].index)
+        close_df = pd.DataFrame({s: raw[s]["close"].reindex(all_idx) for s in avail})
+        high_df  = pd.DataFrame({s: raw[s]["high"].reindex(all_idx)  for s in avail})
+        low_df   = pd.DataFrame({s: raw[s]["low"].reindex(all_idx)   for s in avail})
+        vol_df   = pd.DataFrame({s: raw[s]["volume"].reindex(all_idx)for s in avail})
+        if "BTC" not in close_df.columns:
+            print("[SHORT-ML] BTC missing from aligned frame, aborted")
+            return
+        labels = _sml_compute_labels(close_df, high_df, low_df)
+        rows2 = []
+        for sym in avail:
+            if sym not in labels:
+                continue
+            try:
+                feat = _sml_build_feats(sym, close_df, high_df, low_df, vol_df)
+                feat = feat[feat.index.hour % 2 == 0].copy()
+                feat["label"]  = labels[sym].reindex(feat.index)
+                feat["symbol"] = sym
+                feat["dt"]     = feat.index
+                rows2.append(feat)
+            except Exception as _be:
+                print(f"[SHORT-ML] feat {sym}: {_be}")
+        if not rows2:
+            print("[SHORT-ML] No feature rows, aborted")
+            return
+        df_all = pd.concat(rows2, ignore_index=True)
+        train_end   = df_all["dt"].max()
+        train_start = train_end - pd.DateOffset(months=_SHORT_ML_TRAIN_M)
+        df_tr = df_all[(df_all["dt"] >= train_start) & (df_all["dt"] <= train_end)].dropna(subset=["label"])
+        feat_cols = [c for c in df_tr.columns if c not in _SHORT_ML_NONFEAT and c != "label"]
+        df_tr = df_tr.dropna(subset=feat_cols + ["label"])
+        if len(df_tr) < 3000:
+            print(f"[SHORT-ML] Only {len(df_tr)} rows, aborted")
+            return
+        X = df_tr[feat_cols].values.astype(float)
+        y = df_tr["label"].values.astype(float)
+        mdl = lgb.LGBMClassifier(
+            n_estimators=400, learning_rate=0.02, max_depth=6, num_leaves=48,
+            subsample=0.8, colsample_bytree=0.7, min_child_samples=120,
+            reg_lambda=2.0, verbose=-1,
+        )
+        mdl.fit(X, y)
+        tr_prob   = mdl.predict_proba(X)[:, 1]
+        threshold = float(np.percentile(tr_prob, _SHORT_ML_PCT))
+        _short_ml_state["model"]     = mdl
+        _short_ml_state["threshold"] = threshold
+        _short_ml_state["yearmonth"] = ym
+        _short_ml_state["feat_cols"] = feat_cols
+        print(f"[SHORT-ML] Trained: n={len(df_tr)} WR={y.mean():.2%} "
+              f"thr={threshold:.4f} elapsed={time.time()-t0:.0f}s")
+    except Exception as _te:
+        print(f"[SHORT-ML] Training error: {_te}")
+        import traceback as _tb; _tb.print_exc()
+    finally:
+        _short_ml_state["training"] = False
+
+
+def _short_ml_prefetch_and_train(exchange, now_jst: datetime) -> None:
+    """Called from v2_shadow_run() before shadow rows are built.
+    Refreshes inference OHLCV, trains model if needed, pre-computes feature vectors.
+    No live trading impact: all failures are caught."""
+    global _short_ml_state
+    if not (V2_SHORT_ML_SHADOW_ENABLE and _SHORT_ML_LGB_OK):
+        return
+    try:
+        ym = now_jst.strftime("%Y-%m")
+        # Step 1: refresh inference OHLCV (with TTL)
+        age = time.time() - _short_ml_state["infer_ts"]
+        if age >= _SHORT_ML_INFER_TTL or not _short_ml_state["close_1h"]:
+            raw_inf: Dict[str, pd.DataFrame] = {}
+            for sym in _SHORT_ML_SYMS:
+                try:
+                    df = _sml_fetch_inference_ohlcv(exchange, f"{sym}/USDT")
+                    if df is not None and len(df) >= 50:
+                        raw_inf[sym] = df
+                except Exception:
+                    pass
+            if "BTC" in raw_inf and len(raw_inf) >= 10:
+                for sym, df in raw_inf.items():
+                    _short_ml_state["close_1h"][sym] = df["close"].astype(float)
+                    _short_ml_state["high_1h"][sym]  = df["high"].astype(float)
+                    _short_ml_state["low_1h"][sym]   = df["low"].astype(float)
+                    _short_ml_state["vol_1h"][sym]   = df["volume"].astype(float)
+                _short_ml_state["infer_ts"] = time.time()
+        # Step 2: train if needed
+        if _short_ml_state["model"] is None or _short_ml_state["yearmonth"] != ym:
+            if not _short_ml_state.get("training"):
+                _short_ml_train(exchange, now_jst)
+        # Step 3: pre-compute current feature vectors
+        if _short_ml_state["model"] is None:
+            return
+        avail = [s for s in _SHORT_ML_SYMS if s in _short_ml_state["close_1h"]]
+        if "BTC" not in avail or len(avail) < 5:
+            return
+        close_df = pd.DataFrame({s: _short_ml_state["close_1h"][s] for s in avail})
+        high_df  = pd.DataFrame({s: _short_ml_state["high_1h"][s]  for s in avail})
+        low_df   = pd.DataFrame({s: _short_ml_state["low_1h"][s]   for s in avail})
+        vol_df   = pd.DataFrame({s: _short_ml_state["vol_1h"][s]   for s in avail})
+        if len(close_df) > 600:
+            close_df = close_df.iloc[-600:]
+            high_df  = high_df.iloc[-600:]
+            low_df   = low_df.iloc[-600:]
+            vol_df   = vol_df.iloc[-600:]
+        feat_cols = _short_ml_state.get("feat_cols", [])
+        cur: Dict[str, Dict[str, float]] = {}
+        for sym in avail:
+            if sym not in close_df.columns:
+                continue
+            try:
+                f_df = _sml_build_feats(sym, close_df, high_df, low_df, vol_df)
+                last_row = f_df.iloc[-2] if len(f_df) >= 2 else f_df.iloc[-1]
+                fv: Dict[str, float] = {}
+                for col in feat_cols:
+                    val = last_row[col] if col in last_row.index else np.nan
+                    try:
+                        fv[col] = float(val)
+                    except (TypeError, ValueError):
+                        fv[col] = np.nan
+                cur[sym] = fv
+            except Exception as _ce:
+                print(f"[SHORT-ML] cur_feats {sym}: {_ce}")
+        _short_ml_state["cur_feats"] = cur
+    except Exception as _e:
+        print(f"[SHORT-ML] prefetch_and_train error: {_e}")
+
+
+def _compute_short_ml_shadow(sig: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Compute SHORT ML shadow columns (record-only, no live trading impact).
+    Returns 10 values matching Short_ML_* columns in V2_HEADERS.
+    Returns all empty strings for non-SHORT candidates or if model not ready."""
+    _EMPTY = ("",) * 10
+    if not V2_SHORT_ML_SHADOW_ENABLE:
+        return _EMPTY
+    direction = str(sig.get("direction", "") or "").strip().upper()
+    if not direction.startswith("SHORT"):
+        return _EMPTY
+    model     = _short_ml_state.get("model")
+    threshold = _short_ml_state.get("threshold")
+    feat_cols = _short_ml_state.get("feat_cols", [])
+    if model is None or threshold is None or not feat_cols:
+        return _EMPTY
+    sym_raw = str(sig.get("symbol", "") or "").strip().upper().split("/")[0]
+    if sym_raw not in _SHORT_ML_SYM_IDX:
+        return _EMPTY
+    fv = _short_ml_state.get("cur_feats", {}).get(sym_raw)
+    if fv is None:
+        return (
+            "", float(threshold), "", _SHORT_ML_MODEL_V, _SHORT_ML_FEAT_V,
+            float(_SHORT_ML_TP), float(_SHORT_ML_SL), int(_SHORT_ML_HOLD),
+            "", "cur_feats_missing",
+        )
+    try:
+        X = np.array([[fv.get(c, np.nan) for c in feat_cols]], dtype=float)
+        nan_n = int(np.sum(~np.isfinite(X)))
+        if nan_n > 0:
+            return (
+                "", float(threshold), "0", _SHORT_ML_MODEL_V, _SHORT_ML_FEAT_V,
+                float(_SHORT_ML_TP), float(_SHORT_ML_SL), int(_SHORT_ML_HOLD),
+                "", f"nan_feats={nan_n}",
+            )
+        prob = float(model.predict_proba(X)[0, 1])
+    except Exception as _se:
+        return (
+            "", float(threshold), "0", _SHORT_ML_MODEL_V, _SHORT_ML_FEAT_V,
+            float(_SHORT_ML_TP), float(_SHORT_ML_SL), int(_SHORT_ML_HOLD),
+            "", f"score_err:{_se}",
+        )
+    above = prob >= threshold
+    selected = above
+    no_ol_reason = ""
+    sig_dt = sig.get("dt")
+    if above and sig_dt is not None:
+        try:
+            dt_utc = (sig_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                      if (hasattr(sig_dt, "tzinfo") and sig_dt.tzinfo) else sig_dt)
+            last_exit = _short_ml_state["no_overlap"].get(sym_raw)
+            if last_exit is not None and dt_utc < last_exit:
+                no_ol_reason = f"48h_block;last_exit={last_exit.isoformat()}"
+                selected = False
+            if selected:
+                _short_ml_state["no_overlap"][sym_raw] = (
+                    dt_utc + timedelta(hours=_SHORT_ML_HOLD)
+                )
+        except Exception:
+            pass
+    reason = (
+        f"prob={prob:.4f}{'>=thr' if above else '<thr'}={threshold:.4f}"
+        f";sel={'1' if selected else '0'}"
+        + (f";{no_ol_reason}" if no_ol_reason else "")
+    )
+    return (
+        float(prob),
+        float(threshold),
+        "1" if selected else "0",
+        _SHORT_ML_MODEL_V,
+        _SHORT_ML_FEAT_V,
+        float(_SHORT_ML_TP),
+        float(_SHORT_ML_SL),
+        int(_SHORT_ML_HOLD),
+        no_ol_reason,
+        reason,
+    )
+
+
 def _compute_daily_cap_would_block(sig: Dict[str, Any]) -> str:
     """Daily cap 仮想評価。ai_note 内の rank=X からバッチ内順位を読み、
     上限（V2_DAILY_CAP_SHORT_WB / V2_DAILY_CAP_LONG_WB）を超えるなら "1"、以内なら "0"。
@@ -10054,6 +10486,8 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
     _rv_val, _rv_bucket, _rv_pass, _rv_reason, _rv_dir = _compute_rv_chg_shadow(sig)
     # long_f bypass 経路の行だけ long_f 専用 shadow を立てる（それ以外は空）。診断で long_f が最も明確だったため。
     _longf_rv = _rv_pass if (str(fp["BYPASS_PROFILE"]).strip().lower() == "long_f" and _rv_pass) else ""
+    (_sml_score, _sml_th, _sml_sel, _sml_mv, _sml_fv,
+     _sml_tp_v, _sml_sl_v, _sml_hh_v, _sml_nor, _sml_rsn) = _compute_short_ml_shadow(sig)
     return [
         "'" + sig["dt"].strftime("%Y-%m-%d %H:%M:%S"),
         sig["symbol"],
@@ -10140,6 +10574,17 @@ def v2_build_shadow_row(sig: Dict) -> List[Any]:
         _rv_reason,
         _longf_rv,
         _rv_dir,
+        # SHORT ML shadow（record-only。実通知・Discord・QS・notify_sent に一切影響しない）
+        (float(_sml_score) if isinstance(_sml_score, (int, float)) and np.isfinite(_sml_score) else ""),
+        (float(_sml_th)    if isinstance(_sml_th, (int, float))    and np.isfinite(_sml_th)    else ""),
+        _sml_sel,
+        _sml_mv,
+        _sml_fv,
+        (float(_sml_tp_v) if isinstance(_sml_tp_v, (int, float)) and np.isfinite(_sml_tp_v) else ""),
+        (float(_sml_sl_v) if isinstance(_sml_sl_v, (int, float)) and np.isfinite(_sml_sl_v) else ""),
+        (int(_sml_hh_v)   if isinstance(_sml_hh_v, (int, float)) and np.isfinite(_sml_hh_v) else ""),
+        _sml_nor,
+        _sml_rsn,
     ]
 
 
@@ -13876,6 +14321,13 @@ def v2_shadow_run(exchange, now_jst: datetime, force: bool = False) -> str:
             cur_note = str(sig.get("ai_note", "") or "")
             add_note = "notify_sent=0;notify_send_reason=engine_not_v2_live"
             sig["ai_note"] = f"{cur_note};{add_note}" if cur_note else add_note
+
+    # SHORT ML shadow: pre-compute feature vectors + ensure model is trained
+    # record-only: 実通知・Discord・notify_sent・QS・route選別に一切影響しない
+    try:
+        _short_ml_prefetch_and_train(exchange, now_jst)
+    except Exception as _sml_pre_e:
+        print(f"[SHORT-ML] prefetch call error (ignored): {_sml_pre_e}")
 
     # シート書き込み（選抜通過もREJECTも全部書く）
     # 重要: 送信結果を ai_note に反映したあとで書く
