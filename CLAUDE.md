@@ -2110,3 +2110,57 @@ SHORT停止維持 / LONG_E停止維持 / LONG_F観察継続
 rv_chg gate化しない / cs_mom gate化しない / lt_stable変更なし
 SHORT再開なし / LONG_F停止なし / QS修正なし / ENV変更なし
 ```
+
+---
+
+## 【2026-06-22 ブランチ防御原則の確定】不採用コードは本番にも main にも入れない
+
+**賢治さん指摘（2026-06-22・厳守）：**
+
+### 誤った安全網認識（禁止）
+
+```
+✗「lightgbm が requirements.txt にないから自動無効 → 実害なし → deployしてもいい」
+→ これは安全網として頼ってはいけない。
+  将来 requirements.txt に lightgbm が追加されたり、別修正で有効化されると
+  不採用の SHORT_ML が本番で動く。fragile な防御線に依存するな。
+```
+
+### 正しい防御原則（絶対厳守）
+
+```
+不採用コードは、本番（Cloud Run）にも main ブランチにも絶対に入れない。
+「自動無効になるから大丈夫」を根拠に deploy / merge することは禁止。
+```
+
+### 現ブランチの構造（確認済み・2026-06-22）
+
+```
+branch: claude/crypto-bot-assistant-QlA5G
+main.py 内の混在状態:
+  採用済み（本番稼働中）: rv_chg shadow（dab5a28）/ cs_mom shadow（6c7757f）
+  不採用（本番未投入）:  SHORT_ML_SHADOW（052f508）
+  → Excelの列（74列）にSHORT_ML系の列がないことで本番未投入を確認済み
+
+守るべき防御線:
+  1. このブランチを Cloud Run に deploy しない
+  2. このブランチを main に丸ごと merge しない
+```
+
+### CLAUDE.md だけ残したい場合の正しい方法
+
+```
+NG: このブランチ HEAD から docs/CLAUDE.md だけ抜いてマージ
+    → 万が一の操作ミスで main.py も混入するリスクあり
+
+OK: main 相当から新しいブランチを作り、CLAUDE.md 部分だけ cherry-pick または手動適用
+    → SHORT_ML が正史コードになるリスクがない
+    → 現時点では実施不要。必要になったときに実施する
+```
+
+### 次の監視ポイント（追加開発なし）
+
+```
+1. 6/23 09:00以降: cs_mom_shadow row0 の eval_status が DONE になるか / PnL符号確認
+2. LONG_F: あと数日の実通知を観察（改善継続 or 悪化で判断を更新）
+```
