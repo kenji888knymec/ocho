@@ -2007,3 +2007,106 @@ cs_mom_shadow はONのまま前向き記録（record-only・本番通知に混�
 SHORT再開なし / SHORT_AI_RANK再開なし / rv_chg gate化なし
 TP/SL変更なし / QS修正なし / ENV追加変更なし / LONG_F停止なし
 ```
+
+---
+
+## 【2026-06-20〜22 SHORT_ML_SHADOW 不採用決定】OKX検証で全条件不合格
+
+**記録日: 2026-06-22。不採用決定。コード変更・マージ・デプロイは一切なし。**
+
+### 不採用の経緯
+
+commit `052f508` で branch `claude/crypto-bot-assistant-QlA5G` に SHORT_ML_SHADOW（LightGBM walk-forward shadow実装・452行）を追加したが、以下の理由でそのまま凍結・不採用とした。
+
+### 不採用の5理由（独立して各々が不採用根拠）
+
+1. **OKX検証・全パラメータ不合格（決定的）**
+   - `tf_thr_validate_okx.py`（23銘柄・walk-forward・PCT=98%・6基準）で検証
+   - TP/SL 全組合せ（TPリスト×SLリスト）で6基準（WR≥60%/avg≥+0.15%/median>0/top3除外avg+/LOWO全週+/active_months≥6）を満たすものゼロ
+   - 検証コードにバグ・方法論上の問題なし（compute_labels/gen_select/robustness 全て正しい）
+
+2. **lightgbm が requirements.txt に存在しない → Cloud Run では自動無効化**
+   - `try: import lightgbm` で guard されており、import失敗時は `_SHORT_ML_LGB_OK=False` で全機能スキップ
+   - 本番に push しても実害ゼロだが、機能しないコードを本番に入れる意味もない
+
+3. **入口候補プール（母集団）自体がエッジなし**
+   - SHORT候補全体 median=-0.486%・暴落日依存（CLAUDE.md 2026-06-20 確定事実）
+   - AIランキングをどう設計しても、プール天井（WR48.6%/avgほぼゼロ）を超えられない
+   - ランキング改善より危険日ゲートが本筋（分析フレームが変わっている）
+
+4. **現行SHORTモデル（AI_Prob_Win）は逆方向に機能**
+   - Walk-forward AUC平均0.376、Top20% WR57.4% < Bottom80% WR69.7%（CLAUDE.md 2026-06-12確定）
+   - 同じ設計思想でSHORT_ML_SHADOWを作り直しても同じ結果になる可能性が高い
+
+5. **現時点でSHORTのAI再学習に進むフェーズでない**
+   - Phase 1（defensive filter + QualityScore + shadow安定化）→ Phase 2（データ蓄積）→ Phase 3（AI再学習）の順序を厳守
+   - 3反転列・rv_chg shadow・cs_mom shadow の前向き観察が先
+
+### やらないこと（確定）
+
+```
+SHORT_ML_SHADOW の本番マージ・デプロイ
+lightgbm の requirements.txt 追加
+SHORT_ML_SHADOW の再最適化（TP/SL/PCTの再探索）
+欠損銘柄をspot OHLCVで補完して再検証
+23銘柄版での条件再最適化
+「惜しい条件」の shadow 実装
+```
+
+### コードの扱い
+
+```
+branch: claude/crypto-bot-assistant-QlA5G に 052f508 として残存
+main へのマージ: しない
+Cloud Run デプロイ: しない
+requirements.txt 変更: しない
+コードの削除: しない（研究記録として保持）
+実害: なし（lightgbm 未インストールで自動無効化）
+```
+
+---
+
+## 【2026-06-22 EntryRecord_3 健全性診断】6/13〜6/22 前向き観察データ確認
+
+**データ：** EntryRecord_3.xlsx（DONE 62,258行、5/17〜6/22）、MD5=ce54968e。全V2-Shadow/V2-FeatureProbe。
+
+### 診断結果サマリー
+
+| 項目 | 結果 | 判定 |
+|---|---|---|
+| SHORT通知 (6/19以降) | 0件 | ✅ 停止維持 |
+| LONG_E通知 (6/12以降) | 0件 | ✅ 停止維持 |
+| LONG_F (6/13〜6/22) | n=57, WR=52.6%, avg=+0.041%, med=+0.335% | ⚠️ 観察継続 |
+| rv_chg shadow | 6/20以降 3,466/4,086件 非NaN記録中 | ✅ 正常 |
+| 3反転列 | 6/19以降 4,874件 全列非NaN | ✅ 正常 |
+| cs_mom_shadow | 2本記録（6/20 21:00, 6/21 09:00）OPEN | ✅ 正常 |
+| lt_stable (6/20〜6/21) | n=15, WR=40%, avg=-0.123% | ❌ 基準未達・変更なし |
+
+### LONG_F 日別（6/13〜6/22）
+
+| 日 | n | WR | avg |
+|---|---|---|---|
+| 6/13 | 6 | 83% | +0.390% |
+| 6/16 | 20 | 55% | +0.464% |
+| 6/17 | 21 | 29% | -0.676% |
+| 6/20 | 1 | 100% | +0.637% |
+| 6/22 | 9 | 78% | +0.474% |
+
+5日中4日プラス。停止基準（実通知8件+・WR35%未満・avgマイナス複数日）非該当。観察継続。
+
+### cs_mom_shadow 確認
+
+```
+2本目（6/21 09:00スロット）: 正常追加 ✅ 重複なし
+期待eval時刻: row0=6/22 21:00 / row1=6/23 09:00（いずれもOPEN）
+PnL: まだ未確定（評価時刻未到達）
+次の確認: 6/23 09:00以降に row1 が DONE になるか
+```
+
+### 現状維持（変更なし）
+
+```
+SHORT停止維持 / LONG_E停止維持 / LONG_F観察継続
+rv_chg gate化しない / cs_mom gate化しない / lt_stable変更なし
+SHORT再開なし / LONG_F停止なし / QS修正なし / ENV変更なし
+```
