@@ -20,6 +20,7 @@ train : 2024-01-01 〜 2025-03-31（15ヶ月）
 test  : 2025-04-01 〜 2026-06-21（15ヶ月）
 
 合格基準（事前固定）:
+  test trades >= 10（件数不足は勝率が良くても保留・不合格）
   test avg PnL_Net > 0
   test median PnL_Net > -3%
   test active_months >= 5
@@ -27,6 +28,12 @@ test  : 2025-04-01 〜 2026-06-21（15ヶ月）
   BTC と ETH 両方合格（片方だけはNG）
   top3ヶ月集中度 < 60%
   trainで合格・testで符号逆転は不合格
+
+SL判定の定義（事前固定）:
+  エントリー翌日以降、日足 Low が entry_price × 0.95 以下でSL到達。
+  SL到達日: exit_price = entry_price × 0.95（通常ケース）
+  ギャップダウン: 当日 Open がすでに SL 以下 → exit_price = 当日 Open（保守的）
+  SL と 10日保有終了が同日の場合: SL 優先
 
 やらないこと（厳守）:
   20日を18日・22日に変更しない
@@ -58,6 +65,7 @@ TEST_START  = "2025-04-01"
 TEST_END    = "2026-06-21"
 
 # 合格基準（事前固定）
+PASS_MIN_N  = 10     # test trades >= 10
 PASS_AVG    = 0.0    # avg > 0
 PASS_MED    = -3.0   # median > -3%
 PASS_MONTHS = 5      # active_months >= 5
@@ -104,14 +112,23 @@ def simulate(daily: pd.DataFrame, sym: str) -> pd.DataFrame:
                 entry_date  = d.at[i, "date"]
                 entry_idx   = i
         else:
-            days_held = i - entry_idx
-            sl_price  = entry_price * (1.0 - SL_PCT)
-            hit_sl    = d.at[i, "low"] <= sl_price
-            hit_hold  = days_held >= HOLD_DAYS
+            days_held   = i - entry_idx
+            sl_price    = entry_price * (1.0 - SL_PCT)
+            gap_down    = d.at[i, "open"] <= sl_price   # 始値がすでにSL以下
+            hit_sl_low  = d.at[i, "low"]  <= sl_price   # 日中にSL到達
+            hit_sl      = gap_down or hit_sl_low
+            hit_hold    = days_held >= HOLD_DAYS
 
             if hit_sl or hit_hold:
-                exit_price = sl_price if hit_sl else d.at[i, "close"]
-                reason     = "SL" if hit_sl else "HOLD"
+                if gap_down:
+                    exit_price = d.at[i, "open"]   # ギャップダウン→始値でexit（保守的）
+                    reason     = "SL_GAP"
+                elif hit_sl_low:
+                    exit_price = sl_price           # 日中SL到達→SL価格でexit
+                    reason     = "SL"
+                else:
+                    exit_price = d.at[i, "close"]  # 保有期間終了
+                    reason     = "HOLD"
                 pnl_gross  = (exit_price / entry_price - 1.0) * 100.0
                 pnl_net    = pnl_gross - COST_RT * 100.0
                 trades.append({
@@ -166,6 +183,8 @@ def check_pass(r: dict) -> list[str]:
     if r.get("n", 0) == 0:
         return ["データなし"]
     fails = []
+    if r["n"] < PASS_MIN_N:
+        fails.append(f"件数不足 n={r['n']} < {PASS_MIN_N}（勝率・avgに関係なく保留）")
     if r["avg_%"] <= PASS_AVG:
         fails.append(f"avg {r['avg_%']:.3f}% ≤ 0")
     if r["median_%"] <= PASS_MED:
