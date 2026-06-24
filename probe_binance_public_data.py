@@ -75,9 +75,11 @@ def fetch_klines(d: date, interval: str = "1h") -> pd.DataFrame | None:
     return df
 
 
-# ─── 3. fundingRate ──────────────────────────────────────────────────
-def fetch_funding(d: date) -> pd.DataFrame | None:
-    url = f"{BASE}/fundingRate/{SYM}/{SYM}-fundingRate-{d}.zip"
+# ─── 3. fundingRate（月次のみ。daily には存在しない） ────────────────
+FUNDING_BASE = "https://data.binance.vision/data/futures/um/monthly/fundingRate"
+
+def fetch_funding_month(y: int, m: int) -> pd.DataFrame | None:
+    url = f"{FUNDING_BASE}/{SYM}/{SYM}-fundingRate-{y}-{m:02d}.zip"
     return fetch_zip_csv(url)
 
 
@@ -169,21 +171,14 @@ def main():
     else:
         klines = None
 
-    # ── fundingRate ───────────────────────────────────────────
-    print("\n■ 3. fundingRate")
-    flist = []
-    for d in DATES:
-        print(f"  fetch fundingRate {d} ...", end=" ")
-        df = fetch_funding(d)
-        if df is not None:
-            print(f"OK rows={len(df)}")
-            flist.append(df)
-        else:
-            print("NG")
-
-    if flist:
-        funding = pd.concat(flist, ignore_index=True)
-        show_head("fundingRate (3日合計)", funding)
+    # ── fundingRate（月次ファイルから対象月を取得し3日分に絞る） ──────
+    print("\n■ 3. fundingRate（月次ファイル）")
+    fy, fm = DATES[0].year, DATES[0].month
+    print(f"  fetch fundingRate {fy}-{fm:02d} (月次) ...", end=" ")
+    funding = fetch_funding_month(fy, fm)
+    if funding is not None:
+        print(f"OK rows={len(funding)}（月全体）")
+        show_head("fundingRate (月次・先頭)", funding)
         ts_col = next((c for c in funding.columns if "time" in c.lower()), None)
         if ts_col:
             raw = funding[ts_col].iloc[0]
@@ -192,23 +187,30 @@ def main():
             else:
                 unit = "ms" if raw > 1e12 else "s"
                 funding["_jst"] = pd.to_datetime(funding[ts_col], unit=unit, utc=True).dt.tz_convert("Asia/Tokyo")
-            print(f"  Funding時刻(JST): {funding['_jst'].tolist()}")
+            interval = funding["funding_interval_hours"].iloc[0] if "funding_interval_hours" in funding.columns else "?"
+            print(f"  Funding先頭3件(JST): {funding['_jst'].head(3).tolist()}")
+            print(f"  Funding間隔(h): {interval}")
     else:
         funding = None
 
-    # ── 結合テスト ────────────────────────────────────────────
+    # ── 結合テスト（dtype を UTC ns に統一してから merge_asof） ──────────
     print("\n■ 4. metrics × klines 結合テスト（merge_asof）")
     if metrics is not None and klines is not None and "_jst" in metrics.columns and "_jst" in klines.columns:
-        m2 = metrics.sort_values("_jst").copy()
-        k2 = klines.sort_values("_jst").copy()
+        m2 = metrics.copy()
+        k2 = klines.copy()
+        # 精度(us/ms)とtzのゆらぎを吸収: 一旦UTC・ns精度に正規化
+        m2["_utc"] = pd.to_datetime(m2["_jst"], utc=True).astype("datetime64[ns, UTC]")
+        k2["_utc"] = pd.to_datetime(k2["_jst"], utc=True).astype("datetime64[ns, UTC]")
+        m2 = m2.sort_values("_utc")
+        k2 = k2.sort_values("_utc")
         merged = pd.merge_asof(
-            m2, k2[["_jst", "close", "volume"]].rename(columns={"close": "k_close", "volume": "k_vol"}),
-            on="_jst", direction="backward"
+            m2, k2[["_utc", "close", "volume"]].rename(columns={"close": "k_close", "volume": "k_vol"}),
+            on="_utc", direction="backward"
         )
         print(f"  メトリクス行数: {len(m2)}  klines行数: {len(k2)}  結合後: {len(merged)}")
         na_close = merged["k_close"].isna().sum()
         print(f"  k_close 欠損: {na_close}行 ({na_close/len(merged)*100:.1f}%)")
-        print(merged[["_jst", "k_close"]].head(3).to_string())
+        print(merged[["_utc", "k_close"]].head(3).to_string())
     else:
         print("  metrics または klines が未取得のため結合スキップ。")
 
