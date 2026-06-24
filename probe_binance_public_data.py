@@ -117,14 +117,21 @@ def main():
         metrics = pd.concat(mlist, ignore_index=True)
         show_head("metrics (3日合計)", metrics)
 
-        # 時刻列を探す
+        # 時刻列を探す（create_time は "2024-01-01 00:05:00" の文字列日時）
         ts_col = next((c for c in metrics.columns if "time" in c.lower() or "timestamp" in c.lower()), None)
         if ts_col:
-            unit = "ms" if metrics[ts_col].iloc[0] > 1e12 else "s"
-            metrics["_jst"] = pd.to_datetime(metrics[ts_col], unit=unit, utc=True).dt.tz_convert("Asia/Tokyo")
+            raw = metrics[ts_col].iloc[0]
+            if isinstance(raw, str):
+                # 文字列日時: Binance metrics の create_time 形式
+                metrics["_jst"] = pd.to_datetime(metrics[ts_col], utc=True).dt.tz_convert("Asia/Tokyo")
+                unit_desc = "string-datetime"
+            else:
+                unit = "ms" if raw > 1e12 else "s"
+                metrics["_jst"] = pd.to_datetime(metrics[ts_col], unit=unit, utc=True).dt.tz_convert("Asia/Tokyo")
+                unit_desc = f"numeric-{unit}"
             diffs = metrics["_jst"].diff().dropna()
             most_common = diffs.value_counts().index[0] if len(diffs) else None
-            print(f"\n  時刻列: {ts_col}  単位推定: {unit}")
+            print(f"\n  時刻列: {ts_col}  形式: {unit_desc}")
             print(f"  最頻インターバル: {most_common}  （≒粒度）")
             print(f"  先頭3行 JST: {metrics['_jst'].head(3).tolist()}")
 
@@ -179,8 +186,12 @@ def main():
         show_head("fundingRate (3日合計)", funding)
         ts_col = next((c for c in funding.columns if "time" in c.lower()), None)
         if ts_col:
-            unit = "ms" if funding[ts_col].iloc[0] > 1e12 else "s"
-            funding["_jst"] = pd.to_datetime(funding[ts_col], unit=unit, utc=True).dt.tz_convert("Asia/Tokyo")
+            raw = funding[ts_col].iloc[0]
+            if isinstance(raw, str):
+                funding["_jst"] = pd.to_datetime(funding[ts_col], utc=True).dt.tz_convert("Asia/Tokyo")
+            else:
+                unit = "ms" if raw > 1e12 else "s"
+                funding["_jst"] = pd.to_datetime(funding[ts_col], unit=unit, utc=True).dt.tz_convert("Asia/Tokyo")
             print(f"  Funding時刻(JST): {funding['_jst'].tolist()}")
     else:
         funding = None
