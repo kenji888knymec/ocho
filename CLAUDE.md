@@ -2450,3 +2450,57 @@ SHORT再開 / SHORT_AI_RANK再開 / rv_chg gate化 / TP/SL変更 / QS修正 / EN
 前向きrecord-only（rv_chg / 3反転列 / cs_mom_shadow）の蓄積を待つ状態は維持。
 次の入力: 別ソースの新データ、または前向きデータがGO条件に達したとき。
 ```
+
+---
+
+## 【2026-06-24 Funding Carry検証メモ】監視対象として棚上げ確定
+
+**記録日: 2026-06-24。本番・ENV・通知設定・main.py への変更は一切なし。**
+
+Binance fundingRate 2020-01〜2026-05で、BTC/ETH/SOL/DOGE/BNBを検証。
+BTC/ETHは全期間では構造収益が確認できたが、直近Fundingは大幅に低下。
+
+### 2026-05末時点の現在地スナップショット（verify_funding_carry.py Section 5）
+
+```
+BTC/ETHともに 30d/60d/90d/180d/12m の pass_030/pass_060 は全てNO
+
+BTC 12m net_060 = 2.94%
+ETH 12m net_060 = 2.56%
+BTC 90d net_060 = -0.77%
+ETH 90d net_060 = -0.31%
+```
+
+### 確定結論
+
+```
+Funding Carryは失敗トラックではない。
+BTC/ETHについては構造収益として監視対象に残す。
+ただし現在地は薄すぎる。今すぐ資金投入しない。
+発火ルール最適化もしない。閾値変更もしない。
+
+実運用しない
+本番Botに接続しない
+main.py変更なし / deployなし / mergeなし
+DOGE：参考のみ（全期間では機能するが現在薄い）
+SOL/BNB：監視終了
+```
+
+### 監視ルール（月1回程度）
+
+```
+cd ~/Downloads
+curl -L "https://raw.githubusercontent.com/kenji888knymec/ocho/claude/crypto-bot-assistant-QlA5G/verify_funding_carry.py" -o verify_funding_carry.py
+python3.14 verify_funding_carry.py
+```
+
+BTC/ETHの 90d/180d/12m pass_060 を確認する。
+pass_060 が YES になっても即運用GOではなく、取引所/税務/清算/実手数料の確認を開始するラインとする。
+
+### やらないこと（確定）
+
+```
+Basis検証 / クロス取引所比較 / 発火ルール検証 / 閾値最適化
+SOL/BNBの追加調査
+Funding Carry関連のBot組み込み・main.py変更
+```
