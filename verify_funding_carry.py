@@ -99,6 +99,13 @@ SUBPERIODS = [
 # 現物全額 + Perp証拠金 + バッファ ≒ 想定元本の1.2〜2.0倍
 CAPITAL_MULTIPLIERS = [1.2, 1.5, 2.0]
 
+# 現在地スナップショット: trailing window の日数ラベルと期間
+WINDOWS = [("30日", 30), ("60日", 60), ("90日", 90), ("180日", 180), ("12ヶ月", 365)]
+
+# ハードルレート（net年率の最低基準・事前固定・閾値探索しない）
+# 根拠: 無リスク金利(~4-5%) + 取引所/清算/手間リスクプレミアム(~3-4%) = 8%
+HURDLE_PCT = 8.0
+
 
 # ─── ダウンロード ─────────────────────────────────────────────────
 def _fetch_zip_csv(url: str) -> pd.DataFrame | None:
@@ -472,6 +479,52 @@ def main():
             with pd.option_context("display.width", 200, "display.max_columns", None):
                 print(roe_df_out.to_string(index=False))
 
+        # ── 5. 現在地スナップショット（Trailing Window） ─────────────────
+        print(f"\n{'─'*60}")
+        print("▶ 5. 現在地スナップショット（Trailing Window）  BTC/ETHのみ")
+        print("   直近N日の累積Fundingを年率換算した「今この瞬間の利回り」")
+        print(f"   ハードル: net≥{HURDLE_PCT:.0f}%（清算/取引所/手間リスクを背負う最低ライン・固定）")
+        snapshot_rows = []
+        for sym in [s for s in DEEP_SYMS if s in fund_by_sym]:
+            fund_s   = fund_by_sym[sym]
+            last_utc = fund_s["_utc"].iloc[-1]
+            print(f"\n  {sym}  (データ末尾: {last_utc.date()})")
+            s_rows = []
+            for label, days in WINDOWS:
+                cutoff = last_utc - pd.Timedelta(days=days)
+                sub = fund_s[fund_s["_utc"] >= cutoff]
+                if len(sub) < 2:
+                    continue
+                actual_d = (sub["_utc"].iloc[-1] - sub["_utc"].iloc[0]).total_seconds() / 86400
+                if actual_d < 1:
+                    continue
+                gross_ann = float(sub["rate"].sum()) * 100 * (365.0 / actual_d)
+                net_030   = gross_ann - ROUND_TRIP_FEE_PCT
+                net_060   = gross_ann - ROUND_TRIP_FEE_PCT2
+                row = {
+                    "window":      label,
+                    "actual_days": round(actual_d, 1),
+                    "gross_ann_%": round(gross_ann, 2),
+                    "net_030_%":   round(net_030,   2),
+                    "net_060_%":   round(net_060,   2),
+                }
+                for mult in CAPITAL_MULTIPLIERS:
+                    row[f"ROE×{mult:.1f}(030)%"] = round(net_030 / mult, 2) if np.isfinite(net_030) else None
+                    row[f"ROE×{mult:.1f}(060)%"] = round(net_060 / mult, 2) if np.isfinite(net_060) else None
+                row["pass_030(≥8%)"] = "YES" if (np.isfinite(net_030) and net_030 >= HURDLE_PCT) else "NO"
+                row["pass_060(≥8%)"] = "YES" if (np.isfinite(net_060) and net_060 >= HURDLE_PCT) else "NO"
+                s_rows.append(row)
+                snapshot_rows.append({"symbol": sym, **row})
+            if s_rows:
+                with pd.option_context("display.width", 200, "display.max_columns", None):
+                    print(pd.DataFrame(s_rows).to_string(index=False))
+        if snapshot_rows:
+            snap_df_out = pd.DataFrame(snapshot_rows)
+            snap_df_out.to_csv(OUT_DIR / "current_yield_snapshot.csv", index=False)
+            print(f"\n  (詳細: {OUT_DIR}/current_yield_snapshot.csv)")
+        print(f"  YES = 利回りが太っている（今すぐ検討余地あり）")
+        print(f"  NO  = 米国債等の代替に見劣り（待機。利回りが太るまで張らない）")
+
     # ─── CSV 保存 ──────────────────────────────────────────────────
     summary_df.to_csv(OUT_DIR / "summary_by_symbol.csv", index=False)
     monthly_df.to_csv(OUT_DIR / "monthly_funding.csv", index=False)
@@ -481,6 +534,7 @@ def main():
     print("  monthly_funding.csv    — 銘柄×月別 平均・合計Funding")
     print("  yearly_funding.csv     — 銘柄×年別 累積Funding")
     print("  roll12_monthly.csv     — BTC/ETH/DOGE Rolling 12ヶ月年率グロス")
+    print("  current_yield_snapshot.csv — BTC/ETH Trailing窓別 現在地スナップショット")
     print("=" * 78)
     print("\n判定の見方（事前固定・閾値探索なし・ただし設計バイアスは残る）:")
     print("  ann_net(fee0.30)   : 控除後年率（下限コスト）。プラスでなければ話にならない")
