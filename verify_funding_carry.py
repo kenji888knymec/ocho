@@ -9,7 +9,14 @@ verify_funding_carry.py  【Funding Carry（Cash & Carry）過去検証】
 
   ★これは方向予測シグナルではない。市場ニュートラル構造収益の検証。
    勝率という概念はない。年率とマイナス期間（耐性）で評価する。
-   閾値探索・条件追加は一切しない（足し算のみ＝過学習が原理的に入らない）。
+   閾値探索・条件追加はしない。ただし「過学習が無い」とは言い切らない。
+   残るバイアス（必ず意識する）:
+     - 取引所バイアス（Binanceのみ）
+     - 銘柄選択バイアス（BTC/ETH/SOL/DOGE/BNBを選んだこと）
+     - サバイバーシップ（上場後生き残った銘柄だけ）
+     - 手数料仮定の甘さ/厳しさ（0.30%/0.60%の2段で見る）
+     - スリッページ・証拠金管理・清算は未モデル化
+   → 閾値探索型の過学習は入りにくいが、設計バイアスは残る、が正確。
 
 ポジション前提:
   Cash & Carry = 現物 LONG + Perp SHORT（デルタ≒ゼロ）
@@ -69,8 +76,12 @@ MONTHS = [
     if _START <= (y, m) <= _END
 ]
 
-# 手数料（往復・保守的）: 現物 0.10%×2 + Perp 0.05%×2 = 0.30%（1サイクルに1回）
-ROUND_TRIP_FEE_PCT = 0.30
+# 手数料（往復・1サイクルに1回）。2段階で見る:
+#   0.30% = 現物0.10%×2 + Perp0.05%×2（maker寄り・保守的下限）
+#   0.60% = よりtaker寄り・スプレッド/スリッページ込みの厳しめ想定
+# 結果が0.30%でだけプラスなら、0.60%で消える可能性を疑う。
+ROUND_TRIP_FEE_PCT  = 0.30
+ROUND_TRIP_FEE_PCT2 = 0.60
 
 
 # ─── ダウンロード ─────────────────────────────────────────────────
@@ -144,9 +155,11 @@ def carry_metrics(sym: str, fund: pd.DataFrame) -> dict:
     cum_gross = float(np.nansum(rate_pct))           # %
     ann_gross = cum_gross / years if years and years > 0 else np.nan
 
-    # 手数料控除（全期間保有前提・往復1回だけ）
-    cum_net = cum_gross - ROUND_TRIP_FEE_PCT
-    ann_net = cum_net / years if years and years > 0 else np.nan
+    # 手数料控除（全期間保有前提・往復1回だけ）2段階
+    cum_net  = cum_gross - ROUND_TRIP_FEE_PCT
+    ann_net  = cum_net / years if years and years > 0 else np.nan
+    cum_net2 = cum_gross - ROUND_TRIP_FEE_PCT2
+    ann_net2 = cum_net2 / years if years and years > 0 else np.nan
 
     # 平均Funding（settlementあたり・日あたり）
     avg_per_settle = float(np.nanmean(rate_pct))
@@ -186,7 +199,8 @@ def carry_metrics(sym: str, fund: pd.DataFrame) -> dict:
         "settles_per_day": round(settles_per_day, 2) if np.isfinite(settles_per_day) else None,
         "cum_gross_pct": round(cum_gross, 3),
         "ann_gross_pct": round(ann_gross, 3) if np.isfinite(ann_gross) else None,
-        "ann_net_pct(fee0.30once)": round(ann_net, 3) if np.isfinite(ann_net) else None,
+        "ann_net_pct(fee0.30)": round(ann_net, 3) if np.isfinite(ann_net) else None,
+        "ann_net_pct(fee0.60)": round(ann_net2, 3) if np.isfinite(ann_net2) else None,
         "avg_per_day_pct": round(avg_per_day, 5) if np.isfinite(avg_per_day) else None,
         "breakeven_days(fee0.30)": round(breakeven_days, 1) if np.isfinite(breakeven_days) else None,
         "pct_positive_settles": round(pct_pos, 1),
@@ -263,7 +277,7 @@ def main():
     print(f"{'='*78}")
     show_cols = [
         "symbol", "years", "settles_per_day",
-        "ann_gross_pct", "ann_net_pct(fee0.30once)",
+        "ann_gross_pct", "ann_net_pct(fee0.30)", "ann_net_pct(fee0.60)",
         "pct_positive_settles", "pct_positive_months",
         "longest_neg_streak_days", "worst_neg_streak_sum_pct", "carry_curve_maxDD_pct",
     ]
@@ -286,13 +300,22 @@ def main():
     print("  monthly_funding.csv    — 銘柄×月別 平均Funding")
     print("  yearly_funding.csv     — 銘柄×年別 累積Funding")
     print("=" * 78)
-    print("\n判定の見方（事前固定・閾値探索なし）:")
-    print("  ann_net_pct        : 手数料控除後の年率。プラスでなければ話にならない")
+    print("\n判定の見方（事前固定・閾値探索なし・ただし設計バイアスは残る）:")
+    print("  ann_net(fee0.30)   : 控除後年率（下限コスト）。プラスでなければ話にならない")
+    print("  ann_net(fee0.60)   : 厳しめコスト。0.30%でだけプラスなら実運用で消える疑い")
     print("  longest_neg_streak : Fundingマイナスが何日続いたか（耐性の核心）")
     print("  worst_neg_streak_sum: その間にどれだけ払ったか（最悪期の痛み）")
     print("  carry_curve_maxDD  : 累積Funding曲線の最大落ち込み")
     print("  pct_positive_months: プラス月の割合（高いほど安定）")
-    print("  ※スリッページ・清算・maker/taker差・取引所リスクは含まない（無料データの限界）")
+    print("\n  GO候補の目安（厳しめに見る）:")
+    print("    - BTC/ETH で net年率(0.60%控除後) が明確にプラス")
+    print("    - 2022年型の弱気相場でも完全崩壊していない")
+    print("    - マイナスFunding連続期間・worst streak が資金的/心理的に耐えられる")
+    print("  STOPの目安:")
+    print("    - BTCだけ / DOGE・BNBだけ妙に高い / net年率2〜3%程度 / 0.60%で消える")
+    print("    - マイナスFundingが数ヶ月続く / 最大DDが大きい")
+    print("\n  残るバイアス: Binanceのみ / 銘柄選択 / サバイバーシップ /")
+    print("    スリッページ・清算・証拠金管理・取引所リスクは未モデル化（無料データの限界）")
 
 
 if __name__ == "__main__":
