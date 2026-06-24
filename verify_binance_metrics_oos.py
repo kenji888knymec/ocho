@@ -16,7 +16,7 @@ verify_binance_metrics_oos.py  【Binance metrics 小規模OOS検証】
     funding  = fundingRate（直近settlement値・as-of）
   目的変数: 8h先・24h先のBTC価格リターン
   分位: 月内3分位（low/mid/high）固定
-  期間: 2021〜2026の代表月（年2回・1月と7月）= 最大11ヶ月
+  期間: 2021-01〜2026-05 の全月（取得可能な最新月まで・欠損月は自動SKIP）= 最大65ヶ月
 
 評価（手動運用基準は適用しない・存在確認のみ）:
   - high − low effect の符号が複数月で一貫しているか
@@ -49,14 +49,15 @@ SSL_CTX = ssl.create_default_context()
 HDRS    = {"User-Agent": "Mozilla/5.0"}
 OUT_DIR = Path("binance_oos_out")
 
-# 代表月: 年2回(1月・7月)、2021〜2026
-REP_MONTHS = [
-    (2021, 1), (2021, 7),
-    (2022, 1), (2022, 7),
-    (2023, 1), (2023, 7),
-    (2024, 1), (2024, 7),
-    (2025, 1), (2025, 7),
-    (2026, 1),
+# 全月: 2021-01 〜 2026-05（取得可能な最新月まで・欠損月は load_one_month が自動SKIP）
+# 設計は固定（特徴量・分位・評価・as-of/欠損処理は変更なし）。月数のみ拡大。
+_START = (2021, 1)
+_END   = (2026, 5)
+ALL_MONTHS = [
+    (y, m)
+    for y in range(_START[0], _END[0] + 1)
+    for m in range(1, 13)
+    if _START <= (y, m) <= _END
 ]
 
 # 特徴量定義（事前固定）
@@ -226,12 +227,12 @@ def tercile_stats(df: pd.DataFrame, feat_col: str, ret_col: str) -> pd.DataFrame
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     print("=" * 70)
-    print(f"Binance metrics OOS検証  対象: {SYM}  代表月: {len(REP_MONTHS)}ヶ月")
+    print(f"Binance metrics OOS検証  対象: {SYM}  全月: {len(ALL_MONTHS)}ヶ月（2021-01〜2026-05）")
     print(f"特徴量: {[f[0] for f in FEATURES]}")
     print("=" * 70)
 
     all_frames = []
-    for y, m in REP_MONTHS:
+    for y, m in ALL_MONTHS:
         print(f"\n■ {y}-{m:02d} 取得中...")
         frame = load_one_month(y, m)
         if frame is not None:
