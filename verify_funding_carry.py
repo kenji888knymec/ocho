@@ -48,6 +48,7 @@ verify_funding_carry.py  【Funding Carry（Cash & Carry）過去検証】
   summary_by_symbol.csv  — 銘柄別 全指標
   monthly_funding.csv    — 銘柄×月別の平均Funding・件数
   yearly_funding.csv     — 銘柄×年別の累積・平均Funding
+  roll12_monthly.csv     — BTC/ETH/DOGE の Rolling 12ヶ月年率グロス
 """
 import io
 import ssl
@@ -82,6 +83,21 @@ MONTHS = [
 # 結果が0.30%でだけプラスなら、0.60%で消える可能性を疑う。
 ROUND_TRIP_FEE_PCT  = 0.30
 ROUND_TRIP_FEE_PCT2 = 0.60
+
+# 深掘り対象銘柄（BTC/ETH中心。DOGEは参考のみ。SOL/BNBは深掘り対象外）
+DEEP_SYMS = ["BTCUSDT", "ETHUSDT"]
+REF_SYMS  = ["DOGEUSDT"]
+
+# 期間別サマリの開始年月（label, (year, month)）
+SUBPERIODS = [
+    ("2022-01+", (2022, 1)),
+    ("2024-01+", (2024, 1)),
+    ("2025-01+", (2025, 1)),
+]
+
+# 資本効率の想定倍率（想定元本 × N = 実際に必要な証拠金）
+# 現物全額 + Perp証拠金 + バッファ ≒ 想定元本の1.2〜2.0倍
+CAPITAL_MULTIPLIERS = [1.2, 1.5, 2.0]
 
 
 # ─── ダウンロード ─────────────────────────────────────────────────
@@ -212,6 +228,17 @@ def carry_metrics(sym: str, fund: pd.DataFrame) -> dict:
     }
 
 
+def carry_metrics_subperiod(sym: str, fund: pd.DataFrame, start_ym: tuple) -> dict | None:
+    """特定年月以降のサブ期間のみで carry_metrics を計算する。データが少ない場合は None。"""
+    year0, month0 = start_ym
+    sub = fund[
+        (fund["year"] > year0) | ((fund["year"] == year0) & (fund["month"] >= month0))
+    ].copy().reset_index(drop=True)
+    if len(sub) < 20:
+        return None
+    return carry_metrics(sym, sub)
+
+
 # ─── メイン ──────────────────────────────────────────────────────
 def main():
     OUT_DIR.mkdir(exist_ok=True)
@@ -224,6 +251,7 @@ def main():
     summary_rows = []
     monthly_rows = []
     yearly_rows  = []
+    fund_by_sym  = {}   # 深掘り分析用に fund DataFrame を保持
 
     for sym in SYMBOLS:
         print(f"\n■ {sym} fundingRate ロード中...")
@@ -231,16 +259,18 @@ def main():
         if fund is None or fund.empty:
             print(f"  [{sym}] データなし。SKIP。")
             continue
+        fund_by_sym[sym] = fund
         print(f"  settlements={len(fund)}  {fund['_utc'].iloc[0].date()}〜{fund['_utc'].iloc[-1].date()}")
 
         m = carry_metrics(sym, fund)
         summary_rows.append(m)
 
-        # 月別（プラス月の割合を見るため）
-        g = fund.groupby(["year", "month"])["rate"].agg(["mean", "count"]).reset_index()
+        # 月別（プラス月の割合・Rolling 12ヶ月計算のため sum も追加）
+        g = fund.groupby(["year", "month"])["rate"].agg(["sum", "mean", "count"]).reset_index()
         for _, row in g.iterrows():
             monthly_rows.append({
                 "symbol": sym, "year": int(row["year"]), "month": int(row["month"]),
+                "sum_funding_pct":  round(row["sum"]  * 100, 5),
                 "mean_funding_pct": round(row["mean"] * 100, 5),
                 "n_settles": int(row["count"]),
             })
@@ -292,13 +322,165 @@ def main():
                                       values="cum_funding_pct", aggfunc="first")
         print(pivot.round(2).to_string())
 
+    # ─── BTC/ETH 深掘り分析 ──────────────────────────────────────
+    deep_syms_available = [s for s in DEEP_SYMS + REF_SYMS if s in fund_by_sym]
+    if deep_syms_available:
+        print(f"\n{'='*78}")
+        print("【深掘り分析】BTC/ETH 中心（DOGE=参考。SOL/BNBは対象外）")
+        print(f"{'='*78}")
+
+        # ── 1. 期間別サマリ ──────────────────────────────────────
+        print("\n▶ 1. 期間別サマリ（全期間 / 2022-01以降 / 2024-01以降 / 2025-01以降）")
+        for sym in deep_syms_available:
+            fund = fund_by_sym[sym]
+            base = summary_df[summary_df["symbol"] == sym].iloc[0]
+            tag  = "深掘り" if sym in DEEP_SYMS else "参考"
+            print(f"\n  {sym}（{tag}）")
+            sp_rows = []
+
+            # 全期間行
+            ps_val = pos_share.get(sym)
+            pos_m_full = float(ps_val) if ps_val is not None and pd.notna(ps_val) else None
+            sp_rows.append({
+                "期間":             "全期間",
+                "years":            base["years"],
+                "ann_gross_%":      base["ann_gross_pct"],
+                "ann_net(0.30)%":   base["ann_net_pct(fee0.30)"],
+                "ann_net(0.60)%":   base["ann_net_pct(fee0.60)"],
+                "pos_months%":      pos_m_full,
+                "longest_neg_d":    base["longest_neg_streak_days"],
+                "worst_streak%":    base["worst_neg_streak_sum_pct"],
+                "maxDD%":           base["carry_curve_maxDD_pct"],
+            })
+
+            # サブ期間行
+            for label, start_ym in SUBPERIODS:
+                ms = carry_metrics_subperiod(sym, fund, start_ym)
+                sub_m = monthly_df[
+                    (monthly_df["symbol"] == sym) &
+                    ((monthly_df["year"] > start_ym[0]) |
+                     ((monthly_df["year"] == start_ym[0]) &
+                      (monthly_df["month"] >= start_ym[1])))
+                ]
+                pos_m = round(float((sub_m["sum_funding_pct"] > 0).mean() * 100), 1) \
+                        if len(sub_m) > 0 else None
+                if ms is None:
+                    sp_rows.append({
+                        "期間": label, "years": None, "ann_gross_%": None,
+                        "ann_net(0.30)%": None, "ann_net(0.60)%": None,
+                        "pos_months%": pos_m, "longest_neg_d": None,
+                        "worst_streak%": None, "maxDD%": None,
+                    })
+                else:
+                    sp_rows.append({
+                        "期間":           label,
+                        "years":          ms["years"],
+                        "ann_gross_%":    ms["ann_gross_pct"],
+                        "ann_net(0.30)%": ms["ann_net_pct(fee0.30)"],
+                        "ann_net(0.60)%": ms["ann_net_pct(fee0.60)"],
+                        "pos_months%":    pos_m,
+                        "longest_neg_d":  ms["longest_neg_streak_days"],
+                        "worst_streak%":  ms["worst_neg_streak_sum_pct"],
+                        "maxDD%":         ms["carry_curve_maxDD_pct"],
+                    })
+
+            sp_df = pd.DataFrame(sp_rows)
+            with pd.option_context("display.width", 200, "display.max_columns", None):
+                print(sp_df.to_string(index=False))
+
+        # ── 2. 最悪月・連続マイナス月 ────────────────────────────
+        print(f"\n{'─'*60}")
+        print("▶ 2. 最悪月・連続マイナス月（月別累積Funding基準）")
+        for sym in deep_syms_available:
+            mdf = monthly_df[monthly_df["symbol"] == sym].sort_values(["year", "month"]).copy()
+            if mdf.empty:
+                continue
+            worst_row = mdf.loc[mdf["sum_funding_pct"].idxmin()]
+            # 連続マイナス月の最長ストリーク計算
+            neg_cur, neg_max = 0, 0
+            neg_start_cur, neg_worst_start = None, None
+            for _, row in mdf.iterrows():
+                if row["sum_funding_pct"] < 0:
+                    if neg_cur == 0:
+                        neg_start_cur = (int(row["year"]), int(row["month"]))
+                    neg_cur += 1
+                    if neg_cur > neg_max:
+                        neg_max = neg_cur
+                        neg_worst_start = neg_start_cur
+                else:
+                    neg_cur = 0
+            tag = "深掘り" if sym in DEEP_SYMS else "参考"
+            print(f"\n  {sym}（{tag}）")
+            print(f"    最悪月: {int(worst_row['year'])}-{int(worst_row['month']):02d}  "
+                  f"月累積Funding={worst_row['sum_funding_pct']:.3f}%")
+            wstart = (f"({neg_worst_start[0]}-{neg_worst_start[1]:02d}〜)"
+                      if neg_worst_start else "")
+            print(f"    連続マイナス月最長: {neg_max}ヶ月 {wstart}")
+
+        # ── 3. Rolling 12ヶ月 年率グロス ──────────────────────────
+        print(f"\n{'─'*60}")
+        print("▶ 3. Rolling 12ヶ月 年率グロス（%）— 手数料未控除")
+        print("   （直近12ヶ月の累積Fundingを年率相当とみなす）")
+        roll12_out = []
+        for sym in deep_syms_available:
+            mdf = monthly_df[monthly_df["symbol"] == sym].sort_values(["year", "month"]).copy()
+            mdf["roll12"] = mdf["sum_funding_pct"].rolling(12).sum()
+            valid = mdf.dropna(subset=["roll12"])
+            for _, row in valid.iterrows():
+                roll12_out.append({
+                    "symbol":              sym,
+                    "year_month":          f"{int(row['year'])}-{int(row['month']):02d}",
+                    "roll12_gross_ann_%":  round(float(row["roll12"]), 3),
+                })
+            r = valid["roll12"]
+            tag = "深掘り" if sym in DEEP_SYMS else "参考"
+            print(f"\n  {sym}（{tag}）: "
+                  f"min={r.min():.2f}%  max={r.max():.2f}%  "
+                  f"median={r.median():.2f}%  "
+                  f"直近12ヶ月={r.iloc[-1]:.2f}%  "
+                  f"マイナス年率={int((r < 0).sum())}ヶ月/{len(r)}ヶ月中")
+        if roll12_out:
+            roll12_df_out = pd.DataFrame(roll12_out)
+            roll12_df_out.to_csv(OUT_DIR / "roll12_monthly.csv", index=False)
+            print(f"\n  (詳細: {OUT_DIR}/roll12_monthly.csv)")
+
+        # ── 4. 資金効率 ROE ──────────────────────────────────────
+        print(f"\n{'─'*60}")
+        print("▶ 4. 資金効率 ROE（実必要資金 = 想定元本 × 倍率）")
+        print("   ×1.2: 効率重視（レバ活用）  ×1.5: 標準  ×2.0: 低レバ・余裕重視")
+        print("   ROE = 純年率Funding収益 ÷ 実必要資本倍率")
+        roe_rows = []
+        for sym in deep_syms_available:
+            base = summary_df[summary_df["symbol"] == sym].iloc[0]
+            ann_030 = base["ann_net_pct(fee0.30)"]
+            ann_060 = base["ann_net_pct(fee0.60)"]
+            tag = "深掘り" if sym in DEEP_SYMS else "参考"
+            for mult in CAPITAL_MULTIPLIERS:
+                roe_030 = round(ann_030 / mult, 2) if ann_030 is not None else None
+                roe_060 = round(ann_060 / mult, 2) if ann_060 is not None else None
+                roe_rows.append({
+                    "symbol":           sym,
+                    "tag":              tag,
+                    "資本倍率":          f"×{mult:.1f}",
+                    "ann_net(fee0.30)%": ann_030,
+                    "ann_net(fee0.60)%": ann_060,
+                    "ROE(fee0.30)%":    roe_030,
+                    "ROE(fee0.60)%":    roe_060,
+                })
+        if roe_rows:
+            roe_df_out = pd.DataFrame(roe_rows)
+            with pd.option_context("display.width", 200, "display.max_columns", None):
+                print(roe_df_out.to_string(index=False))
+
+    # ─── CSV 保存 ──────────────────────────────────────────────────
     summary_df.to_csv(OUT_DIR / "summary_by_symbol.csv", index=False)
     monthly_df.to_csv(OUT_DIR / "monthly_funding.csv", index=False)
     yearly_df.to_csv(OUT_DIR / "yearly_funding.csv", index=False)
     print(f"\n出力先: {OUT_DIR}/")
     print("  summary_by_symbol.csv  — 銘柄別 全指標")
-    print("  monthly_funding.csv    — 銘柄×月別 平均Funding")
+    print("  monthly_funding.csv    — 銘柄×月別 平均・合計Funding")
     print("  yearly_funding.csv     — 銘柄×年別 累積Funding")
+    print("  roll12_monthly.csv     — BTC/ETH/DOGE Rolling 12ヶ月年率グロス")
     print("=" * 78)
     print("\n判定の見方（事前固定・閾値探索なし・ただし設計バイアスは残る）:")
     print("  ann_net(fee0.30)   : 控除後年率（下限コスト）。プラスでなければ話にならない")
