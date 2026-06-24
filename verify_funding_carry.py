@@ -522,8 +522,8 @@ def main():
             snap_df_out = pd.DataFrame(snapshot_rows)
             snap_df_out.to_csv(OUT_DIR / "current_yield_snapshot.csv", index=False)
             print(f"\n  (詳細: {OUT_DIR}/current_yield_snapshot.csv)")
-        print(f"  YES = 利回りが太っている（今すぐ検討余地あり）")
-        print(f"  NO  = 米国債等の代替に見劣り（待機。利回りが太るまで張らない）")
+        print(f"  YES = 検討開始ライン（即運用GOではない。取引所/税務/清算/実手数料を調べる段階）")
+        print(f"  NO  = 待機（米国債等の代替に見劣り。利回りが太るまで張らない）")
 
     # ─── CSV 保存 ──────────────────────────────────────────────────
     summary_df.to_csv(OUT_DIR / "summary_by_symbol.csv", index=False)
