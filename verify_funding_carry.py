@@ -50,6 +50,7 @@ verify_funding_carry.py  【Funding Carry（Cash & Carry）過去検証】
   yearly_funding.csv     — 銘柄×年別の累積・平均Funding
   roll12_monthly.csv     — BTC/ETH/DOGE の Rolling 12ヶ月年率グロス
 """
+from __future__ import annotations
 import io
 import ssl
 import urllib.request
