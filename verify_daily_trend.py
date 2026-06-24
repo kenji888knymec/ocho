@@ -30,9 +30,11 @@ test  : 2025-04-01 〜 2026-06-21（15ヶ月）
   trainで合格・testで符号逆転は不合格
 
 SL判定の定義（事前固定）:
-  エントリー翌日以降、日足 Low が entry_price × 0.95 以下でSL到達。
+  エントリー当日を含め、日足 Low が entry_price × 0.95 以下でSL到達。
+  （前日終値ブレイク → 当日始値エントリーのため、当日のintraday下落もSL対象）
   SL到達日: exit_price = entry_price × 0.95（通常ケース）
   ギャップダウン: 当日 Open がすでに SL 以下 → exit_price = 当日 Open（保守的）
+                  ※始値=entry_priceの当日は対象外。翌日以降のみ判定
   SL と 10日保有終了が同日の場合: SL 優先
 
 やらないこと（厳守）:
@@ -104,18 +106,21 @@ def simulate(daily: pd.DataFrame, sym: str) -> pd.DataFrame:
     entry_idx   = 0
 
     for i in range(1, len(d)):
+        # ① エントリー判定（前日シグナル発生 → 当日始値でエントリー）
         if not in_trade:
-            # 前日シグナル発生 → 当日始値でエントリー
             if d.at[i - 1, "signal"] and np.isfinite(d.at[i - 1, "dc_hi"]):
                 in_trade    = True
                 entry_price = d.at[i, "open"]
                 entry_date  = d.at[i, "date"]
                 entry_idx   = i
-        else:
+
+        # ② 決済判定（エントリー当日 days_held=0 を含む。当日のintraday SLも捕捉）
+        if in_trade:
             days_held   = i - entry_idx
             sl_price    = entry_price * (1.0 - SL_PCT)
-            gap_down    = d.at[i, "open"] <= sl_price   # 始値がすでにSL以下
-            hit_sl_low  = d.at[i, "low"]  <= sl_price   # 日中にSL到達
+            # ギャップダウン(始値がSL以下)は翌日以降のみ。当日は open==entry_price のため対象外
+            gap_down    = (i > entry_idx) and (d.at[i, "open"] <= sl_price)
+            hit_sl_low  = d.at[i, "low"]  <= sl_price   # 日中にSL到達（当日含む）
             hit_sl      = gap_down or hit_sl_low
             hit_hold    = days_held >= HOLD_DAYS
 
