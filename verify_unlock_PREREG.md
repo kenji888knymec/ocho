@@ -41,16 +41,30 @@
 ## 2. データ源（事前固定・優先順）
 
 ```
-第1候補: DeFiLlama emissions（無料API・歴史アンロックイベント）
-         https://api.llama.fi/emissions （一覧）
-         https://api.llama.fi/emission/{protocol} （個別スケジュール）
-第2候補: Token Unlocks (token.unlocks.app)（APIゲートあり・第1候補で不足時のみ）
-取得環境: 賢治さんのMac（リモートはCoinGecko/DeFiLlama等が403）
-価格データ: 既存 OHLCV /tmp/ohlcv_long/ohlcv_2024_2026/*_1h.csv（日次終値に集約）
-           不足銘柄は Mac で OKX/Binance から追加取得しうる（別途）
+【2026-06-27 更新】DeFiLlama無料emissions APIは有料化（HTTP 402 Payment Required）。
+  → 有料Proには進まない（CLAUDE.md「有料データ購入の即断はしない」）。
+  → Token Unlocksも無料APIゲート＋ToS懸念で不使用。
+
+採用データ源（差し替え後・事前固定）:
+  循環供給ジャンプ検出方式（CoinGecko無料データから供給を復元）
+    circ_supply[t] = market_cap[t] / price[t]   （CoinGecko market_chart, days=max）
+    単日で circ_supply が ≥1.0% 増えた日 = アンロックイベント（経済定義は不変）
+  → 第三者のアンロックラベルでなく「実際に観測された供給増」を使う。
+    チーム/エコシステム/emission の区別なく、市場に出た供給増を捉える（むしろ筋が良い）。
+取得環境: 賢治さんのMac（リモートはCoinGecko 403）。標準ライブラリのみ・売買なし。
+価格データ: 既存 OHLCV /tmp/ohlcv_long/ohlcv_2024_2026/*_1h.csv（28銘柄・日次終値に集約）
+
+正直な注意（誇張しない）:
+  - CoinGeckoの供給更新は数日遅れ・平滑化あり → イベント日が±数日ずれ得る（±10日窓で吸収）。
+  - ごく小さなアンロックは見えないことがある（≥1%cliffは検出可能の想定）。
+  - mcap/price 復元は丸め誤差あり → 1日スパイクで戻る偽ジャンプは「持続ステップ」条件で除外。
+
+★イベント定義（§4）の窓・指標・合格基準（§5〜§7）は一切変えない。データ源のみ差し替え。
 ```
 
-**まず probe_unlock_data.py でDeFiLlamaの実スキーマを確認してから本パーサを書く（スキーマ推測でハードコードしない）。**
+**取得は fetch_supply_coingecko.py（Mac実行）。生の price/mcap も保存し、供給復元と
+ジャンプ検出はリモート側（オフライン）で行う（スキーマ推測でハードコードしない）。**
+**旧 probe_unlock_data.py（DeFiLlama用）は402で無効化・研究記録として残置。**
 
 ---
 
