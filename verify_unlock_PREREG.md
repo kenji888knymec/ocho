@@ -41,17 +41,22 @@
 ## 2. データ源（事前固定・優先順）
 
 ```
-【2026-06-27 更新】DeFiLlama無料emissions APIは有料化（HTTP 402 Payment Required）。
-  → 有料Proには進まない（CLAUDE.md「有料データ購入の即断はしない」）。
-  → Token Unlocksも無料APIゲート＋ToS懸念で不使用。
+【2026-06-27 更新・データ源の試行履歴】
+  ① DeFiLlama無料emissions API → HTTP 402（有料化）。有料Proには進まない。
+  ② CoinGecko キーレス → 401/429（キー必須化）。Demoキー作成も有料Basic $29/mo
+     ($348/yr)契約画面に誘導され、無料・カードなしで取得できず → 停止（購入しない）。
+  ③ Coinpaprika 無料API（キー不要・カード不要）→ 採用。/v1/coins でID解決、
+     /v1/tickers/{id}/historical で price+market_cap（無料枠は約1年）。
+  ※Token Unlocksは無料APIゲート＋ToS懸念で不使用。
+  ※いずれも無料で取得不能になった場合、Bは「データ取得コストあり候補」として保留（購入しない）。
 
 採用データ源（差し替え後・事前固定）:
-  循環供給ジャンプ検出方式（CoinGecko無料データから供給を復元）
-    circ_supply[t] = market_cap[t] / price[t]   （CoinGecko market_chart, days=max）
+  循環供給ジャンプ検出方式（Coinpaprika無料データから供給を復元）
+    circ_supply[t] = market_cap[t] / price[t]   （Coinpaprika historical, interval=1d）
     単日で circ_supply が ≥1.0% 増えた日 = アンロックイベント（経済定義は不変）
   → 第三者のアンロックラベルでなく「実際に観測された供給増」を使う。
     チーム/エコシステム/emission の区別なく、市場に出た供給増を捉える（むしろ筋が良い）。
-取得環境: 賢治さんのMac（リモートはCoinGecko 403）。標準ライブラリのみ・売買なし。
+取得環境: 賢治さんのMac（リモートはプロキシ制約）。標準ライブラリのみ・売買なし・キー不要。
 価格データ: 既存 OHLCV /tmp/ohlcv_long/ohlcv_2024_2026/*_1h.csv（28銘柄・日次終値に集約）
 
 正直な注意（誇張しない）:
