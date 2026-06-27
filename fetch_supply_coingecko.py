@@ -19,12 +19,23 @@ CoinGecko 無料APIから、対象28銘柄の price / market_cap 日次履歴を
     （列: symbol,date_utc,price,market_cap）
     このファイルをチャットに貼れば、リモートで供給復元＋イベント検出＋反応分析を回す。
 
+★無料Demoキーが必要（2026-06以降、CoinGeckoはキーレスを401/429で封鎖）:
+    1. https://www.coingecko.com にサインアップ（無料）
+    2. ダッシュボード → Developer → 「Demo API Key」を作成（課金なし・$0プラン）
+    3. ターミナルでキーを環境変数に入れてから実行:
+         export COINGECKO_API_KEY="CG-xxxxxxxxxxxxxxxx"
+         python3 fetch_supply_coingecko.py
+  → キーはチャットにもgitにも貼らないこと（環境変数だけで渡す）。
+  → 無料Demoプランは履歴が直近365日まで。検証期間はその範囲に絞られる（窓・基準は不変）。
+
 依存: 標準ライブラリのみ（pip不要）。売買・送金・Bot接続は一切なし。取得して保存するだけ。
-レート制限に配慮し、各銘柄の取得後に少し待つ。失敗銘柄はスキップして続行。
+429（レート制限）は指数バックオフでリトライ。失敗銘柄はスキップして続行。
 """
 
 from __future__ import annotations
+import os
 import urllib.request
+import urllib.error
 import json
 import time
 import datetime as dt
@@ -62,20 +73,47 @@ SYMBOL_TO_ID = {
 }
 
 BASE = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
-# days=max を使うと長期は日次粒度で返る（無料tier）。interval指定はしない（無料tierで弾かれる為）。
+# 無料Demoプランは履歴365日まで。days=365 を要求（max超過要求はエラーになる為）。
+DAYS = "365"
+API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
 
 
 def fetch_market_chart(coin_id: str):
-    url = f"{BASE.format(id=coin_id)}?vs_currency=usd&days=max"
-    req = urllib.request.Request(url, headers={"User-Agent": "research/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode())
+    """429は指数バックオフでリトライ（5,10,20,40秒）。Demoキーをヘッダで付与。"""
+    url = f"{BASE.format(id=coin_id)}?vs_currency=usd&days={DAYS}"
+    headers = {"User-Agent": "research/1.0"}
+    if API_KEY:
+        headers["x-cg-demo-api-key"] = API_KEY
+    backoffs = [5, 10, 20, 40]
+    last_err = None
+    for attempt in range(len(backoffs) + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429 and attempt < len(backoffs):
+                wait = backoffs[attempt]
+                print(f"    429 → {wait}秒待ってリトライ ({attempt+1}/{len(backoffs)})")
+                time.sleep(wait)
+                continue
+            raise
+    raise last_err
 
 
 def main():
     print("=" * 60)
     print("CoinGecko 循環供給（price/market_cap）取得  検証B")
     print("=" * 60)
+    if not API_KEY:
+        print("\n❌ 環境変数 COINGECKO_API_KEY が未設定です。")
+        print("   無料Demoキーを作成し、以下を実行してから再度走らせてください:")
+        print('     export COINGECKO_API_KEY="CG-xxxxxxxxxxxxxxxx"')
+        print("     python3 fetch_supply_coingecko.py")
+        print("   （キーはチャットにもgitにも貼らないこと）")
+        return
+    print(f"  Demoキー: 検出OK（末尾4文字 ...{API_KEY[-4:]}） / 履歴={DAYS}日")
 
     out_rows = []  # (symbol, date_utc, price, market_cap)
     ok, ng = [], []
