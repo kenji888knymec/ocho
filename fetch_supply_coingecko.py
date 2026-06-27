@@ -79,11 +79,15 @@ API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
 
 
 def fetch_market_chart(coin_id: str):
-    """429は指数バックオフでリトライ（5,10,20,40秒）。Demoキーをヘッダで付与。"""
+    """429は指数バックオフでリトライ（5,10,20,40秒）。
+    Demoキーは CoinGecko docs 準拠でクエリパラメータ x_cg_demo_api_key= で渡す
+    （ヘッダ x-cg-demo-api-key も併用）。401時は本文を表示して切り分け。"""
     url = f"{BASE.format(id=coin_id)}?vs_currency=usd&days={DAYS}"
+    if API_KEY:
+        url += f"&x_cg_demo_api_key={API_KEY}"   # ← docs準拠のクエリ方式（主）
     headers = {"User-Agent": "research/1.0"}
     if API_KEY:
-        headers["x-cg-demo-api-key"] = API_KEY
+        headers["x-cg-demo-api-key"] = API_KEY    # ← ヘッダ方式も併用（保険）
     backoffs = [5, 10, 20, 40]
     last_err = None
     for attempt in range(len(backoffs) + 1):
@@ -98,6 +102,12 @@ def fetch_market_chart(coin_id: str):
                 print(f"    429 → {wait}秒待ってリトライ ({attempt+1}/{len(backoffs)})")
                 time.sleep(wait)
                 continue
+            # 401等はCoinGeckoのエラー本文を表示（キーは含まれない）
+            try:
+                body = e.read().decode()[:200]
+                print(f"    HTTP {e.code} 本文: {body}")
+            except Exception:
+                pass
             raise
     raise last_err
 
@@ -113,7 +123,10 @@ def main():
         print("     python3 fetch_supply_coingecko.py")
         print("   （キーはチャットにもgitにも貼らないこと）")
         return
-    print(f"  Demoキー: 検出OK（末尾4文字 ...{API_KEY[-4:]}） / 履歴={DAYS}日")
+    print(f"  Demoキー: 検出OK（長さ={len(API_KEY)}文字・末尾4文字 ...{API_KEY[-4:]}） / 履歴={DAYS}日")
+    if not API_KEY.startswith("CG-") or len(API_KEY) < 20:
+        print("  ⚠ 警告: 本物のDemoキーは 'CG-' 始まり・約25文字。"
+              "短い/形式が違う場合はキーが不完全な可能性（Dashboardで全文コピーを確認）。")
 
     out_rows = []  # (symbol, date_utc, price, market_cap)
     ok, ng = [], []
