@@ -3124,3 +3124,86 @@ Fluid USDC 6.72%($131M) / Morpho USDC 4.32%($432M)
 ⑤⑥のBot接続・実装・通知化 / 有料データ購入 / main.py変更 / deploy / merge
 SHORT再開 / LONG_E再開 / rv_chg・cs_mom・VRP gate化 / ENV変更
 ```
+
+---
+
+## 【2026-06-27 ③ベーシス=Fundingで代表して閉じる → 7候補探索 完了】最終スコアボードと監視項目
+
+**記録日: 2026-06-27。本番・ENV・通知・main.py 変更なし。賢治さん合意で③ベーシスは追加フェッチせず閉じる。**
+
+### ③の締め方（合意）
+
+```
+③キャリーは Funding（現物ロング+無期限先物ショートで資金調達料を収穫）で検証済み・月1監視中。
+ベーシス（現物vs四半期先物）は同じキャリー構造（現物ロング+先物ショートで金利差/プレミアム収穫）。
+→ 四半期先物データを追加取得しても結論は同系統（構造あり・薄利・要資金・月1監視）になる見込み。
+  手間の割に実運用判断が変わらないため、③はFundingで代表して閉じる（ベーシス追加検証しない）。
+```
+
+### 7候補 最終スコアボード（全完了）
+
+```
+①ボラ売り(VRP)    : BTCに構造あり → 月1監視候補（実運用不可・テールリスク・薄利）。ETH不採用。総合不合格
+②アンロック        : APT単独依存 → 不合格・保留（無料データ1年の限界・購入しない）
+③キャリー          : 構造あり・現在薄い(pass_060全NO)・要資金 → 月1監視（Fundingで代表・ベーシスは閉じる）
+④現物持ち替え      : C/C'/C'' 全滅 → 閉鎖
+⑤DeFi貸出          : ステーブル貸出 年3〜5%（本物だが「預金」）→ エッジでなく別枠（遊休資金の利回りフロア）
+⑥DEX LP            : 高APYはIL/報酬トークンの幻・トレンドでIL負け → 不採用
+⑦レバレッジ・ペア  : 無レバで負け・2x以上で強制ロスカット退場 → 不採用
+```
+
+### 全体結論（言い切らない整理）
+
+```
+公開・無料データの範囲では「掛けていい」手動売買シグナルは見つからなかった（A〜⑦全て）。
+構造収益として残るのは ①BTC VRP と ③キャリー の2つだけ。ただし両方とも:
+  - 別ゲーム（オプション売り / 現物+先物キャリー）
+  - 要資本・小資金では薄利
+  - ①はテールリスク大（暴落で一発）
+  → Discord通知シグナルにはならない。実運用しない。月1で現在地を見る監視候補。
+本番Botは引き続き全凍結が正しい。
+```
+
+### 今後残す監視・観察（新規開発なし）
+
+```
+1. BTC VRP        : 月1監視（Macでdvol再取得→verify_vrp.py）。実運用/Bot/通知/gate化しない
+2. キャリー(Funding): 月1監視（verify_funding_carry.py）。pass_060がYESで初めて執行条件検討
+3. record-only観察 : rv_chg / 3反転列 / cs_mom_shadow（前向き蓄積・GO条件までgate化しない）
+4. 本番健康診断    : EntryRecordで SHORT停止/LONG_E停止/LONG_F急悪化/notify_sent異常増/
+                     Discord過多/shadow配線/本番設定の意図せぬ変更 を確認するだけ
+⑤DeFi貸出は「遊休資金の置き場」として頭の片隅に（Bot/シグナルではない・別枠）
+```
+
+### やらないこと（確定・厳守）
+
+```
+③ベーシスの追加フェッチ / D系の新探索 / 有料データ購入
+①〜⑦の条件足し・閾値スイープ・単名(APT等)救済 / B5実運用設計への前進
+①VRP・③キャリーの実運用化・Bot接続・通知化・gate化
+SHORT再開 / SHORT_AI_RANK再開 / LONG_E再開 / LONG_F停止
+rv_chg gate化 / cs_mom gate化 / TP/SL変更 / QS修正 / AI閾値変更
+ENV変更 / main.py変更 / deploy / merge
+```
+
+### 再探索フェーズに進む条件（どちらか満たすまで新探索しない）
+
+```
+1. 別ソース・別時期の本当に新しいデータが「無料 or 既存コスト」で入手できた場合（有料の壁なら進まない）
+2. 月1監視（BTC VRP / Funding）または record-only（rv_chg/3反転列/cs_mom_shadow）が
+   事前に定めたGO条件を満たす程度に蓄積した場合
+→ それまでは探索完了・監視フェーズに移行した状態とする。EntryRecordを開くときは必ず
+  「健康診断・月1監視か、勝ち筋探しか。後者ならやらない」を自問する。
+```
+
+### branch上の研究スクリプト（本番非投入・ブランチ防御）
+
+```
+A:  fetch_deribit_dvol.py / verify_vrp.py / verify_vrp_tail.py / dvol_*.csv
+B:  verify_unlock_PREREG.md / probe_unlock_data.py / fetch_supply_coingecko.py /
+    fetch_supply_coinpaprika.py / verify_unlock_event_study.py / supply_coingecko.csv
+⑤⑥: fetch_defillama_yields.py
+⑦:  verify_leverage_pair.py
+C系: verify_ratio_rotation.py / verify_ratio_momentum.py / verify_xsec_momentum.py
+→ いずれも研究用。main.pyと独立。PR化/merge/deployしない（ブランチ防御原則）。
+```
