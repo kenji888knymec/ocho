@@ -85,6 +85,13 @@ def main():
     kl = {s: g.sort_values("t").reset_index(drop=True) for s, g in kdf.groupby("symbol")}
     perp_map = dict(zip(perp["symbol"], perp["perp_symbol"]))
     elig_set = set(eligible["symbol"])
+    # データ整合（保守的・基準変更ではない）: funding履歴が1行も無い銘柄は
+    # 「funding=0」と楽観仮定せず判定から除外し、件数を開示する（403等の取得失敗対策）。
+    no_fund = {s for s in elig_set if perp_map.get(s, "") not in fund_by}
+    if no_fund:
+        print(f"⚠ funding未取得のため判定から除外: {len(no_fund)}銘柄 "
+              f"({sorted(no_fund)[:8]}{'...' if len(no_fund) > 8 else ''})")
+        elig_set = elig_set - no_fund
 
     def short_trade(sym, H, use_stop=False):
         g = kl.get(sym)
