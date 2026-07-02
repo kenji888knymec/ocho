@@ -3539,3 +3539,28 @@ cs_mom本番化 / S4 / 日次トレンドフォロー / LSR・taker / レバペ�
 Track A Step-2: fetch_binance_perp_check.py を書く（上記仕様）→ Mac実行を依頼 →
 結果CSVで funding調整後のGO/NO-GO判定（判定基準は上記の事前登録に従い、変更しない）。
 ```
+
+---
+
+## 【2026-07-02 Cloud Scheduler 全停止】Bot巡回・shadow前向き蓄積を終了
+
+**記録日: 2026-07-02。賢治さんがGCPコンソールで実施（deploy/merge/main.py変更なし・一時停止のみ）。**
+
+```
+停止済み（4本とも一時停止・削除はしていない）:
+  crypto-alert-judge-v2-every-15m / crypto-alert-run / ops-health-daily / v2-report-daily
+→ 動いているスケジュールはゼロ。Cloud Runは呼ばれないため自動ゼロスケール＝ランニングコストほぼゼロ。
+
+これに伴い終了するもの:
+  - v2_shadow / rv_chg / 3反転列 / cs_mom_shadow の前向き蓄積（Track C 実質終了）
+  - EntryRecord健康診断（見る対象が止まったため実質終了）
+  - 一部OPEN行はDONE化されないまま残るが実害なし
+
+影響を受けないもの:
+  - Track A（新規上場ショート）: Botと無関係（Macフェッチ＋オフライン分析）
+  - Track B（BTC VRP / Funding Carry 月1監視）: Macスクリプトで実施
+  - 本番凍結の防御線: ブランチ防御原則は継続（このbranchをdeploy/mergeしない）
+
+再開方法: GCPコンソールで各ジョブを「再開」するだけ（ワンクリック・可逆）。
+再開する場合の候補理由: Track AがStep-4合格し「上場イベント検知Bot」へ転換する時（別途判断）。
+```
